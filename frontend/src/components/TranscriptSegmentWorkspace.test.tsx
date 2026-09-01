@@ -20,7 +20,6 @@ function renderWorkspace(props: Partial<React.ComponentProps<typeof TranscriptSe
   const episode: EpisodeDetail = {
     id: 'ep-1',
     title: 'Test episode',
-    slug: 'test-feed',
     status: 'completed',
     published: '2026-01-01T00:00:00Z',
     hasOriginalAudio: true,

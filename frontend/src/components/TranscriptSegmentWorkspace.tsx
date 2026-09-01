@@ -185,7 +185,7 @@ function TranscriptSegmentWorkspace({
             start: bounds.start,
             end: bounds.end,
             pattern_id: marker?.pattern_id,
-            confidence: marker?.confidence,
+            confidence: marker?.confidence ?? 1,
             reason: marker?.reason || '',
             sponsor: marker?.sponsor,
           },
@@ -467,7 +467,7 @@ function SegmentTableRow({
           aria-label={`Select segment ${row.sequenceNum}`}
           onChange={(e) => {
             e.stopPropagation();
-            onToggleSelect(e.nativeEvent.shiftKey);
+            onToggleSelect((e.nativeEvent as MouseEvent).shiftKey);
           }}
         />
       </td>
