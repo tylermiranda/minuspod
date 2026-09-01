@@ -12,6 +12,7 @@ import DraftNumberInput, { DRAFT_NUMBER_INPUT_CLASS, parseOptionalNumber } from 
 import { focusRing } from '../components/fieldStyles';
 
 type AddFeedMode = 'subscribe' | 'local';
+type SubscribeInputMode = 'search' | 'url';
 
 // Mirrors the shape of the backend's make_slug (python-slugify): lowercase,
 // strip diacritics, collapse runs of non-alphanumerics to a single hyphen,
@@ -377,6 +378,7 @@ function AddFeed() {
   const queryClient = useQueryClient();
 
   const [mode, setMode] = useState<AddFeedMode>('subscribe');
+  const [subscribeInputMode, setSubscribeInputMode] = useState<SubscribeInputMode>('search');
 
   // Input state
   const [inputValue, setInputValue] = useState('');
@@ -396,8 +398,8 @@ function AddFeed() {
   const [isDragging, setIsDragging] = useState(false);
   const [opmlResult, setOpmlResult] = useState<OpmlImportResult | null>(null);
 
-  // Detect URL vs search
-  const isUrl = /^https?:\/\//.test(inputValue);
+  // Detect URL vs search (URL mode, or a pasted URL while in search mode)
+  const isUrl = subscribeInputMode === 'url' || /^https?:\/\//.test(inputValue);
 
   // URL validation (only when it looks like a URL)
   const urlValidation = useMemo(() => isUrl ? validateUrl(inputValue) : { isValid: false, error: null, warning: null }, [inputValue, isUrl]);
@@ -420,7 +422,8 @@ function AddFeed() {
   }, [feedsData]);
 
   const inputTrimmed = inputValue.trim();
-  const shouldSearch = !isUrl && searchEnabled && inputTrimmed.length >= 2;
+  const inSearchMode = searchEnabled && subscribeInputMode === 'search' && !/^https?:\/\//.test(inputValue);
+  const shouldSearch = inSearchMode && inputTrimmed.length >= 2;
 
   // Clear stale search state during render when the search is no longer
   // applicable. Avoids a setState-in-effect for the early-return branch.
@@ -512,10 +515,18 @@ function AddFeed() {
     setIsDragging(false);
   }, []);
 
+  const switchSubscribeInputMode = (next: SubscribeInputMode) => {
+    setSubscribeInputMode(next);
+    setInputValue('');
+    setSearchResults([]);
+    setSearchError(null);
+    setTouched(false);
+  };
+
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     setTouched(true);
-    if (isUrl && inputValue.trim() && urlValidation.isValid) {
+    if ((subscribeInputMode === 'url' || !searchEnabled) && inputValue.trim() && urlValidation.isValid) {
       mutation.mutate();
     }
   };
@@ -565,32 +576,92 @@ function AddFeed() {
         </div>
       )}
 
-      {/* Section A: Unified Input */}
+      {searchEnabled && (
+        <div className="flex border border-border rounded overflow-hidden mb-4 w-fit">
+          <button
+            type="button"
+            onClick={() => switchSubscribeInputMode('search')}
+            aria-pressed={subscribeInputMode === 'search'}
+            className={`px-4 py-2 text-sm font-medium transition-colors ${
+              subscribeInputMode === 'search' ? btnPrimary : btnSecondary
+            } ${focusRing}`}
+          >
+            Search
+          </button>
+          <button
+            type="button"
+            onClick={() => switchSubscribeInputMode('url')}
+            aria-pressed={subscribeInputMode === 'url'}
+            className={`px-4 py-2 text-sm font-medium transition-colors ${
+              subscribeInputMode === 'url' ? btnPrimary : btnSecondary
+            } ${focusRing}`}
+          >
+            Enter RSS URL
+          </button>
+        </div>
+      )}
+
+      {/* Section A: Search or URL input */}
       <form onSubmit={handleSubmit} className="space-y-4">
         <div>
-          <label htmlFor="podcastInput" className="block text-sm font-medium text-foreground mb-2">
-            {searchEnabled ? 'Search podcasts or enter RSS URL' : 'Podcast RSS Feed URL'}
-          </label>
-          <input
-            type="text"
-            id="podcastInput"
-            value={inputValue}
-            onChange={(e) => setInputValue(e.target.value)}
-            onBlur={() => { if (isUrl) setTouched(true); }}
-            placeholder={searchEnabled ? 'Search by name or paste an RSS feed URL...' : 'https://example.com/podcast/feed.xml'}
-            className={`w-full px-4 py-2 rounded-lg border bg-background text-foreground placeholder:text-muted-foreground focus:outline-hidden focus:ring-2 focus:ring-ring ${
-              isUrl && touched && urlValidation.error
-                ? 'border-destructive focus:ring-destructive'
-                : isUrl && touched && urlValidation.warning
-                  ? 'border-warning focus:ring-warning'
-                  : 'border-input'
-            }`}
-          />
-          {isUrl && touched && urlValidation.error && (
-            <p className="mt-1 text-sm text-destructive">{urlValidation.error}</p>
-          )}
-          {isUrl && touched && !urlValidation.error && urlValidation.warning && (
-            <p className="mt-1 text-sm text-warning">{urlValidation.warning}</p>
+          {inSearchMode || (searchEnabled && subscribeInputMode === 'search' && !isUrl) ? (
+            <>
+              <label htmlFor="podcastInput" className="block text-sm font-medium text-foreground mb-2">
+                Search podcasts
+              </label>
+              <div className="relative">
+                <svg
+                  className="absolute left-3 top-1/2 -translate-y-1/2 w-5 h-5 text-muted-foreground pointer-events-none"
+                  fill="none"
+                  viewBox="0 0 24 24"
+                  stroke="currentColor"
+                  aria-hidden="true"
+                >
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+                </svg>
+                <input
+                  type="search"
+                  id="podcastInput"
+                  value={inputValue}
+                  onChange={(e) => setInputValue(e.target.value)}
+                  placeholder="e.g. Radiolab, Hard Fork, NPR..."
+                  autoComplete="off"
+                  className="w-full pl-10 pr-4 py-2 rounded-lg border border-input bg-background text-foreground placeholder:text-muted-foreground focus:outline-hidden focus:ring-2 focus:ring-ring"
+                />
+              </div>
+              <p className="mt-1 text-sm text-muted-foreground">
+                {searchProvider === 'itunes'
+                  ? "Searches Apple's podcast directory. Results appear as you type."
+                  : 'Results appear as you type.'}
+              </p>
+            </>
+          ) : (
+            <>
+              <label htmlFor="podcastInput" className="block text-sm font-medium text-foreground mb-2">
+                Podcast RSS Feed URL
+              </label>
+              <input
+                type="url"
+                id="podcastInput"
+                value={inputValue}
+                onChange={(e) => setInputValue(e.target.value)}
+                onBlur={() => setTouched(true)}
+                placeholder="https://example.com/podcast/feed.xml"
+                className={`w-full px-4 py-2 rounded-lg border bg-background text-foreground placeholder:text-muted-foreground focus:outline-hidden focus:ring-2 focus:ring-ring ${
+                  touched && urlValidation.error
+                    ? 'border-destructive focus:ring-destructive'
+                    : touched && urlValidation.warning
+                      ? 'border-warning focus:ring-warning'
+                      : 'border-input'
+                }`}
+              />
+              {touched && urlValidation.error && (
+                <p className="mt-1 text-sm text-destructive">{urlValidation.error}</p>
+              )}
+              {touched && !urlValidation.error && urlValidation.warning && (
+                <p className="mt-1 text-sm text-warning">{urlValidation.warning}</p>
+              )}
+            </>
           )}
         </div>
 
@@ -670,7 +741,7 @@ function AddFeed() {
         </details>
 
         {/* URL mode: show Add Feed button */}
-        {isUrl && (
+        {(subscribeInputMode === 'url' || !searchEnabled) && (
           <>
             {mutation.error && (
               <div className="p-4 rounded-lg bg-destructive/10 text-destructive">
@@ -698,7 +769,7 @@ function AddFeed() {
       </form>
 
       {/* Section C: Search Results */}
-      {!isUrl && inputValue.trim() && searchEnabled && (
+      {inSearchMode && inputValue.trim() && (
         <div className="mt-4 space-y-2">
           {isSearching && (
             <div className="space-y-3">

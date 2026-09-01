@@ -71,11 +71,12 @@ beforeEach(() => {
 });
 
 describe('AddFeed: mode toggle', () => {
-  it('starts in subscribe mode with the search/URL input and OPML section visible', async () => {
+  it('starts in subscribe mode with search selected and OPML section visible', async () => {
     renderAddFeed();
     await waitFor(() => {
-      expect(screen.getByLabelText('Search podcasts or enter RSS URL')).toBeDefined();
+      expect(screen.getByLabelText('Search podcasts')).toBeDefined();
     });
+    expect(screen.getByRole('button', { name: 'Search', pressed: true })).toBeDefined();
     expect(screen.getByText('Import from OPML')).toBeDefined();
     expect(screen.queryByLabelText('Title')).toBeNull();
   });
@@ -84,7 +85,7 @@ describe('AddFeed: mode toggle', () => {
     const user = userEvent.setup();
     renderAddFeed();
     await waitFor(() => {
-      expect(screen.getByLabelText('Search podcasts or enter RSS URL')).toBeDefined();
+      expect(screen.getByLabelText('Search podcasts')).toBeDefined();
     });
 
     await user.click(screen.getByRole('button', { name: 'Create local feed' }));
@@ -92,7 +93,20 @@ describe('AddFeed: mode toggle', () => {
     expect(screen.getByLabelText('Title')).toBeDefined();
     expect(screen.getByLabelText('Slug')).toBeDefined();
     expect(screen.queryByText('Import from OPML')).toBeNull();
-    expect(screen.queryByLabelText('Search podcasts or enter RSS URL')).toBeNull();
+    expect(screen.queryByLabelText('Search podcasts')).toBeNull();
+  });
+
+  it('switches to RSS URL mode', async () => {
+    const user = userEvent.setup();
+    renderAddFeed();
+    await waitFor(() => {
+      expect(screen.getByLabelText('Search podcasts')).toBeDefined();
+    });
+
+    await user.click(screen.getByRole('button', { name: 'Enter RSS URL' }));
+
+    expect(screen.getByLabelText('Podcast RSS Feed URL')).toBeDefined();
+    expect(screen.queryByLabelText('Search podcasts')).toBeNull();
   });
 });
 
@@ -101,7 +115,7 @@ describe('AddFeed: local feed form', () => {
     const user = userEvent.setup();
     renderAddFeed();
     await waitFor(() => {
-      expect(screen.getByLabelText('Search podcasts or enter RSS URL')).toBeDefined();
+      expect(screen.getByLabelText('Search podcasts')).toBeDefined();
     });
     await user.click(screen.getByRole('button', { name: 'Create local feed' }));
     return user;
@@ -197,7 +211,7 @@ describe('AddFeed: artwork upload after create', () => {
     const user = userEvent.setup();
     renderAddFeed();
     await waitFor(() => {
-      expect(screen.getByLabelText('Search podcasts or enter RSS URL')).toBeDefined();
+      expect(screen.getByLabelText('Search podcasts')).toBeDefined();
     });
     await user.click(screen.getByRole('button', { name: 'Create local feed' }));
     await user.type(screen.getByLabelText('Title'), 'My Archive Show');
@@ -277,10 +291,10 @@ describe('AddFeed: podcast search', () => {
     const user = userEvent.setup();
     renderAddFeed();
     await waitFor(() => {
-      expect(screen.getByLabelText('Search podcasts or enter RSS URL')).toBeDefined();
+      expect(screen.getByLabelText('Search podcasts')).toBeDefined();
     });
 
-    await user.type(screen.getByLabelText('Search podcasts or enter RSS URL'), 'test show');
+    await user.type(screen.getByLabelText('Search podcasts'), 'test show');
 
     await waitFor(() => {
       expect(mockSearchPodcasts).toHaveBeenCalledWith('test show', expect.any(AbortSignal));
