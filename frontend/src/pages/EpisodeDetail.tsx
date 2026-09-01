@@ -392,8 +392,8 @@ function EpisodeDetail() {
   const submitCorrectionAsync = (correction: AdCorrection) =>
     correctionMutation.mutateAsync(correction);
 
-  const handleTranscriptRecut = () => {
-    reprocessMutation.mutate('recut');
+  const handleTranscriptRecut = async () => {
+    await reprocessMutation.mutateAsync('recut');
   };
 
   const handleTranscriptWaveformHandoff = (opts: {

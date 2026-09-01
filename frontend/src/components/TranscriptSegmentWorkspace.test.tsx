@@ -5,6 +5,18 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import TranscriptSegmentWorkspace from './TranscriptSegmentWorkspace';
 import type { EpisodeDetail } from '../api/types';
 
+vi.mock('../hooks/useEpisodeRecutWatch', () => ({
+  useEpisodeRecutWatch: () => ({
+    phase: 'idle',
+    stageLabel: null,
+    progress: 0,
+    watching: false,
+    startWatching: vi.fn(),
+    stopWatching: vi.fn(),
+    dismissCompletion: vi.fn(),
+  }),
+}));
+
 vi.mock('../api/feeds', () => ({
   getOriginalSegments: vi.fn(),
   episodeOriginalUrl: (slug: string, id: string) => `/api/v1/feeds/${slug}/episodes/${id}/original.mp3`,
@@ -39,7 +51,7 @@ function renderWorkspace(props: Partial<React.ComponentProps<typeof TranscriptSe
         episode={episode}
         onClose={vi.fn()}
         onSubmitCorrection={onSubmitCorrection}
-        onRecut={vi.fn()}
+        onRecut={vi.fn().mockResolvedValue(undefined)}
         onOpenWaveform={vi.fn()}
         {...props}
       />

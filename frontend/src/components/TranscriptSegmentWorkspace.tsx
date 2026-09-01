@@ -7,6 +7,7 @@ import {
 } from '../api/feeds';
 import type { AdSegment, EpisodeDetail as EpisodeDetailType } from '../api/types';
 import type { AdCorrection } from '../components/AdEditor';
+import { useEpisodeRecutWatch } from '../hooks/useEpisodeRecutWatch';
 import { btnDestructive, btnPrimary, btnSecondary } from './buttonStyles';
 import { focusRing } from './fieldStyles';
 import { formatTime } from '../utils/adReviewHelpers';
@@ -35,7 +36,7 @@ interface Props {
   episode: EpisodeDetailType;
   onClose: () => void;
   onSubmitCorrection: (correction: AdCorrection) => Promise<void>;
-  onRecut: () => void;
+  onRecut: () => Promise<void>;
   onOpenWaveform: (opts: { start: number; end: number; createMode: boolean; marker?: AdSegment }) => void;
   saveStatus?: SaveStatus;
   correctionError?: string | null;
@@ -62,6 +63,7 @@ function TranscriptSegmentWorkspace({
   const [sponsor, setSponsor] = useState('');
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [localError, setLocalError] = useState<string | null>(null);
+  const recutWatch = useEpisodeRecutWatch(slug, episodeId, episode.title);
 
   const { data: segmentsData, isLoading, error: segmentsError } = useQuery({
     queryKey: ['originalSegments', slug, episodeId],
@@ -237,10 +239,18 @@ function TranscriptSegmentWorkspace({
     }
   };
 
-  const handleRecut = () => {
+  const handleRecut = async () => {
     setLocalError(null);
-    onRecut();
-    setStatusMessage('Recut started.');
+    recutWatch.dismissCompletion();
+    recutWatch.startWatching();
+    try {
+      await onRecut();
+      setStatusMessage('Recut queued — progress updates below.');
+    } catch {
+      recutWatch.stopWatching();
+      setLocalError('Failed to start recut.');
+      setStatusMessage(null);
+    }
   };
 
   const handleFineTune = () => {
@@ -259,8 +269,9 @@ function TranscriptSegmentWorkspace({
     });
   };
 
-  const busy = saveStatus === 'saving';
+  const busy = saveStatus === 'saving' || recutWatch.watching;
   const displayError = localError || correctionError;
+  const recutActive = recutWatch.phase === 'queued' || recutWatch.phase === 'processing';
   const originalAudioUrl = episode.hasOriginalAudio
     ? episodeOriginalUrl(slug, episodeId)
     : null;
@@ -366,10 +377,10 @@ function TranscriptSegmentWorkspace({
             <button
               type="button"
               disabled={busy || !episode.hasOriginalAudio}
-              onClick={handleRecut}
+              onClick={() => { void handleRecut(); }}
               className={`px-3 py-1.5 text-sm rounded-md ${btnPrimary} disabled:opacity-50 ${focusRing}`}
             >
-              Recut audio
+              {recutWatch.watching ? 'Recutting…' : 'Recut audio'}
             </button>
             <button
               type="button"
@@ -389,6 +400,68 @@ function TranscriptSegmentWorkspace({
               </button>
             )}
           </div>
+
+          {recutActive && (
+            <div className="rounded-lg border border-primary/30 bg-primary/5 p-3 space-y-2">
+              <div className="flex items-center justify-between gap-2 text-sm">
+                <span className="font-medium text-foreground">
+                  {recutWatch.stageLabel ?? 'Recutting'}
+                </span>
+                <span className="tabular-nums text-muted-foreground">
+                  {Math.round(recutWatch.progress)}%
+                </span>
+              </div>
+              <div className="h-2 w-full rounded-full bg-muted overflow-hidden">
+                <div
+                  className="h-full bg-primary transition-all duration-300"
+                  style={{ width: `${Math.max(recutWatch.progress, recutWatch.phase === 'queued' ? 8 : 3)}%` }}
+                />
+              </div>
+              <p className="text-xs text-muted-foreground">
+                {recutWatch.phase === 'queued'
+                  ? 'Waiting in the processing queue…'
+                  : 'Updating processed audio from your corrections…'}
+              </p>
+            </div>
+          )}
+
+          {recutWatch.phase === 'completed' && (
+            <div className="rounded-lg border border-emerald-500/40 bg-emerald-500/10 p-3 flex items-start justify-between gap-3">
+              <div>
+                <p className="text-sm font-medium text-emerald-800 dark:text-emerald-200">
+                  Recut complete
+                </p>
+                <p className="text-sm text-emerald-700 dark:text-emerald-300">
+                  Processed audio is updated. Segment labels will refresh on the next load.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={recutWatch.dismissCompletion}
+                className={`shrink-0 text-sm ${btnSecondary} px-2 py-1 rounded ${focusRing}`}
+              >
+                Dismiss
+              </button>
+            </div>
+          )}
+
+          {recutWatch.phase === 'failed' && (
+            <div className="rounded-lg border border-destructive/40 bg-destructive/10 p-3 flex items-start justify-between gap-3">
+              <div>
+                <p className="text-sm font-medium text-destructive">Recut failed</p>
+                <p className="text-sm text-destructive/90">
+                  Check the episode status or processing logs for details.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={recutWatch.dismissCompletion}
+                className={`shrink-0 text-sm ${btnSecondary} px-2 py-1 rounded ${focusRing}`}
+              >
+                Dismiss
+              </button>
+            </div>
+          )}
 
           {displayError && (
             <p className="text-sm text-destructive">{displayError}</p>
