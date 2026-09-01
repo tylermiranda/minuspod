@@ -19,6 +19,10 @@ UNIVERSAL_TAG = 'universal'
 # Single source of truth for the upstream MinusPod repo identity. Used by
 # both the export pipeline's prefilled-PR URL builder and the sync job's
 # manifest fetch URL.
+#
+# Fork note (tylermiranda/minuspod): keep this pointing at upstream so
+# community pattern sync pulls the shared catalog from ttlequals0/MinusPod.
+# Only change if operating a separate community pattern feed.
 GITHUB_REPO = 'ttlequals0/MinusPod'
 # Per-pattern files and the index live side by side under this directory; the
 # sync client builds each per-pattern fetch URL as COMMUNITY_PATTERN_BASE_URL +
