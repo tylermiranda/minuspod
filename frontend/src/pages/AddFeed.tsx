@@ -326,7 +326,7 @@ function SearchResultItem({ result, isSubscribed, isAdding, onAdd }: {
         <div className="flex items-start justify-between gap-2">
           <div className="min-w-0">
             <a
-              href={`https://podcastindex.org/podcast/${result.id}`}
+              href={result.link || `https://podcastindex.org/podcast/${result.id}`}
               target="_blank"
               rel="noopener noreferrer"
               className={`text-sm font-semibold text-foreground hover:text-primary truncate block ${focusRing}`}
@@ -403,12 +403,14 @@ function AddFeed() {
   const urlValidation = useMemo(() => isUrl ? validateUrl(inputValue) : { isValid: false, error: null, warning: null }, [inputValue, isUrl]);
   const [touched, setTouched] = useState(false);
 
-  // Settings query to check if PodcastIndex is configured
+  // Settings query: search works via iTunes with no setup, or PodcastIndex when creds exist.
   const { data: settings } = useQuery({
     queryKey: ['settings'],
     queryFn: getSettings,
   });
   const podcastIndexConfigured = settings?.podcastIndexApiKeyConfigured ?? false;
+  const searchProvider = settings?.podcastSearchProvider?.value ?? 'itunes';
+  const searchEnabled = searchProvider === 'itunes' || podcastIndexConfigured;
 
   // Existing feeds for "already added" detection
   const { data: feedsData } = useQuery({ ...feedsQueryOptions, select: (r) => r.feeds });
@@ -418,7 +420,7 @@ function AddFeed() {
   }, [feedsData]);
 
   const inputTrimmed = inputValue.trim();
-  const shouldSearch = !isUrl && podcastIndexConfigured && inputTrimmed.length >= 2;
+  const shouldSearch = !isUrl && searchEnabled && inputTrimmed.length >= 2;
 
   // Clear stale search state during render when the search is no longer
   // applicable. Avoids a setState-in-effect for the early-return branch.
@@ -551,14 +553,14 @@ function AddFeed() {
 
       {mode === 'subscribe' && (
       <>
-      {/* No-credentials info banner */}
-      {!podcastIndexConfigured && (
+      {/* PodcastIndex selected but credentials missing */}
+      {searchProvider === 'podcastindex' && !podcastIndexConfigured && (
         <div className="mb-6 p-4 rounded-lg bg-accent/50 border border-border">
           <p className="text-sm text-muted-foreground">
             <Link to="/settings#podcast-index" className={`text-primary hover:underline font-medium ${focusRing}`}>
               Configure PodcastIndex API credentials
             </Link>
-            {' '}to search for podcasts by name. You can still add feeds by URL below.
+            {' '}to search for podcasts by name, or switch to iTunes in Settings (no setup needed). You can still add feeds by URL below.
           </p>
         </div>
       )}
@@ -567,7 +569,7 @@ function AddFeed() {
       <form onSubmit={handleSubmit} className="space-y-4">
         <div>
           <label htmlFor="podcastInput" className="block text-sm font-medium text-foreground mb-2">
-            {podcastIndexConfigured ? 'Search podcasts or enter RSS URL' : 'Podcast RSS Feed URL'}
+            {searchEnabled ? 'Search podcasts or enter RSS URL' : 'Podcast RSS Feed URL'}
           </label>
           <input
             type="text"
@@ -575,7 +577,7 @@ function AddFeed() {
             value={inputValue}
             onChange={(e) => setInputValue(e.target.value)}
             onBlur={() => { if (isUrl) setTouched(true); }}
-            placeholder={podcastIndexConfigured ? 'Search by name or paste an RSS feed URL...' : 'https://example.com/podcast/feed.xml'}
+            placeholder={searchEnabled ? 'Search by name or paste an RSS feed URL...' : 'https://example.com/podcast/feed.xml'}
             className={`w-full px-4 py-2 rounded-lg border bg-background text-foreground placeholder:text-muted-foreground focus:outline-hidden focus:ring-2 focus:ring-ring ${
               isUrl && touched && urlValidation.error
                 ? 'border-destructive focus:ring-destructive'
@@ -696,7 +698,7 @@ function AddFeed() {
       </form>
 
       {/* Section C: Search Results */}
-      {!isUrl && inputValue.trim() && podcastIndexConfigured && (
+      {!isUrl && inputValue.trim() && searchEnabled && (
         <div className="mt-4 space-y-2">
           {isSearching && (
             <div className="space-y-3">
