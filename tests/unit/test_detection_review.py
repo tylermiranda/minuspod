@@ -27,6 +27,8 @@ REJECTED = {'start': 100.0, 'end': 130.0, 'confidence': 0.4, 'was_cut': False,
             'validation': {'decision': 'REJECT'}}
 HELD = {'start': 200.0, 'end': 230.0, 'confidence': 0.6,
         'held_for_review': True, 'was_cut': False}
+KEPT_OUTRO = {'start': 400.0, 'end': 420.0, 'confidence': 0.7,
+              'category': 'outro', 'action_applied': 'keep', 'was_cut': False}
 
 
 class TestFlatten:
@@ -155,6 +157,16 @@ class TestFilter:
         out = filter_detections(items, status='needs_review')
         assert [i['start'] for i in out] == [200.0]
 
+    def test_needs_review_excludes_deliberate_keeps(self):
+        items = flatten_detections([_row(markers=[REJECTED, KEPT_OUTRO])], [])
+        out = filter_detections(items, status='needs_review')
+        assert [i['start'] for i in out] == [100.0]
+
+    def test_needs_review_count_excludes_deliberate_keeps(self):
+        items = flatten_detections([_row(markers=[REJECTED, KEPT_OUTRO])], [])
+        counts = summarize_detections(items)
+        assert counts['needsReview'] == 1
+
     def test_single_status_filters(self):
         out = filter_detections(self._items(), status='accepted')
         assert [i['start'] for i in out] == [10.0]
@@ -240,8 +252,6 @@ class TestSortAndPaginate:
 CROSS_PROMO = {'start': 300.0, 'end': 340.0, 'confidence': 0.8,
                'category': 'cross_promo', 'action_applied': 'remove',
                'sponsor': 'The Daily Tech Show'}
-KEPT_OUTRO = {'start': 400.0, 'end': 420.0, 'confidence': 0.7,
-              'category': 'outro', 'action_applied': 'keep', 'was_cut': False}
 
 
 class TestCategoryFields:

@@ -61,7 +61,9 @@ function DetectionBadges({ d, showCategory }: { d: ReviewDetection; showCategory
     <div className="flex gap-1.5 shrink-0">
       <DetectionStatusBadge status={d.status} />
       <ResolutionBadge resolution={d.resolution} />
-      {showCategory && <ActionBadge action={d.actionApplied} />}
+      {(showCategory || d.actionApplied === 'keep') && (
+        <ActionBadge action={d.actionApplied} />
+      )}
     </div>
   );
 }
@@ -123,7 +125,8 @@ function DetectionActions({ d, variant, playing, onTogglePlay, actions }: {
   const btn = isCard
     ? 'px-2 py-2.5 text-xs min-[370px]:px-2.5 min-[370px]:text-sm rounded touch-manipulation whitespace-nowrap text-center max-w-full overflow-hidden'
     : 'px-1.5 py-1 text-xs rounded whitespace-nowrap';
-  const undecided = d.resolution === 'unresolved';
+  // Deliberate keeps are final per-feed decisions; the API rejects corrections.
+  const undecided = d.resolution === 'unresolved' && d.actionApplied !== 'keep';
   // grow exists to balance the Confirm/Not-an-ad pair on review cards. With
   // no Confirm (Detected Ads), a lone grow turns Not an ad into a full-width
   // slab, so the buttons stay content-sized there.
@@ -165,14 +168,16 @@ function DetectionActions({ d, variant, playing, onTogglePlay, actions }: {
           Split
         </button>
       )}
-      <button
-        type="button"
-        onClick={() => actions.onEdit(d)}
-        disabled={actions.busy}
-        className={`${btn} ${isCard ? 'ml-auto ' : ''}${btnOutline} disabled:opacity-50 ${focusRing}`}
-      >
-        Edit
-      </button>
+      {d.actionApplied !== 'keep' && (
+        <button
+          type="button"
+          onClick={() => actions.onEdit(d)}
+          disabled={actions.busy}
+          className={`${btn} ${isCard ? 'ml-auto ' : ''}${btnOutline} disabled:opacity-50 ${focusRing}`}
+        >
+          Edit
+        </button>
+      )}
     </div>
   );
 }

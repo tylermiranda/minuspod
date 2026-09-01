@@ -259,13 +259,26 @@ describe('AdReviewTab row actions', () => {
     expect(screen.queryByRole('button', { name: /play/i })).toBeNull();
   });
 
+  it('kept segments show no review actions', async () => {
+    mockGetDetections.mockResolvedValue({
+      detections: [detection({ actionApplied: 'keep', status: 'rejected' })],
+      total: 1, page: 1, totalPages: 1, limit: 20, counts: COUNTS,
+    });
+    renderTab();
+    await screen.findAllByRole('link', { name: 'Episode One' });
+    expect(screen.queryByRole('button', { name: 'Confirm ad' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Not an ad' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Edit' })).toBeNull();
+    expect(screen.getAllByText('Kept').length).toBeGreaterThan(0);
+  });
+
   it('shows error banner when correction fails and does not call reprocess', async () => {
     const errSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
     mockSubmitCorrection.mockRejectedValueOnce(new Error('boom'));
     renderTab();
     const user = userEvent.setup();
     await user.click((await screen.findAllByRole('button', { name: 'Confirm ad' }))[0]);
-    expect(await screen.findByText('Failed to save correction. Try again.')).toBeTruthy();
+    expect(await screen.findByText('boom')).toBeTruthy();
     expect(mockReprocess).not.toHaveBeenCalled();
     errSpy.mockRestore();
   });

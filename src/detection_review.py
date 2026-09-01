@@ -111,7 +111,8 @@ def summarize_detections(items: list[dict]) -> dict:
             counts['confirmed'] += 1
         elif item['resolution'] == 'dismissed':
             counts['dismissed'] += 1
-        elif item['status'] in ('pending', 'rejected'):
+        elif (item['status'] in ('pending', 'rejected')
+              and item.get('actionApplied') != 'keep'):
             counts['needsReview'] += 1
     return counts
 
@@ -154,7 +155,8 @@ def filter_detections(items: list[dict], status: str = 'needs_review',
     if status == 'needs_review':
         out = [i for i in out
                if i['status'] in ('pending', 'rejected')
-               and i['resolution'] == 'unresolved']
+               and i['resolution'] == 'unresolved'
+               and i.get('actionApplied') != 'keep']
     elif status in ('pending', 'rejected', 'accepted'):
         out = [i for i in out if i['status'] == status]
     if category == UNSET_CATEGORY:

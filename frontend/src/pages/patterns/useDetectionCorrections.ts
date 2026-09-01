@@ -2,6 +2,7 @@ import { useState } from 'react';
 import { useMutation, useQueryClient, type QueryClient } from '@tanstack/react-query';
 import type { ReviewDetection } from '../../api/detections';
 import { reprocessEpisode } from '../../api/feeds';
+import { getErrorMessage } from '../../api/client';
 import { submitCorrection, type PatternCorrection } from '../../api/patterns';
 
 // Refresh what a recut changes, then start it. Logs and resolves false when
@@ -61,7 +62,7 @@ export function useDetectionCorrections({ stopAudition, onSettled }: Options) {
     },
     onError: (error) => {
       console.error('Failed to save correction:', error);
-      setActionError('Failed to save correction. Try again.');
+      setActionError(getErrorMessage(error, 'Failed to save correction. Try again.'));
     },
   });
 
