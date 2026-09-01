@@ -865,8 +865,35 @@ def _apply_processing_flags(db, data):
         logger.info(f"Updated max feed episodes to: {max_ep}")
 
     if 'onlyExposeProcessedDefault' in data:
-        value = 'true' if data['onlyExposeProcessedDefault'] else 'false'
+        new_enabled = bool(data['onlyExposeProcessedDefault'])
+        old_enabled = db.get_setting('only_expose_processed_default') == 'true'
+        value = 'true' if new_enabled else 'false'
         db.set_setting('only_expose_processed_default', value, is_default=False)
+        if old_enabled != new_enabled:
+            # Served RSS embeds the processed_only render mode; without
+            # invalidating validators every feed would 304-skip until the
+            # next upstream change, leaving hidden episodes invisible.
+            db.clear_all_podcast_etags()
+            import threading
+            from main_app.feeds import rebuild_all_served_feeds
+
+            def _rebuild_feeds_after_processed_only_toggle():
+                try:
+                    count = rebuild_all_served_feeds()
+                    logger.info(
+                        f"Rebuilt served RSS for {count} feed(s) after "
+                        f"only-expose-processed default -> {value}"
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to rebuild feeds after only-expose-processed "
+                        "default change"
+                    )
+
+            threading.Thread(
+                target=_rebuild_feeds_after_processed_only_toggle,
+                daemon=True,
+            ).start()
         logger.info(f"Updated only-expose-processed default to: {value}")
 
     if 'detectShowSegments' in data:

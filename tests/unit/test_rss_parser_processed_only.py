@@ -118,3 +118,12 @@ class TestProcessedOnlyFilter:
             processed_only=True, processed_episode_ids=None,
         )
         assert "/episodes/test-pod/" not in result
+
+    def test_emits_processed_only_marker(self, parser, feed_with_three_entries):
+        on = parser.modify_feed(
+            feed_with_three_entries, "test-pod",
+            processed_only=True, processed_episode_ids=set(),
+        )
+        off = parser.modify_feed(feed_with_three_entries, "test-pod")
+        assert 'purpose="minuspod-processed-only">true<' in on
+        assert 'purpose="minuspod-processed-only">false<' in off

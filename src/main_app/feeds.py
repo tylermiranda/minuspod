@@ -30,6 +30,7 @@ from main_app.cache import TTLCache
 from main_app import db, rss_parser, storage, status_service, pattern_service
 from main_app.feed_auth import active_feed_key
 from main_app.shared_state import invalidate_episode_lookup_cache
+from rss_parser import extract_cached_processed_only
 
 import webhook_service
 
@@ -130,6 +131,39 @@ def invalidate_feed_cache():
     _feed_cache.invalidate('all_feeds')
 
 
+def is_served_rss_stale(slug: str, podcast: dict | None, cached_rss: str | None) -> bool:
+    """True when stored served RSS doesn't match current feed settings.
+
+    Detects missing processed episodes and, when only-expose-processed is off,
+    unprocessed episodes that were dropped by a prior processed_only render.
+    """
+    if not cached_rss:
+        return True
+    podcast = podcast or db.get_podcast_by_slug(slug)
+    if not podcast:
+        return False
+
+    current_processed_only = db.is_only_expose_processed_for_podcast(
+        slug, podcast=podcast)
+    cached_processed_only = extract_cached_processed_only(cached_rss)
+    if cached_processed_only is not None:
+        if cached_processed_only != current_processed_only:
+            return True
+    elif not current_processed_only:
+        # Legacy cache without the marker: unprocessed episodes missing from
+        # the served feed means it was likely built with processed_only on.
+        statuses, _ = db.get_episode_statuses_for_podcast(slug)
+        for episode_id, status in statuses.items():
+            if status != 'processed' and episode_id not in cached_rss:
+                return True
+
+    for ep in db.get_processed_episodes_for_feed(podcast['id']):
+        if ep['episode_id'] not in cached_rss:
+            return True
+
+    return False
+
+
 def refresh_rss_feed(slug: str, feed_url: str, force: bool = False):
     """Refresh RSS feed for a podcast.
 
@@ -201,11 +235,7 @@ def refresh_rss_feed(slug: str, feed_url: str, force: bool = False):
                     )
                 else:
                     cached_rss = storage.get_rss(slug)
-                    rss_stale = not cached_rss or any(
-                        ep['episode_id'] not in cached_rss
-                        for ep in db.get_processed_episodes_for_feed(podcast['id'])
-                    )
-                    if rss_stale:
+                    if is_served_rss_stale(slug, podcast, cached_rss):
                         refresh_logger.info(
                             f"[{slug}] Feed unchanged (304) but RSS cache stale, forcing full fetch"
                         )

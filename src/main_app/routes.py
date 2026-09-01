@@ -27,6 +27,7 @@ from config import (
 )
 from database.podcasts import is_local_feed
 from database.queue import compute_queue_priority
+from main_app.feeds import is_served_rss_stale
 from rss_parser import extract_cached_base_url, extract_cached_feed_auth_key
 from utils.constants import EpisodeStatus, REPROCESS_SOURCE_JIT
 from utils.safe_http import URLTrust, safe_head
@@ -422,6 +423,13 @@ def register_routes(app):
                     feed_logger.info(
                         f"[{slug}] cached RSS feed-auth key state mismatch, "
                         f"forcing refresh"
+                    )
+                elif is_served_rss_stale(slug, db.get_podcast_by_slug(slug), cached_rss):
+                    should_refresh = True
+                    force_refresh = True
+                    feed_logger.info(
+                        f"[{slug}] cached RSS only-expose-processed state "
+                        f"stale, forcing refresh"
                     )
         if not should_refresh and last_checked:
             try:

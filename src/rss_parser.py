@@ -261,6 +261,23 @@ def extract_cached_feed_auth_key(cached_rss: str) -> str | None:
     return m.group(1) if m else None
 
 
+_PROCESSED_ONLY_RE = re.compile(
+    r'<podcast:txt purpose="minuspod-processed-only">(true|false)</podcast:txt>')
+
+
+def extract_cached_processed_only(cached_rss: str) -> bool | None:
+    """Return the processed_only flag embedded in a cached RSS, or None.
+
+    Used to detect when the served feed was rendered with a different
+    only-expose-processed setting than the current resolved value (issue #181
+    toggle-off regression). Older caches without the tag return None.
+    """
+    m = _PROCESSED_ONLY_RE.search(cached_rss)
+    if not m:
+        return None
+    return m.group(1) == 'true'
+
+
 class RSSParser:
     def __init__(self, base_url: str = None):
         self._explicit_base_url = base_url
@@ -990,6 +1007,11 @@ class RSSParser:
         # Channel-level Podcasting 2.0 tags: minted guid, passthrough of safe
         # upstream tags, ai-content disclosure. See docs/podcasting-2.0.md.
         self._emit_channel_pc2_tags(lines, feed_content, slug, channel=channel_elem)
+        # Stamp the processed_only render mode so serve_rss and the 304 path
+        # can detect a settings toggle without re-parsing upstream.
+        lines.append(
+            f'<podcast:txt purpose="minuspod-processed-only">'
+            f'{str(processed_only).lower()}</podcast:txt>')
 
         # Limit to most recent episodes to keep feed size manageable
         # Pocket Casts and other apps may reject very large feeds (>1MB)
