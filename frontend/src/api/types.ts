@@ -207,6 +207,12 @@ export interface DaiDifferential {
   error?: string | null;
 }
 
+export interface AppliedCut {
+  start: number;
+  end: number;
+  replacementDuration?: number;
+}
+
 export interface EpisodeDetail extends Episode {
   description?: string;
   // Local feeds only; absent on a subscribed feed's episodes. The
@@ -234,6 +240,7 @@ export interface EpisodeDetail extends Episode {
   // configuration outcome, not a rejected detection.
   keptMarkers?: AdSegment[];
   corrections?: EpisodeCorrection[];
+  appliedCuts?: AppliedCut[] | null;
   cueDetections?: CueDetection[];
   originalDuration?: number;
   newDuration?: number;
@@ -418,6 +425,7 @@ export interface AdSegment {
   // What the resolved segment-action map did with this marker's category.
   // Null when the marker predates the feature or the action never resolved.
   actionApplied?: SegmentAction | null;
+  pattern_id?: number;
 }
 
 export interface SettingValue {

@@ -427,6 +427,19 @@ def get_episode(slug, episode_id):
 
     processing_runs = _processing_runs(db, episode)
 
+    applied_cuts = None
+    if status == EpisodeStatus.COMPLETED:
+        cuts_raw = storage.get_applied_cuts(slug, episode_id)
+        if cuts_raw is not None:
+            applied_cuts = [
+                {
+                    'start': cut['start'],
+                    'end': cut['end'],
+                    'replacementDuration': cut.get('replacement_duration'),
+                }
+                for cut in cuts_raw
+            ]
+
     return json_response({
         **base,
         # Local-feed season/episode numbers (absent/None on a subscribed
@@ -450,6 +463,7 @@ def get_episode(slug, episode_id):
         'pendingReviewMarkers': pending_review_markers,
         'keptMarkers': kept_markers,
         'corrections': corrections,
+        'appliedCuts': applied_cuts,
         'cueDetections': cue_detections,
         'adDetectionStatus': episode.get('ad_detection_status'),
         'partialDetection': _partial_detection(episode, processing_runs),

@@ -19,6 +19,7 @@ import { CORROBORATION_CLASS, CORROBORATION_META } from '../utils/corroboration'
 import { formatConfidence } from '../utils/confidence';
 import AdEditor, { AdCorrection } from '../components/AdEditor';
 import AdReviewModal from '../components/AdReviewModal';
+import TranscriptSegmentWorkspace from '../components/TranscriptSegmentWorkspace';
 import type { AdSegment, Feed, EpisodeDetail as EpisodeDetailApi } from '../api/types';
 import PatternLink from '../components/PatternLink';
 import ExpandableText from '../components/ExpandableText';
@@ -245,6 +246,7 @@ type SaveStatus = 'idle' | 'saving' | 'success' | 'error';
 function EpisodeDetail() {
   const { slug, episodeId } = useParams<{ slug: string; episodeId: string }>();
   const [showEditor, setShowEditor] = useState(false);
+  const [showTranscriptWorkspace, setShowTranscriptWorkspace] = useState(false);
   const [createModeRequested, setCreateModeRequested] = useState(false);
   const [saveStatus, setSaveStatus] = useState<SaveStatus>('idle');
   // Transient error toast for a rejected correction submit (e.g. a 409 on a
@@ -255,6 +257,12 @@ function EpisodeDetail() {
   // Held/rejected row currently open in the standalone waveform editor
   // (issue #563). Independent of showEditor/AdEditor state.
   const [reviewMarker, setReviewMarker] = useState<{ segment: AdSegment; key: string; fromHeld: boolean } | null>(null);
+  const [transcriptWaveformHandoff, setTranscriptWaveformHandoff] = useState<{
+    start: number;
+    end: number;
+    createMode: boolean;
+    marker?: AdSegment;
+  } | null>(null);
   const [savedScrollY, setSavedScrollY] = useState<number | null>(null);
   const [reviewMode, setReviewMode] = useLocalStorageState<'processed' | 'original'>(
     'ad-editor-review-mode',
@@ -379,6 +387,31 @@ function EpisodeDetail() {
   // Handle ad corrections from AdEditor
   const handleCorrection = (correction: AdCorrection) => {
     correctionMutation.mutate(correction);
+  };
+
+  const submitCorrectionAsync = (correction: AdCorrection) =>
+    correctionMutation.mutateAsync(correction);
+
+  const handleTranscriptRecut = () => {
+    reprocessMutation.mutate('recut');
+  };
+
+  const handleTranscriptWaveformHandoff = (opts: {
+    start: number;
+    end: number;
+    createMode: boolean;
+    marker?: AdSegment;
+  }) => {
+    setShowTranscriptWorkspace(false);
+    if (opts.marker && !opts.createMode) {
+      setReviewMarker({
+        segment: opts.marker,
+        key: `transcript-${opts.start}-${opts.end}`,
+        fromHeld: !!opts.marker.held_for_review,
+      });
+      return;
+    }
+    setTranscriptWaveformHandoff(opts);
   };
 
   // Per-row save status for the Held-for-Review and Detections-Not-Cut rows.
@@ -778,6 +811,18 @@ function EpisodeDetail() {
           </div>
         )}
 
+        {episode.status === 'completed' && episode.originalTranscriptAvailable && (
+          <div className="mt-4 pt-4 border-t border-border flex flex-wrap gap-2">
+            <button
+              type="button"
+              onClick={() => setShowTranscriptWorkspace(true)}
+              className={`px-3 py-1.5 text-sm rounded-md ${btnPrimary} transition-colors ${focusRing}`}
+            >
+              Review transcript
+            </button>
+          </div>
+        )}
+
         {episode.status === 'completed' && (
           <div className="mt-4 pt-4 border-t border-border">
             {/* processedUrl is server-built and carries the feed auth key when
@@ -899,15 +944,15 @@ function EpisodeDetail() {
                 <div className="flex items-center gap-1.5 shrink-0">
                   <button
                     onClick={() => openEditorFresh(false)}
-                    aria-label={showEditor ? 'Hide editor' : 'Edit ads'}
-                    title={showEditor ? 'Hide editor' : 'Edit ads'}
+                    aria-label={showEditor ? 'Hide waveform editor' : 'Fine-tune in waveform'}
+                    title={showEditor ? 'Hide waveform editor' : 'Fine-tune in waveform'}
                     className={`inline-flex items-center gap-1.5 px-2 sm:px-3 py-1.5 text-xs sm:text-sm ${btnSecondary} rounded-md transition-colors whitespace-nowrap ${focusRing}`}
                   >
                     <svg className="w-4 h-4 shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                       <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2}
                         d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
                     </svg>
-                    <span className="hidden sm:inline">{showEditor ? 'Hide Editor' : 'Edit Ads'}</span>
+                    <span className="hidden sm:inline">{showEditor ? 'Hide waveform' : 'Fine-tune in waveform'}</span>
                   </button>
                   <button
                     onClick={() => openEditorFresh(true)}
@@ -1201,6 +1246,83 @@ function EpisodeDetail() {
           />
         );
       })()}
+
+      {showTranscriptWorkspace && (
+        <TranscriptSegmentWorkspace
+          slug={slug!}
+          episodeId={episodeId!}
+          episode={episode}
+          onClose={() => setShowTranscriptWorkspace(false)}
+          onSubmitCorrection={submitCorrectionAsync}
+          onRecut={handleTranscriptRecut}
+          onOpenWaveform={handleTranscriptWaveformHandoff}
+          saveStatus={saveStatus}
+          correctionError={correctionError}
+        />
+      )}
+
+      {transcriptWaveformHandoff && (
+        <AdReviewModal
+          key={`transcript-handoff-${transcriptWaveformHandoff.start}-${transcriptWaveformHandoff.end}`}
+          mode={transcriptWaveformHandoff.createMode ? 'create' : 'review'}
+          hasNext={false}
+          item={{
+            podcastSlug: slug!,
+            episodeId: episodeId!,
+            start: transcriptWaveformHandoff.start,
+            end: transcriptWaveformHandoff.end,
+            sponsor: transcriptWaveformHandoff.marker?.sponsor ?? null,
+            reason: transcriptWaveformHandoff.marker?.reason ?? '',
+            confidence: transcriptWaveformHandoff.marker?.confidence ?? null,
+            detectionStage: transcriptWaveformHandoff.marker?.detection_stage ?? 'manual',
+            patternId: transcriptWaveformHandoff.marker?.pattern_id ?? null,
+            correctedBounds: null,
+          }}
+          audioMode="original"
+          hasOriginal={!!episode.hasOriginalAudio}
+          episodeDuration={episode.originalDuration ?? 0}
+          onSubmit={(s) => {
+            const marker = transcriptWaveformHandoff.marker;
+            const originalAd = marker
+              ? toOriginalAd(marker)
+              : {
+                  start: transcriptWaveformHandoff.start,
+                  end: transcriptWaveformHandoff.end,
+                  confidence: 1,
+                  reason: '',
+                };
+            if (s.kind === 'reject') {
+              handleCorrection({ type: 'reject', originalAd });
+            } else if (s.kind === 'adjust') {
+              handleCorrection({
+                type: 'adjust',
+                originalAd,
+                adjustedStart: s.adjustedStart,
+                adjustedEnd: s.adjustedEnd,
+                sponsor: s.sponsor,
+              });
+            } else {
+              handleCorrection({ type: 'confirm', originalAd, sponsor: s.sponsor });
+            }
+            setTranscriptWaveformHandoff(null);
+          }}
+          onCreate={(s) => {
+            handleCorrection({
+              type: 'create',
+              start: s.start,
+              end: s.end,
+              sponsor: s.sponsor,
+              text_template: s.textTemplate,
+              scope: s.scope,
+              reason: s.reason,
+              category: s.category,
+            });
+            setTranscriptWaveformHandoff(null);
+          }}
+          onSkip={() => setTranscriptWaveformHandoff(null)}
+          onClose={() => setTranscriptWaveformHandoff(null)}
+        />
+      )}
 
       {heldMarkers.length > 0 && (
         <div className="bg-card rounded-lg border border-warning/30 p-6 mb-6" data-testid="held-for-review-section">
