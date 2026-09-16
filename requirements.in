@@ -7,10 +7,10 @@
 
 # Core transcription
 faster-whisper>=1.1.0
-ctranslate2==4.8.1
+ctranslate2==4.8.2
 
 # API and web
-anthropic>=1.0.0
+anthropic>=1.5.0
 openai>=3.3.1                  # OpenAI-compatible API (Claude Code wrapper, Ollama)
 flask>=3.1.3
 flask-compress>=1.14
@@ -33,12 +33,12 @@ python-slugify==8.0.4
 # container Python at 3.12: numpy<2.0 ships no cp313+ wheels, which is why
 # the Dockerfiles pin python3.12 via deadsnakes.
 numpy<2.0
-huggingface_hub>=1.30.0
+huggingface_hub>=1.31.0
 
 # Cross-episode ad training (fingerprinting + text matching)
 pyacoustid>=1.2.0
 rapidfuzz>=3.14.6
-scikit-learn>=1.9.0
+scikit-learn>=1.9.1
 
 # Security
 nh3>=0.3.7
