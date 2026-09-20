@@ -7,6 +7,10 @@ Two distinct cases:
 """
 import json
 
+from tests.app_bootstrap import bootstrap
+
+bootstrap('google_rate_limit_test_')
+
 from utils.rate_limit import parse_google_retry_delay, parse_google_daily_quota
 from llm_client import (
     classify_daily_quota_exhaustion, extract_retry_after, StructuralRateLimitError,
@@ -166,7 +170,7 @@ class TestRetryLoopDailyQuotaFastFail:
         response, last_error = llm_call.call_llm_for_window(
             llm_client=_Client(), model="gemini-3.5-flash", system_prompt="s",
             prompt="u", llm_timeout=1.0, max_retries=5, max_tokens=4096,
-            slug="t", episode_id="e", window_label="w",
+            slug="t", episode_id="e", window_label="w", phase_key="test",
         )
         assert response is None and last_error is not None
         assert calls["n"] == 1  # no long-backoff retries on a dead daily quota

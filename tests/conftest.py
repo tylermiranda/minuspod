@@ -51,6 +51,27 @@ def temp_db(temp_dir):
 
 
 @pytest.fixture
+def preserve_setting():
+    """Factory: snapshot a global setting's value and is_default, restore after.
+    A leaked global value decides another module's assertion."""
+    saved = []
+
+    def _preserve(key):
+        db = Database()
+        row = db.get_connection().execute(
+            "SELECT value, is_default FROM settings WHERE key = ?", (key,)).fetchone()
+        saved.append((db, key, row))
+
+    yield _preserve
+
+    for db, key, row in reversed(saved):
+        if row is None:
+            db.clear_setting(key)
+        else:
+            db.set_setting(key, row['value'], bool(row['is_default']))
+
+
+@pytest.fixture
 def sample_transcript():
     """Sample transcript with ad segments for testing."""
     return [
@@ -203,3 +224,17 @@ def _reset_warned_invalid_values():
         settings_mod._warned_invalid_values.clear()
     except ImportError:
         pass
+
+
+@pytest.fixture(autouse=True)
+def _reset_rate_limiter():
+    """Clear in-memory limiter counters before each test."""
+    try:
+        from api import limiter
+        limiter.reset()
+    except Exception:
+        # Limiter may not be initialised yet when the first test of a
+        # module runs (Flask app import is lazy). Safe to skip.
+        pass
+    yield
+

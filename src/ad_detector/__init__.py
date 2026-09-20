@@ -23,15 +23,17 @@ from llm_client import (
     get_effective_provider, model_matches_provider,
     StructuralRateLimitError, ProviderRateLimitedError,
 )
-from run_context import run_in_worker_thread
+from llm_route import client_for_route
+from run_context import route_for_phase, run_in_worker_thread
 from sponsor_normalize import segment_category_for
 from utils.language import get_pattern_language
-from utils.llm_call import call_llm, call_llm_for_window, schema_format_for
+from utils.llm_call import (
+    call_llm, call_llm_for_window, schema_format_for, window_loss_class,
+)
 from utils.markers import (
     DAI_CORE_SPANS,
-    mark_distinct_merge,
-    merge_dai_core_spans,
-    note_merged_members,
+    estimated_text_bounds,
+    note_fold,
 )
 from utils.prompt import (
     format_sponsor_block, render_prompt, apply_override,
@@ -218,6 +220,9 @@ class WindowResult(NamedTuple):
     dropped_invalid_ref: int = 0
     dropped_out_of_window: int = 0
     dropped_too_long: int = 0
+    # What a failed window was lost to (utils.llm_call.window_loss_class);
+    # None on a window that answered.
+    loss_class: str | None = None
 
 
 @dataclass
@@ -305,7 +310,7 @@ def _model_not_found_hint(last_error, model) -> str:
 
 
 def _windows_failed_response(stage: str, failed_windows: int, num_windows: int,
-                              last_error, model) -> dict:
+                              last_error, model, loss_classes=None) -> dict:
     """Build the failure response for a pass whose failed-window count hit
     the fail threshold (all windows, or too high a share).
 
@@ -354,6 +359,12 @@ def _windows_failed_response(stage: str, failed_windows: int, num_windows: int,
         "limit_exceeded": limit_exceeded,
         "rate_limited_hold": rate_limited_hold,
         "retry_after_seconds": getattr(last_error, 'retry_after_seconds', None),
+        "provider_key": getattr(last_error, 'provider_key', None),
+        "credential_slot": getattr(last_error, 'credential_slot', 'primary'),
+        # Manual MinusPod caps (#747) must stay manual across the stage
+        # boundary: a manual hold is never completion-probed, and defers even
+        # when the 429-hold toggle is off.
+        "manual": getattr(last_error, 'manual', False),
         # Lets the pipeline tell "endpoint down" apart from a bad response so
         # the offline queue (#482) defers only genuine outages. Includes
         # CircuitBreakerOpen, which reaches here as last_error because
@@ -364,6 +375,7 @@ def _windows_failed_response(stage: str, failed_windows: int, num_windows: int,
         # Per-run stats (#519): "0/N answered" is the failure signal.
         "windows_total": num_windows,
         "windows_failed": failed_windows,
+        "windows_failure_classes": loss_classes or {},
     }
 
 
@@ -388,6 +400,27 @@ def _span_transcript_coverage(segments, start, end):
         covered += max(0.0, min(float(seg.get('end', 0.0)), end)
                        - max(float(seg.get('start', 0.0)), start))
     return min(1.0, covered / span)
+
+
+def _window_seen_extent(window_segments, window_start, window_end):
+    """The extent the model was shown: the window bounds the prompt prints,
+    widened by any segment straddling an edge. A window carries every segment
+    it overlaps, timestamps included, so that text is in front of it too."""
+    if not window_segments:
+        return window_start, window_end
+    return (min(window_start, min(float(seg['start']) for seg in window_segments)),
+            max(window_end, max(float(seg['end']) for seg in window_segments)))
+
+
+def _clamp_ad_to_window(ad, seen_start, seen_end):
+    """``ad`` narrowed to the bounds given, or the ad itself when it already
+    fits. Length is not judged here: the raw refusal rules on it before the
+    clamp, and the duration floors downstream rule on what survives."""
+    start = max(float(ad['start']), seen_start)
+    end = min(float(ad['end']), seen_end)
+    if start == ad['start'] and end == ad['end']:
+        return ad
+    return dict(ad, start=start, end=end)
 
 
 def dai_differential_ads(dai_differential, fp_pairs, corroborating_spans=None, *,
@@ -547,13 +580,14 @@ _MEMBER_STAGES = '_member_stages'
 
 
 def _label_reach(entry: dict) -> float:
-    """Audio a member's reason/sponsor label may claim: the full span, or
-    just the matched-text extent when the span is duration-estimated."""
+    """Audio a member's reason/sponsor label may claim: the full span, or just
+    the matched-text extent when the span is duration-estimated. The label claim
+    stays text-limited even after the span moves, unlike member protection,
+    which only narrows while the span is still the estimate."""
+    text = estimated_text_bounds(entry)
+    if text is not None:
+        return max(0.0, text[1] - text[0])
     if entry.get('span_estimated'):
-        text_start = entry.get('text_start')
-        text_end = entry.get('text_end')
-        if text_start is not None and text_end is not None:
-            return max(0.0, text_end - text_start)
         # No text bounds recorded: conservative half-span cap.
         return (entry['end'] - entry['start']) / 2
     return entry['end'] - entry['start']
@@ -577,6 +611,16 @@ def _pattern_match_evidence(match, kind: str) -> str:
     if matched:
         return f'{kind} "{truncate(matched, PATTERN_EVIDENCE_MAX_CHARS)}" {pct}'
     return f'{kind} {pct}'
+
+
+def _phase_for_pass(pass_name: str) -> str:
+    """Route-snapshot phase key for a detection pass_name."""
+    if pass_name == PASS_AD_DETECTION_1:
+        return 'detection'
+    if pass_name == PASS_AD_DETECTION_2:
+        return 'verification'
+    logger.debug("Unknown pass_name for ad_detector: %r, defaulting to 'detection'", pass_name)
+    return 'detection'
 
 
 class AdDetector:
@@ -743,7 +787,10 @@ class AdDetector:
         return models_list
 
     def get_model(self) -> str:
-        """Get configured model from database, or raise if unset."""
+        """This run's detection model, or the configured value outside a run."""
+        route = route_for_phase('detection')
+        if route:
+            return route['configured_model']
         self._ensure_deps()
         try:
             model = self.db.get_setting('claude_model')
@@ -754,7 +801,10 @@ class AdDetector:
         raise ModelNotConfiguredError('claude_model')
 
     def get_verification_model(self) -> str:
-        """Get verification pass model from database, else fall back to first pass model."""
+        """This run's verification model, or the configured value outside a run."""
+        route = route_for_phase('verification')
+        if route:
+            return route['configured_model']
         self._ensure_deps()
         try:
             model = self.db.get_setting('verification_model')
@@ -763,6 +813,23 @@ class AdDetector:
         except Exception:
             pass
         return self.get_model()
+
+    def get_provider(self) -> str:
+        """This run's detection provider, or the global effective provider outside a run."""
+        route = route_for_phase('detection')
+        return route['provider_key'] if route else get_effective_provider()
+
+    def get_verification_provider(self) -> str:
+        """This run's verification provider, or the global effective provider outside a run."""
+        route = route_for_phase('verification')
+        return route['provider_key'] if route else get_effective_provider()
+
+    def _client_for_pass(self, pass_name: str) -> LLMClient | None:
+        """LLM client for a detection pass: the run's routed provider client,
+        or the legacy override/global client outside a run."""
+        return client_for_route(
+            _phase_for_pass(pass_name), override=self._llm_client_override,
+            fallback=lambda: get_llm_client() if self.api_key else None)
 
     def _apply_pass_override(self, rendered: str, setting_key: str) -> str:
         """Append the user's per-pass override (empty by default -> no change)."""
@@ -999,17 +1066,15 @@ class AdDetector:
         the temperature/max_tokens/reasoning values, and is forwarded to the LLM
         client for per-pass fallback flag scoping.
         """
-        if pass_name == PASS_AD_DETECTION_1:
-            prefix = 'detection'
-        elif pass_name == PASS_AD_DETECTION_2:
-            prefix = 'verification'
-        else:
-            raise ValueError(f"Unknown pass_name for ad_detector: {pass_name!r}")
-
-        max_tokens, temperature, reasoning = resolve_stage_tunables(prefix)
+        phase = _phase_for_pass(pass_name)
+        route = route_for_phase(phase)
+        provider = route['provider_key'] if route else None
+        credential_slot = route.get('credential_slot', 'primary') if route else 'primary'
+        max_tokens, temperature, reasoning = resolve_stage_tunables(
+            phase, provider=provider)
 
         return call_llm_for_window(
-            llm_client=self._llm_client,
+            llm_client=self._client_for_pass(pass_name),
             model=model,
             system_prompt=system_prompt,
             prompt=prompt,
@@ -1022,9 +1087,12 @@ class AdDetector:
             episode_id=episode_id,
             window_label=window_label,
             pass_name=pass_name,
+            phase_key=phase,
+            provider=provider,
+            credential_slot=credential_slot,
             response_format=schema_format_for(
                 model, 'ad_detection', AD_DETECTION_JSON_SCHEMA,
-                'Ad segments detected in this window.'),
+                'Ad segments detected in this window.', provider=provider),
         )
 
     def _process_single_window(self, *, window_idx, window, total_windows,
@@ -1110,6 +1178,7 @@ class AdDetector:
                 last_error=last_error,
                 addressing_mode=addressing_mode,
                 compliant=None,
+                loss_class=window_loss_class(last_error),
             )
 
         response_text = response.content
@@ -1172,24 +1241,49 @@ class AdDetector:
         dropped_out_of_window = 0
         dropped_too_long = 0
         valid_window_ads = []
+        seen_start, seen_end = _window_seen_extent(
+            window_segments, window_start, window_end)
         for ad in window_ads:
-            duration = ad['end'] - ad['start']
-            in_window = (ad['start'] >= window_start - MIN_OVERLAP_TOLERANCE and
-                         ad['start'] <= window_end + MIN_OVERLAP_TOLERANCE)
-            reasonable_length = duration <= MAX_AD_DURATION_WINDOW
-
-            if in_window and reasonable_length:
-                valid_window_ads.append(ad)
-            else:
-                if not in_window:
-                    dropped_out_of_window += 1
-                else:
-                    dropped_too_long += 1
+            # Judged on the raw span: an over-long proposal is refused, not
+            # trimmed to the window edge until it fits.
+            duration = float(ad['end']) - float(ad['start'])
+            if duration > MAX_AD_DURATION_WINDOW:
+                dropped_too_long += 1
                 logger.warning(
                     f"[{slug}:{episode_id}] {window_label} rejected ad: "
-                    f"{ad['start']:.1f}s-{ad['end']:.1f}s ({duration:.0f}s) - "
-                    f"{'outside window' if not in_window else 'too long'}"
+                    f"{ad['start']:.1f}s-{ad['end']:.1f}s "
+                    f"({duration:.0f}s) - too long"
                 )
+                continue
+            if not (seen_start - MIN_OVERLAP_TOLERANCE <= float(ad['start'])
+                    <= seen_end + MIN_OVERLAP_TOLERANCE):
+                dropped_out_of_window += 1
+                logger.warning(
+                    f"[{slug}:{episode_id}] {window_label} rejected ad: "
+                    f"{ad['start']:.1f}s-{ad['end']:.1f}s "
+                    f"({duration:.0f}s) - outside window"
+                )
+                continue
+            # Inside the placement tolerance an edge belongs to an ad that
+            # straddles the window, and the cross-window merge re-unions it.
+            # Past the tolerance the model is extrapolating: cut it back.
+            clamped = _clamp_ad_to_window(ad, seen_start - MIN_OVERLAP_TOLERANCE,
+                                          seen_end + MIN_OVERLAP_TOLERANCE)
+            if clamped is not ad:
+                logger.info(
+                    f"[{slug}:{episode_id}] {window_label} clamped ad "
+                    f"{ad['start']:.1f}s-{ad['end']:.1f}s to its window: "
+                    f"{clamped['start']:.1f}s-{clamped['end']:.1f}s"
+                )
+            valid_window_ads.append(clamped)
+
+        # Stamp the LLM origin before the window-dedup merge records members:
+        # a member span saved with no stage reads as measured evidence later
+        # and freezes the reviewer's boundary trims (issue #750).
+        llm_stage = ('verification' if pass_name == PASS_AD_DETECTION_2
+                     else 'claude')
+        for ad in valid_window_ads:
+            ad.setdefault('detection_stage', llm_stage)
 
         logger.info(
             f"[{slug}:{episode_id}] {window_label} found {len(valid_window_ads)} ads"
@@ -1333,7 +1427,9 @@ class AdDetector:
 
         Returns ``(final_ads, all_raw_responses, failed_windows,
         failure_response, category_missing, category_total,
-        category_repaired, addressing)`` where ``failure_response`` is the
+        category_repaired, window_losses, addressing)`` where
+        ``window_losses`` tallies the failed windows by loss class and
+        ``failure_response`` is the
         all-windows-failed envelope the caller must return as-is, or None.
         ``category_missing``/``category_total`` count raw LLM markers still
         missing "category" across non-failed windows before dedup, after
@@ -1345,6 +1441,7 @@ class AdDetector:
         all_raw_responses = []
         all_window_ads = []
         failed_windows = 0
+        window_losses = {}
         last_error = None
         llm_timeout = get_llm_timeout()
         max_retries = get_llm_max_retries()
@@ -1393,6 +1490,8 @@ class AdDetector:
         for result in window_results:
             if result.failed:
                 failed_windows += 1
+                loss = result.loss_class or window_loss_class(result.last_error)
+                window_losses[loss] = window_losses.get(loss, 0) + 1
                 last_error = result.last_error
                 # A held 429 in ANY window defers the whole episode (#696):
                 # proceeding with the surviving windows would silently skip
@@ -1424,6 +1523,7 @@ class AdDetector:
                         slug=slug,
                         episode_id=episode_id,
                         window_label=window_label,
+                        pass_name=pass_name,
                     )
                 except ProviderRateLimitedError as e:
                     # Same rule as a held window: the hold defers the episode.
@@ -1441,18 +1541,18 @@ class AdDetector:
         if hold_error is not None:
             failure = _windows_failed_response(
                 pass_label.lower(), failed_windows, len(windows),
-                hold_error, model)
+                hold_error, model, window_losses)
             return ([], all_raw_responses, failed_windows, failure,
-                    0, 0, 0, AddressingStats())
+                    0, 0, 0, window_losses, AddressingStats())
 
         failure_ratio = failed_windows / len(windows) if windows else 0.0
         if failed_windows >= len(windows) or (
                 failure_ratio > _resolve_max_failed_window_ratio()):
             failure = _windows_failed_response(
                 pass_label.lower(), failed_windows, len(windows),
-                last_error, model)
+                last_error, model, window_losses)
             return ([], all_raw_responses, failed_windows, failure,
-                    0, 0, 0, AddressingStats())
+                    0, 0, 0, window_losses, AddressingStats())
 
         # Raw LLM markers with no "category": the merge seam leaves these
         # unset, so this counts what stays uncategorized end to end.
@@ -1464,11 +1564,11 @@ class AdDetector:
         final_ads = deduplicate_window_ads(all_window_ads, action_map=action_map)
         return (final_ads, all_raw_responses, failed_windows, None,
                 category_missing, category_total, category_repaired,
-                addressing)
+                window_losses, addressing)
 
     def _repair_window_categories(self, *, ads, transcript_excerpt, model,
                                    llm_timeout, max_retries, slug, episode_id,
-                                   window_label):
+                                   window_label, pass_name=PASS_AD_DETECTION_1):
         """One follow-up LLM call asking only for categories on ``ads``
         missing one; prompt wording alone left most detections
         category-less on real episodes, so ask again narrowly instead.
@@ -1482,9 +1582,13 @@ class AdDetector:
             return 0
 
         prompt = format_category_repair_prompt(transcript_excerpt, missing)
+        phase = _phase_for_pass(pass_name)
+        route = route_for_phase(phase)
+        provider = route['provider_key'] if route else None
+        credential_slot = route.get('credential_slot', 'primary') if route else 'primary'
 
         response, error = call_llm(
-            llm_client=self._llm_client,
+            llm_client=self._client_for_pass(pass_name),
             model=model,
             system_prompt=CATEGORY_REPAIR_SYSTEM_PROMPT,
             prompt=prompt,
@@ -1494,10 +1598,13 @@ class AdDetector:
             slug=slug,
             episode_id=episode_id,
             call_label=f"{window_label} category repair",
+            phase_key=phase,
+            provider=provider,
+            credential_slot=credential_slot,
             response_format=schema_format_for(
                 model, 'segment_categories', CATEGORY_REPAIR_JSON_SCHEMA,
                 'Category for each listed segment.',
-                allow_provider_schema=True),
+                allow_provider_schema=True, provider=provider),
         )
         if response is None:
             # A rate-limit hold is queue-wide state, not a degraded window.
@@ -1642,7 +1749,7 @@ class AdDetector:
 
             (final_ads, all_raw_responses, failed_windows, failure,
              category_missing, category_total, category_repaired,
-             addressing) = self._run_detection_pass(
+             window_losses, addressing) = self._run_detection_pass(
                 windows,
                 pass_label='Detection',
                 model=model,
@@ -1727,6 +1834,7 @@ class AdDetector:
                 "model": model,
                 "windows_total": len(windows),
                 "windows_failed": failed_windows,
+                "windows_failure_classes": window_losses,
             }
 
         except Exception as e:
@@ -2167,6 +2275,8 @@ class AdDetector:
         if 'windows_total' in result:
             detection_stats['windows_total'] = result['windows_total']
             detection_stats['windows_failed'] = result.get('windows_failed', 0)
+            detection_stats['windows_failure_classes'] = result.get(
+                'windows_failure_classes') or {}
 
         # Merge Claude detections with pattern matches
         claude_ads = result.get('ads', [])
@@ -2283,9 +2393,11 @@ class AdDetector:
         fp_count = detection_stats['fingerprint_matches']
         tp_count = detection_stats['text_pattern_matches']
         cl_count = detection_stats['claude_matches']
+        dd_count = detection_stats['dai_differential_matches']
         logger.info(
             f"[{slug}:{episode_id}] Detection complete: {total} ads "
-            f"(fingerprint: {fp_count}, text: {tp_count}, claude: {cl_count})"
+            f"(fingerprint: {fp_count}, text: {tp_count}, "
+            f"differential: {dd_count}, claude: {cl_count})"
         )
 
         # Pattern learning moved to main.py (after validation sets was_cut)
@@ -2305,7 +2417,10 @@ class AdDetector:
         else:
             reason = f"Pattern #{match.pattern_id} ({evidence})"
 
-        all_ads.append({
+        # getattr: FingerprintMatch has no span-estimation fields (audio
+        # stage matches real audio, never estimates a boundary).
+        span_estimated = getattr(match, 'span_estimated', False)
+        entry = {
             'start': match.start,
             'end': match.end,
             'confidence': match.confidence,
@@ -2319,12 +2434,11 @@ class AdDetector:
             # getattr: FingerprintMatch has no 'defined' field (audio stage
             # predates the trust-tier split); treat it as not tier-1.
             'pattern_defined': getattr(match, 'defined', False),
-            # getattr: FingerprintMatch has no span-estimation fields (audio
-            # stage matches real audio, never estimates a boundary).
-            'span_estimated': getattr(match, 'span_estimated', False),
+            'span_estimated': span_estimated,
             'text_start': getattr(match, 'text_start', None),
             'text_end': getattr(match, 'text_end', None),
-        })
+        }
+        all_ads.append(entry)
         pattern_matched_regions.append({
             'start': match.start,
             'end': match.end,
@@ -2498,7 +2612,8 @@ class AdDetector:
                 scope='podcast',
                 podcast_id=podcast_id,
                 episode_id=episode_id,
-                category=ad.get('category')
+                category=ad.get('category'),
+                ad=ad,
             )
 
             if pattern_ids:
@@ -2730,19 +2845,7 @@ class AdDetector:
                         and current['start'] >= last['end']):
                     merged.append(_with_category_span(current.copy()))
                     continue
-                merge_dai_core_spans(last, current)
-                # Non-overlapping spans (touching or gapped) are distinct ads,
-                # not the same ad overlapping across stages. Touch counts too
-                # (LLM breaks are often exactly contiguous). Keep these
-                # expand-only in the reviewer so a later inward pull can't drop
-                # a sub-ad; a true overlap (start < end) stays tightenable.
-                if current['start'] >= last['end']:
-                    mark_distinct_merge(last, current)
-                elif 'merged_protected_start' in last:
-                    # True overlap extending a tracked merge: fold the member
-                    # in so the protected union covers audio it adds past the
-                    # recorded end (else a later trim could sever it).
-                    note_merged_members(last, current)
+                note_fold(last, current)
                 # The label goes to the member classifying the most audio,
                 # ties to the incumbent. A member naming nothing, or naming
                 # something outside the vocabulary, displaces nothing.
@@ -2935,7 +3038,10 @@ class AdDetector:
                                or sanitize_sponsor_label(other.get('sponsor')))
 
                     combined = a.copy()
-                    merge_dai_core_spans(combined, b)
+                    note_fold(combined, b)
+                    # The flag is the reviewer's gate on member protection.
+                    if b.get('merged_distinct_ads'):
+                        combined['merged_distinct_ads'] = True
                     combined['start'] = min(a['start'], b['start'])
                     combined['end'] = max(a['end'], b['end'])
                     combined['confidence'] = max(a_conf, b_conf)
@@ -3056,7 +3162,7 @@ class AdDetector:
             # can distinguish first-pass from verification.
             (final_ads, all_raw_responses, failed_windows, failure,
              category_missing, category_total, category_repaired,
-             addressing) = self._run_detection_pass(
+             window_losses, addressing) = self._run_detection_pass(
                 windows,
                 pass_label='Verification',
                 model=model,
@@ -3130,6 +3236,7 @@ class AdDetector:
                 "segment_actions": action_map,
                 "windows_total": len(windows),
                 "windows_failed": failed_windows,
+                "windows_failure_classes": window_losses,
             }
 
         except Exception as e:

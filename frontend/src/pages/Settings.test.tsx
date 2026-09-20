@@ -68,6 +68,10 @@ vi.mock('../api/settings', () => ({
   resetPrompts: vi.fn(),
   resetPrompt: (...a: unknown[]) => mockResetPrompt(...a),
   getModels: vi.fn().mockResolvedValue([]),
+  modelsQueryOptionsFor: (provider: string, slot: string) => ({
+    queryKey: ['models', provider, slot],
+    queryFn: () => Promise.resolve([]),
+  }),
   getWhisperModels: vi.fn().mockResolvedValue([]),
   getWhisperCapacity: vi.fn().mockResolvedValue({
     enabled: false, backend: 'openai-api', active: false, inactiveReason: 'disabled',
@@ -118,6 +122,7 @@ vi.mock('../api/providers', () => ({
   testProvider: vi.fn(),
   testWhisperConnection: vi.fn(),
   testLlmConnection: vi.fn(),
+  testSecondaryProviderConnection: vi.fn(),
   testPodcastIndex: vi.fn(),
 }));
 
@@ -171,6 +176,8 @@ function renderSettings() {
 }
 
 beforeEach(() => {
+  localStorage.setItem('settings-section-prompts', 'true');
+  localStorage.setItem('settings-section-ad-reviewer', 'true');
   vi.clearAllMocks();
 });
 

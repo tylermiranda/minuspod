@@ -1,7 +1,10 @@
 import { apiRequest } from './client';
-import type { WhisperHealthProbe } from './types';
+import type { LlmProvider, ProviderSlot, WhisperHealthProbe } from './types';
 
-export type ProviderName = 'anthropic' | 'openai' | 'openrouter' | 'whisper' | 'ollama';
+// 'secondary' has no dedicated /settings/providers/secondary REST surface
+// (unlike the others): its key saves/clears through PUT /settings and its
+// test hits /settings/providers/secondary/test-connection directly.
+export type ProviderName = 'anthropic' | 'openai' | 'openrouter' | 'whisper' | 'ollama' | 'secondary';
 
 export interface ProviderStatus {
   configured: boolean;
@@ -47,6 +50,32 @@ export function clearProvider(name: ProviderName) {
   });
 }
 
+// Work still bound to a slot's current account, read before a save that
+// changes that slot's endpoint or provider type.
+export interface AffectedRun {
+  id: string;
+  slug: string;
+  episodeId: string;
+  title: string;
+  state: string;
+}
+
+export interface AffectedRuns {
+  count: number;
+  runs: AffectedRun[];
+}
+
+interface AffectedRunsResponse {
+  slot: ProviderSlot;
+  accountId: string | null;
+  affectedRuns?: AffectedRuns;
+}
+
+export async function getAffectedRuns(slot: ProviderSlot): Promise<AffectedRuns> {
+  const res = await apiRequest<AffectedRunsResponse>(`/settings/providers/${slot}/affected-runs`);
+  return res.affectedRuns ?? { count: 0, runs: [] };
+}
+
 export function testProvider(name: ProviderName) {
   return apiRequest<ProviderTestResult>(`/settings/providers/${name}/test`, {
     method: 'POST',
@@ -81,6 +110,19 @@ export function testLlmConnection(
   return apiRequest<ConnectionTestResult>(`/settings/providers/${name}/test-connection`, {
     method: 'POST',
     body: baseUrl === undefined ? {} : { baseUrl },
+  });
+}
+
+// Probes the secondary provider slot using its saved key; provider and
+// baseUrl override the saved type/base URL so an unsaved draft (a changed
+// type dropdown, an edited base URL) can be tested before Save.
+export function testSecondaryProviderConnection(provider?: LlmProvider | '', baseUrl?: string) {
+  const body: Record<string, string> = {};
+  if (provider) body.provider = provider;
+  if (baseUrl !== undefined) body.baseUrl = baseUrl;
+  return apiRequest<ConnectionTestResult>('/settings/providers/secondary/test-connection', {
+    method: 'POST',
+    body,
   });
 }
 

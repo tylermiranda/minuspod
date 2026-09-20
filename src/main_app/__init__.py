@@ -13,6 +13,8 @@ import time
 import uuid
 from utils.session_defaults import _default_session_cookie_secure
 from utils.paths import resolve_data_dir
+# Re-exported: main_app.shutdown_event stays the same object every waiter uses.
+from utils.shutdown import shutdown_event
 from pathlib import Path
 
 import defusedxml
@@ -201,7 +203,6 @@ status_service = StatusService()
 pattern_service = PatternService(db)
 
 # Graceful shutdown support
-shutdown_event = threading.Event()
 processing_queue = ProcessingQueue()
 _previous_signal_handlers = {}
 _shutdown_started = False
@@ -852,10 +853,9 @@ def _startup():
             logger.debug("Background threads not started")
 
         # No inline initial RSS refresh here: background_rss_refresh (started
-        # above) calls refresh_all_feeds() immediately on its first loop
-        # iteration with a 5-worker pool, covering every feed in get_feed_map.
-        # A second sequential pass would mostly hit the 30s per-feed refresh
-        # coalesce window and only blocked leader boot for feeds x fetch time.
+        # above) begins staggering the due feeds on its first tick. On a fresh
+        # boot every feed is due, so the first ticks drain them a batch at a
+        # time. An inline sequential pass would only block leader boot.
 
         logger.info(f"Web UI available at: {base_url}/ui/")
     else:

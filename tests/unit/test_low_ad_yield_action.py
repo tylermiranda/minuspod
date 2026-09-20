@@ -4,6 +4,8 @@ detection once per episode."""
 from contextlib import ExitStack
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from tests.app_bootstrap import bootstrap
 
 _data_dir = bootstrap('low_ad_yield_test_')
@@ -77,7 +79,9 @@ class TestLowAdYieldHeuristic:
 class TestResolveLowAdYieldAction:
     """Per-feed override wins over the global setting."""
 
-    def setup_method(self):
+    @pytest.fixture(autouse=True)
+    def _isolate_global_action(self, preserve_setting):
+        preserve_setting('low_ad_yield_action')
         self.db = Database()
         self.db.set_setting('low_ad_yield_action', 'nothing', is_default=True)
 
@@ -160,7 +164,7 @@ SEGMENTS = [{'start': 0.0, 'end': 5.0, 'text': 'hello'}]
 class TestCompletionPathWiring:
     """The gate matrix is worthless if the pipeline never calls the hook."""
 
-    def _run_pipeline(self, episode_row=None):
+    def _run_pipeline(self, episode_row=None, approval_recut=False):
         podcast_row = {'id': 1, 'slug': 'wiring-feed', 'description': None,
                        'tags': None, 'dai_platform': None,
                        'passthrough_enabled': None, 'skip_ad_detection': None}
@@ -191,6 +195,11 @@ class TestCompletionPathWiring:
             p(processing, '_generate_assets')
             finalize = p(processing, '_finalize_episode')
             hook = p(processing, '_maybe_fire_low_ad_yield_action')
+            # Filing zero approvals is what keeps the normal runs off the
+            # recut exit, rather than a MagicMock's default truthiness.
+            p(processing, '_file_corroborated_hold_approvals',
+              return_value=1 if approval_recut else 0)
+            p(processing, '_recut_episode', return_value=True)
             p(processing.shutil, 'move')
             p(processing.os, 'unlink')
             p(processing.os.path, 'exists', return_value=False)
@@ -240,6 +249,14 @@ class TestCompletionPathWiring:
         assert args[1] == 'ep1'
         # Last two arguments are the pre-run row snapshot and this run's stats.
         assert args[-1]['mode'] == 'auto'
+
+    def test_the_approval_recut_exit_calls_the_hook_too(self):
+        result, finalize, hook, _ = self._run_pipeline(approval_recut=True)
+
+        assert result is True
+        # Proves the recut exit was taken, not the normal finalize path.
+        finalize.assert_not_called()
+        hook.assert_called_once()
 
 
 class TestReprocessProvenance:

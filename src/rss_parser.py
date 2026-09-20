@@ -4,6 +4,8 @@ import logging
 import hashlib
 import os
 import re
+import threading
+import time
 from chapter_notes import append_chapters
 from datetime import datetime, timezone
 from email.utils import format_datetime, parsedate_to_datetime
@@ -112,6 +114,38 @@ def _get_rss_circuit_breaker(url: str) -> CircuitBreaker:
             f"rss-{host}", failure_threshold=5, recovery_timeout=60
         )
     return _rss_circuit_breakers[host]
+
+
+# Hosts whose gzip stream failed to decode. The plain retry recovers the body,
+# so ask this URL for identity encoding up front until the TTL expires rather
+# than transferring a multi-MB feed twice every cycle.
+_GZIP_BROKEN_TTL_SECONDS = 3600
+_gzip_broken_until: dict[str, float] = {}
+_gzip_broken_lock = threading.Lock()
+
+
+def _gzip_is_broken(url: str) -> bool:
+    """True while this URL is known to serve an undecodable gzip stream."""
+    with _gzip_broken_lock:
+        until = _gzip_broken_until.get(url)
+        if until is None:
+            return False
+        if time.monotonic() >= until:
+            del _gzip_broken_until[url]
+            return False
+        return True
+
+
+def _mark_gzip_broken(url: str) -> None:
+    with _gzip_broken_lock:
+        _gzip_broken_until[url] = time.monotonic() + _GZIP_BROKEN_TTL_SECONDS
+
+
+def _identity_headers(url: str, headers: dict) -> dict:
+    """Add Accept-Encoding: identity when this URL's gzip is known broken."""
+    if not _gzip_is_broken(url):
+        return headers
+    return {**headers, 'Accept-Encoding': 'identity'}
 
 
 # Podcasting 2.0 channel-tag dispositions. See docs/podcasting-2.0.md for the
@@ -321,7 +355,7 @@ class RSSParser:
                 timeout=timeout,
                 max_redirects=HTTP_MAX_REDIRECTS_FEED,
                 stream=True,
-                headers={'User-Agent': feed_user_agent()},
+                headers=_identity_headers(url, {'User-Agent': feed_user_agent()}),
             )
             try:
                 response.raise_for_status()
@@ -360,6 +394,7 @@ class RSSParser:
         except requests.exceptions.ContentDecodingError as e:
             # Some servers claim gzip encoding but send malformed data
             # Retry without accepting compressed responses
+            _mark_gzip_broken(url)
             logger.warning(
                 "Gzip decompression failed, retrying without compression: "
                 "url=%s err=%s", safe_url_for_log(url), e)
@@ -421,7 +456,7 @@ class RSSParser:
             If feed not modified (304), returns (None, etag, last_modified)
             On error, returns (None, None, None)
         """
-        headers = {'User-Agent': feed_user_agent()}
+        headers = _identity_headers(url, {'User-Agent': feed_user_agent()})
         if etag:
             headers['If-None-Match'] = etag
         if last_modified:
@@ -488,18 +523,18 @@ class RSSParser:
 
         except requests.exceptions.ContentDecodingError as e:
             # Retry without accepting compressed responses
+            _mark_gzip_broken(url)
             logger.warning(
                 "Gzip decompression failed, retrying: url=%s err=%s",
                 safe_url_for_log(url), e)
             try:
-                headers['Accept-Encoding'] = 'identity'
                 response = safe_get(
                     url,
                     trust=_feed_trust(),
                     timeout=timeout,
                     max_redirects=HTTP_MAX_REDIRECTS_FEED,
                     stream=True,
-                    headers=headers,
+                    headers={**headers, 'Accept-Encoding': 'identity'},
                 )
                 if response.status_code == 304:
                     _get_rss_circuit_breaker(url).record_success()
@@ -772,8 +807,8 @@ class RSSParser:
         }
 
     @staticmethod
-    def extract_podcast_artwork_url(feed_content_or_parsed, channel=None) -> str | None:
-        """Channel-level podcast artwork URL.
+    def extract_podcast_artwork_url(feed_content_or_parsed, channel=None) -> list[str]:
+        """Ordered channel-level podcast artwork candidate URLs.
 
         feedparser flattens ``<itunes:image>`` across the whole document, so
         ``parsed_feed.feed.image.href`` gets clobbered by the LAST itunes:image
@@ -783,23 +818,25 @@ class RSSParser:
         feedparser surfaces the 40 MB per-episode GIF.
 
         Parse the raw XML directly so we only consider channel-level
-        elements. Order of preference:
+        elements. Returned in preference order, deduped, so a caller can
+        fall back to the next candidate when the preferred one 404s:
 
           1. ``<itunes:image href="...">`` as a direct child of ``<channel>``
           2. ``<image><url>`` as a direct child of ``<channel>``
 
-        Accepts either raw bytes/str (preferred) or a feedparser parse
-        result (legacy compat); the legacy path is intentionally narrow
-        because it carries the bug described above.
+        Empty list when neither is present. Accepts either raw bytes/str
+        (preferred) or a feedparser parse result (legacy compat, at most one
+        candidate); the legacy path is intentionally narrow because it
+        carries the bug described above.
         """
         if not feed_content_or_parsed:
-            return None
+            return []
 
         if channel is not None or isinstance(feed_content_or_parsed, (str, bytes)):
             if channel is None:
                 channel = RSSParser.find_channel_element(feed_content_or_parsed)
                 if channel is None:
-                    return None
+                    return []
 
             ITUNES_NS_TAGS = (
                 '{http://www.itunes.com/dtds/podcast-1.0.dtd}image',
@@ -807,16 +844,19 @@ class RSSParser:
             )
             channel_itunes_image = None
             channel_rss_image = None
+            # No early break: both candidates are collected in one pass
+            # (the itunes:image tag commonly precedes <image> in channel
+            # order, and a caller needs both to build the fallback list).
             for elem in channel:
                 tag = getattr(elem, 'tag', '')
                 if not isinstance(tag, str):
                     continue
-                if tag in ITUNES_NS_TAGS:
+                if channel_itunes_image is None and tag in ITUNES_NS_TAGS:
                     href = elem.get('href') or ''
                     if href.strip():
                         channel_itunes_image = href.strip()
-                        break
-                if tag == 'image' or tag.endswith('}image'):
+                    continue
+                if channel_rss_image is None and (tag == 'image' or tag.endswith('}image')):
                     for sub in elem:
                         sub_tag = getattr(sub, 'tag', '')
                         if isinstance(sub_tag, str) and (sub_tag == 'url' or sub_tag.endswith('}url')):
@@ -824,17 +864,24 @@ class RSSParser:
                             if url_text:
                                 channel_rss_image = url_text
                                 break
-            return channel_itunes_image or channel_rss_image
+            seen = set()
+            candidates = []
+            for url in (channel_itunes_image, channel_rss_image):
+                if url and url not in seen:
+                    seen.add(url)
+                    candidates.append(url)
+            return candidates
 
         # Legacy feedparser path (kept narrow; see docstring).
         feed = getattr(feed_content_or_parsed, 'feed', None)
         if feed is None:
-            return None
-        if hasattr(feed, 'image') and hasattr(feed.image, 'href'):
-            return feed.image.href
+            return []
+        if hasattr(feed, 'image') and hasattr(feed.image, 'href') and feed.image.href:
+            return [feed.image.href]
         if 'itunes_image' in feed:
-            return feed.itunes_image.get('href')
-        return None
+            href = feed.itunes_image.get('href')
+            return [href] if href else []
+        return []
 
     @staticmethod
     def _dedup_category_labels(tags) -> list[str]:
@@ -978,7 +1025,8 @@ class RSSParser:
         # (feedparser corrupts feed.image.href with per-episode itunes:image
         # overrides). Emit BOTH the standard <image> block and the
         # <itunes:image> tag that Apple Podcasts and most apps prefer.
-        artwork_url = self.extract_podcast_artwork_url(feed_content, channel=channel_elem)
+        artwork_candidates = self.extract_podcast_artwork_url(feed_content, channel=channel_elem)
+        artwork_url = artwork_candidates[0] if artwork_candidates else None
         # When the watermark is enabled and we have the cover cached, point the
         # channel image at our badge-overlaid variant so podcast apps show the
         # filtered feed is distinct (issue #420). This is podcast-level artwork,

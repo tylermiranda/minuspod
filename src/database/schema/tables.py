@@ -45,6 +45,10 @@ TABLE_DDL['podcasts'] = """CREATE TABLE IF NOT EXISTS podcasts (
     -- 1 = serve MinusPod episode ids. New feeds are created with 1.
     own_episode_guids INTEGER,
     last_checked_at TEXT,
+    -- Last refresh attempt, stamped on success and failure alike, so the
+    -- staggered scheduler retries a failing feed on the interval rather than
+    -- every tick. last_checked_at stays success-only for freshness.
+    last_refresh_attempt_at TEXT,
     -- Consecutive refresh-failure tracking (#516); cleared on success.
     -- last_refresh_error_at is the first failure of the current run,
     -- last_refresh_failure_at the most recent counted failure.
@@ -52,6 +56,11 @@ TABLE_DDL['podcasts'] = """CREATE TABLE IF NOT EXISTS podcasts (
     last_refresh_error TEXT,
     last_refresh_error_at TEXT,
     last_refresh_failure_at TEXT,
+    -- Consecutive unparseable-body tracking; backs off the "304 but RSS
+    -- cache stale" forced full fetch so a broken body is not refetched
+    -- every cycle. Cleared on the first clean parse.
+    parse_failure_count INTEGER DEFAULT 0,
+    last_parse_failure_at TEXT,
     network_id TEXT,
     dai_platform TEXT,
     network_id_override TEXT,
@@ -77,6 +86,7 @@ TABLE_DDL['podcasts'] = """CREATE TABLE IF NOT EXISTS podcasts (
     -- Phase C held-for-review per-feed settings
     max_ad_duration_override REAL,
     max_ad_duration_reject_override REAL,
+    ad_detection_exclude_start_override REAL,
     -- Splice-veto override (NULL = inherit the global, 0 = off, 1 = on)
     splice_veto_enabled INTEGER,
     cue_gated_approval INTEGER DEFAULT 0,
@@ -173,6 +183,8 @@ TABLE_DDL['episodes'] = """CREATE TABLE IF NOT EXISTS episodes (
     p20_item_json TEXT,
     tags TEXT NOT NULL DEFAULT '[]',
     deletion_requested_at TEXT,
+    -- Per-episode pass-through override, issue #746.
+    passthrough_enabled INTEGER,
     created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
     updated_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
     FOREIGN KEY (podcast_id) REFERENCES podcasts(id) ON DELETE CASCADE,
@@ -280,7 +292,8 @@ TABLE_DDL['processing_runs'] = """CREATE TABLE IF NOT EXISTS processing_runs (
     cancel_requested_at TEXT,
     started_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
     heartbeat_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
-    finished_at TEXT
+    finished_at TEXT,
+    route_snapshot_json TEXT
 )"""
 
 TABLE_DDL['upload_reservations'] = """CREATE TABLE IF NOT EXISTS upload_reservations (
@@ -381,6 +394,10 @@ TABLE_DDL['processing_history'] = """CREATE TABLE IF NOT EXISTS processing_histo
     -- Run log pointer (#660): path relative to the data dir. NULL when the
     -- run stored no log or the sweep pruned it.
     log_file TEXT,
+    -- Ledger correlation key: links to llm_call_usage.run_id for this run's
+    -- phase-cost breakdown. NULL for runs recorded before this column
+    -- existed and for runs outside a bound run context (recuts).
+    run_id TEXT,
     FOREIGN KEY (podcast_id) REFERENCES podcasts(id) ON DELETE CASCADE
 )"""
 
@@ -585,6 +602,39 @@ TABLE_DDL['addressing_log'] = """CREATE TABLE IF NOT EXISTS addressing_log (
     ads_dropped_too_long INTEGER
 )"""
 
+TABLE_DDL['llm_call_usage'] = """CREATE TABLE IF NOT EXISTS llm_call_usage (
+    attempt_id TEXT PRIMARY KEY,
+    run_id TEXT,
+    podcast_id INTEGER,
+    episode_id TEXT,
+    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+    finalized_at TEXT,
+    phase_key TEXT NOT NULL,
+    invoking_pass INTEGER,
+    window_label TEXT,
+    provider_key TEXT NOT NULL,
+    -- Account slot for per-account rate accounting; NULL reads as 'primary'.
+    credential_slot TEXT,
+    configured_model TEXT NOT NULL,
+    returned_model TEXT,
+    input_tokens INTEGER,
+    output_tokens INTEGER,
+    cache_read_tokens INTEGER,
+    cache_write_tokens INTEGER,
+    reasoning_tokens INTEGER,
+    cost_usd TEXT,
+    cost_source TEXT,
+    rate_snapshot TEXT,
+    pricing_revision TEXT,
+    state TEXT NOT NULL DEFAULT 'in_flight',
+    -- SDK dispatches this attempt made, compatibility retries included, so
+    -- manual request caps count outbound requests rather than ledger rows.
+    dispatch_count INTEGER NOT NULL DEFAULT 1,
+    -- Tokens reserved at dispatch (prompt estimate + max_tokens); the TPM
+    -- cap reads this while the row is in flight and actual usage after.
+    reserved_tokens INTEGER
+)"""
+
 SCHEMA_SQL = """
 PRAGMA foreign_keys = ON;
 PRAGMA journal_mode = WAL;
@@ -753,6 +803,17 @@ CREATE INDEX IF NOT EXISTS idx_cue_dismissals_podcast
 """ + TABLE_DDL['podping_hosts'] + """;
 CREATE INDEX IF NOT EXISTS idx_podping_hosts_last_seen
     ON podping_hosts(last_seen_at DESC);
+
+-- llm_call_usage: append-only per-provider-attempt LLM call ledger.
+-- Downstream checkpoints write one row per attempt and derive counters
+-- from it in the same transaction.
+""" + TABLE_DDL['llm_call_usage'] + """;
+CREATE INDEX IF NOT EXISTS idx_llm_call_usage_run ON llm_call_usage(run_id);
+CREATE INDEX IF NOT EXISTS idx_llm_call_usage_episode ON llm_call_usage(podcast_id, episode_id);
+CREATE INDEX IF NOT EXISTS idx_llm_call_usage_provider_model ON llm_call_usage(provider_key, configured_model);
+CREATE INDEX IF NOT EXISTS idx_llm_call_usage_created ON llm_call_usage(created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_llm_call_usage_state ON llm_call_usage(state);
+CREATE INDEX IF NOT EXISTS idx_llm_call_usage_provider_slot_created ON llm_call_usage(provider_key, credential_slot, created_at DESC);
 
 -- addressing_log: per-pass addressing-mode compliance samples (random
 -- addressing mode A/B tracking). Aggregated per effective_mode by

@@ -118,13 +118,17 @@ Every term the app uses, in plain words, with a link to the part of the docs tha
 
 **Offline queue** - An opt-in hold that parks an episode when the LLM provider or Whisper endpoint is unreachable, probes the service every few minutes, and re-queues the episode once it answers. It does not stop the queue: everything not waiting on that service keeps processing. [Configuration > Offline Queue](configuration.md#offline-queue)
 
+**Opening window exclusion** - A global or per-feed number of seconds at the start of an episode during which ad markers are ignored, so a show's opening cue is not cut as an ad. [Configuration > Detection Tuning](configuration.md#opening-window-exclusion)
+
 **Outbound Requests** - The settings section holding the two User-Agent strings MinusPod sends: one for audio, artwork, and chapters, one for RSS. Editable so a host that starts refusing ours can be worked around without a new release. [Configuration > Outbound Requests](configuration.md#outbound-requests)
 
 ## P
 
 **Partial detection** - An episode published from pattern and cross-fetch cuts alone after the AI detection pass failed. Shows an amber badge and a Re-run detection banner on the episode page; one automatic low-priority re-detect is also queued. [How It Works > Partial Detection](how-it-works.md#partial-detection)
 
-**Pass-through** - One of the five presets on the per-feed Processing mode select. It turns processing off entirely: episodes are downloaded and served exactly as published, and the feed URL stays the same so switching to another mode resumes processing later without touching your podcast app. [Configuration > Pass-through mode](configuration.md#pass-through-mode)
+**Pass-through** - One of the five presets on the per-feed Processing mode select. It turns processing off entirely: episodes are downloaded and relayed with no transcription or ad removal, though the audio may be transcoded for serving. The feed URL stays the same, so switching to another mode resumes processing later without touching your podcast app. [Configuration > Pass-through mode](configuration.md#pass-through-mode)
+
+**Pass-through, per-episode** - A flag on a single episode that runs pass-through for that episode alone, even when its feed is in a different processing mode. Useful for one episode a host serves through dynamic ad insertion that should skip ad removal without opting the whole feed out of it.
 
 **Pattern** - Anything MinusPod has learned from confirmed ads and reapplies to new episodes: text patterns from transcripts and audio fingerprints. Patterns catch repeat ads without spending LLM tokens. [How It Works > Pattern Learning](how-it-works.md#pattern-learning)
 
@@ -137,6 +141,8 @@ Every term the app uses, in plain words, with a link to the part of the docs tha
 **Processing stats** - The per-run table at the bottom of the episode page: what each run downloaded, detected, cut, held, and verified. [Web Interface > Processing stats](web-interface.md#processing-stats)
 
 ## Q
+
+**Queued** - An episode with an actual row in the processing queue, waiting its turn. Not every *pending* episode is queued: pending only means "not yet processed," while queued means work is scheduled to start. The episode API's `jobState` field reports this directly, rather than leaving callers to infer it from `status`. [How It Works > Processing Queue](how-it-works.md#processing-queue)
 
 **Queue priority** - A per-feed High/Normal/Low processing-order preference, with automatic boosts for episodes published in the last 48 hours and for manual reprocesses. [Configuration > Queue priority](configuration.md#queue-priority)
 

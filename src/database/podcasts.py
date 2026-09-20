@@ -1,11 +1,12 @@
 """Podcast CRUD mixin for MinusPod database."""
 import json
 import logging
+from datetime import datetime, timedelta, timezone
 
 from config import (coerce_bool_setting, resolve_ad_chapter_categories_map,
                     resolve_segment_category_actions_map)
 from utils.constants import EpisodeStatus
-from utils.time import utc_now_iso
+from utils.time import ISO_FORMAT, utc_now_iso
 
 logger = logging.getLogger(__name__)
 
@@ -78,24 +79,40 @@ def recents_cutoff(podcast: dict) -> str:
     return (podcast.get('created_at') or '')[:10]
 
 
+_ALL_PODCASTS_SQL = f"""
+    SELECT p.*,
+           COUNT(e.id) as episode_count,
+           SUM(CASE WHEN e.status = 'processed' THEN 1 ELSE 0 END) as processed_count,
+           MAX(e.created_at) as last_episode_date,
+           {_STATUS_COUNT_SELECT}
+    FROM podcasts p
+    LEFT JOIN episodes e ON p.id = e.podcast_id
+    GROUP BY p.id
+    ORDER BY p.created_at DESC
+"""  # noqa: S608 (_STATUS_COUNT_SELECT is a fixed enum-derived string, not user input)
+
+
 class PodcastMixin:
     """Podcast management methods."""
 
     def get_all_podcasts(self) -> list[dict]:
-        """Get all podcasts with episode counts."""
+        """Get all podcasts with episode counts, unbounded.
+
+        Kept unbounded (no LIMIT/OFFSET) for callers that need every feed in
+        one pass, such as OPML export or the all-feeds refresh count. Use
+        get_podcasts_page for a paginated view.
+        """
         conn = self.get_connection()
-        cursor = conn.execute(f"""
-            SELECT p.*,
-                   COUNT(e.id) as episode_count,
-                   SUM(CASE WHEN e.status = 'processed' THEN 1 ELSE 0 END) as processed_count,
-                   MAX(e.created_at) as last_episode_date,
-                   {_STATUS_COUNT_SELECT}
-            FROM podcasts p
-            LEFT JOIN episodes e ON p.id = e.podcast_id
-            GROUP BY p.id
-            ORDER BY p.created_at DESC
-        """)  # noqa: S608
+        cursor = conn.execute(_ALL_PODCASTS_SQL)  # noqa: S608
         return [dict(row) for row in cursor.fetchall()]
+
+    def get_podcasts_page(self, limit: int, offset: int) -> tuple[list[dict], int]:
+        """One page of podcasts with episode counts, plus the total feed count."""
+        conn = self.get_connection()
+        total = conn.execute("SELECT COUNT(*) FROM podcasts").fetchone()[0]
+        cursor = conn.execute(
+            _ALL_PODCASTS_SQL + " LIMIT ? OFFSET ?", (limit, offset))  # noqa: S608
+        return [dict(row) for row in cursor.fetchall()], total
 
     def get_podcast_feed_urls(self) -> list[dict]:
         """slug + source_url only. The podping listener rebuilds its feed map
@@ -157,6 +174,56 @@ class PodcastMixin:
         ).fetchone()
         return row['last_checked_at'] if row else None
 
+    def get_due_feed_slugs(self, interval_seconds: float, limit: int) -> list[str]:
+        """Subscribed feeds not attempted within interval_seconds, oldest
+        attempt first, capped at limit. Keyed off last_refresh_attempt_at (not
+        last_checked_at) so a failing feed, which records no success, still
+        retries once per interval instead of monopolizing every tick. Never-
+        attempted feeds (NULL) sort first. Local and recents feeds are not
+        fetched from upstream, so they are excluded. The timestamp is a fixed-
+        width UTC ISO string, so the string compare is chronological."""
+        cutoff = (datetime.now(timezone.utc)
+                  - timedelta(seconds=interval_seconds)).strftime(ISO_FORMAT)
+        rows = self.get_connection().execute(
+            """SELECT slug FROM podcasts
+               WHERE feed_type NOT IN ('local', 'recents')
+                 AND source_url IS NOT NULL AND source_url != ''
+                 AND (last_refresh_attempt_at IS NULL OR last_refresh_attempt_at < ?)
+               ORDER BY last_refresh_attempt_at ASC
+               LIMIT ?""",
+            (cutoff, limit),
+        ).fetchall()
+        return [row['slug'] for row in rows]
+
+    def count_subscribed_feeds(self) -> int:
+        """Number of upstream-fetched feeds, used to size the staggered refresh
+        batch so the whole set is covered within one interval."""
+        return self.get_connection().execute(
+            "SELECT COUNT(*) FROM podcasts "
+            "WHERE feed_type NOT IN ('local', 'recents') "
+            "AND source_url IS NOT NULL AND source_url != ''"
+        ).fetchone()[0]
+
+    def get_feeds_min_last_checked_at(self) -> str | None:
+        """Oldest successful refresh across subscribed feeds that have refreshed
+        at least once, or None when none have. Backs the dashboard's 'all feeds
+        fresh as of T' indicator. A feed that succeeded before but is now failing
+        keeps its old timestamp and holds this back (honest staleness); a feed
+        that never succeeded is ignored rather than pinning it to empty."""
+        return self.get_connection().execute(
+            "SELECT MIN(last_checked_at) FROM podcasts "
+            "WHERE feed_type NOT IN ('local', 'recents') AND last_checked_at IS NOT NULL"
+        ).fetchone()[0]
+
+    def get_feeds_last_successful_refresh_at(self) -> str | None:
+        """Most recent successful refresh across subscribed feeds, for the
+        health panel's 'is refresh working at all' signal. A max, so one stale
+        feed cannot blank it."""
+        return self.get_connection().execute(
+            "SELECT MAX(last_checked_at) FROM podcasts "
+            "WHERE feed_type NOT IN ('local', 'recents')"
+        ).fetchone()[0]
+
     def get_podcast_slug(self, podcast_id: int) -> str | None:
         """Slug for a podcast id -- cheap single-column lookup."""
         conn = self.get_connection()
@@ -210,6 +277,7 @@ class PodcastMixin:
     _HELD_REVIEW_COLS = (
         'max_ad_duration_override',
         'max_ad_duration_reject_override',
+        'ad_detection_exclude_start_override',
         'splice_veto_enabled',
         'cue_gated_approval',
     )
@@ -278,7 +346,8 @@ class PodcastMixin:
         for key, value in kwargs.items():
             if key in (
                 'title', 'description', 'artwork_url', 'artwork_cached',
-                'last_checked_at', 'source_url', 'network_id', 'dai_platform',
+                'last_checked_at', 'last_refresh_attempt_at',
+                'source_url', 'network_id', 'dai_platform',
                 'network_id_override', 'audio_analysis_override', 'auto_process_override',
                 'language_override', 'title_override', 'detection_notes', 'detection_mode',
                 'chapters_mode', 'chapters_in_notes',
@@ -293,6 +362,7 @@ class PodcastMixin:
                 'last_modified_header', 'only_expose_processed_episodes',
                 'refresh_failure_count', 'last_refresh_error',
                 'last_refresh_error_at', 'last_refresh_failure_at',
+                'parse_failure_count', 'last_parse_failure_at',
                 'website_url', 'passthrough_enabled', 'skip_ad_detection',
                 'last_podping_at', 'podping_uses', 'podping_hive_accounts',
                 'podping_checked_at', 'channel_metadata_at',
@@ -302,6 +372,7 @@ class PodcastMixin:
                 'low_ad_yield_action', 'episode_logs',
                 'retention_days_override', 'keep_original_audio_override',
                 'p20_channel_json', 'author', 'explicit', 'categories',
+                'artwork_failure_state',
             ):
                 fields.append(f"{key} = ?")
                 values.append(value)
@@ -332,20 +403,32 @@ class PodcastMixin:
         costs no lock at all. The UPDATE keeps its own guard, since a
         concurrent refresh may have written a failure since this read.
         """
-        conn = self.get_connection()
-        row = conn.execute(
-            "SELECT refresh_failure_count FROM podcasts WHERE slug = ?",
-            (slug,)
-        ).fetchone()
-        if not row or not row['refresh_failure_count']:
-            return
-        conn.execute(
+        self._clear_failure_columns(
+            slug, 'refresh_failure_count',
             """UPDATE podcasts
                SET refresh_failure_count = 0, last_refresh_error = NULL,
                    last_refresh_error_at = NULL, last_refresh_failure_at = NULL
-               WHERE slug = ? AND refresh_failure_count > 0""",
+               WHERE slug = ? AND refresh_failure_count > 0""")
+
+    def clear_parse_failure_state(self, slug: str):
+        """Reset the unparseable-body backoff. Only a body that actually parsed
+        clears it: a 304 refresh succeeds without parsing anything."""
+        self._clear_failure_columns(
+            slug, 'parse_failure_count',
+            """UPDATE podcasts
+               SET parse_failure_count = 0, last_parse_failure_at = NULL
+               WHERE slug = ? AND parse_failure_count > 0""")
+
+    def _clear_failure_columns(self, slug: str, count_column: str, sql: str):
+        """Run `sql` only when `count_column` is set; see clear_refresh_failure_state."""
+        conn = self.get_connection()
+        row = conn.execute(
+            f"SELECT {count_column} FROM podcasts WHERE slug = ?",  # noqa: S608
             (slug,)
-        )
+        ).fetchone()
+        if not row or not row[count_column]:
+            return
+        conn.execute(sql, (slug,))
         conn.commit()
 
     def get_podcast_tags(self, slug: str) -> dict[str, list[str]]:

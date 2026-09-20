@@ -110,6 +110,9 @@ SEED_SNAPSHOT = {
     'retention_period_minutes': '1440',
     'review_max_boundary_shift': '60',
     'review_model': 'same_as_pass',
+    'review_provider': 'same_as_pass',
+    'secondary_provider_enabled': 'false',
+    'secondary_provider_base_url': 'http://localhost:8000/v1',
     'review_prompt': ('sha256', '0a30979273b7dd4f7447c40536383d0bb3a3e3c649b2ec07c4772ea47880035e'),  # Updated for the #695 example format
     'rss_refresh_interval_minutes': '15',
     'queue_manual_boost': '20',
@@ -154,6 +157,7 @@ EXPECTED_AD_RESET_KEYS = {
     'ad_reviewer_parallel_ads', 'max_artwork_bytes', 'max_rss_bytes',
     'max_audio_download_mb',
     'llm_provider', 'openai_base_url', 'pricing_source_mode',
+    'secondary_provider', 'secondary_provider_base_url',
     'openrouter_api_key',
     'whisper_backend', 'whisper_api_base_url', 'whisper_api_key',
     'whisper_api_model', 'whisper_compute_type', 'whisper_language',
@@ -190,6 +194,7 @@ EXPECTED_AD_RESET_KEYS = {
     'learning_min_pattern_duration', 'learning_max_pattern_duration',
     'differential_measured_corr_max', 'differential_hold_min_seconds',
     'dai_differential_overrides_keep',
+    'ad_detection_exclude_start_seconds',
 }
 
 # Keys reset_setting() must refuse (return False). Membership captured from
@@ -204,6 +209,7 @@ NON_RESETTABLE_KEYS = (
     'podping_enabled', 'positional_prior_enabled',
     'processing_hard_timeout_seconds', 'processing_soft_timeout_seconds',
     'retention_days', 'review_max_boundary_shift', 'review_model',
+    'review_provider', 'secondary_provider_enabled',
     'rss_refresh_interval_minutes', 'segment_category_actions',
     'queue_manual_boost', 'queue_fresh_boost', 'queue_bulk_boost',
     'community_sync_categories',
@@ -332,6 +338,7 @@ class TestResetSetting:
             'whisper_api_model': 'whisper-1',
             'vad_gap_mid_min_seconds': '8.0',
             'min_content_between_ads_seconds': '12.0',
+            'ad_detection_exclude_start_seconds': '0',
             'audio_cue_freq_min_hz': '1500',
             'audio_cue_pair_orient_window_seconds': '20.0',
             'silence_snap_noise_db': '-50.0',
@@ -405,6 +412,7 @@ class TestGetDefaults:
             'vadGapDetectionEnabled': True,
             'vadGapMidMinSeconds': 8.0,
             'minContentBetweenAdsSeconds': 12.0,
+            'adDetectionExcludeStartSeconds': 0.0,
             'audioCueFreqMinHz': 1500,
             'audioCueProminenceDb': 9.0,
             'silenceSnapNoiseDb': -50.0,
@@ -473,12 +481,18 @@ class TestGetDefaults:
         # chaptersInNotes (105 -> 106). whisperPoolEnabled +
         # whisperPoolMaxRequests + whisperPoolMaxEpisodes after that (106 -> 109),
         # then daiDifferentialOverridesKeep (109 -> 110),
-        # then the seven adChapter* keys (110 -> 117).
+        # then the seven adChapter* keys (110 -> 117), then reviewProvider,
+        # matching review_model's default-block presence (117 -> 118).
+        # secondaryProviderEnabled + secondaryProvider + secondaryProviderBaseUrl
+        # added after that (118 -> 121). Then the four manual provider
+        # request-rate limit keys (#747), primary and secondary (121 -> 125),
+        # then the two tokens-per-minute keys, primary and secondary (125 -> 127).
+        # adDetectionExcludeStartSeconds added after that (127 -> 128).
         payload_keys = {
             spec.payload_key for spec in SETTINGS_REGISTRY.values()
             if spec.payload_key
         }
-        assert len(payload_keys) == 117
+        assert len(payload_keys) == 128
         assert 'audioCuePairOrientWindowSeconds' not in payload_keys
         assert 'audioCuePairMaxBreakFraction' in payload_keys
 

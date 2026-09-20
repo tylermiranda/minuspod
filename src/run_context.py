@@ -7,6 +7,8 @@ state (token totals, run log) is looked up by thread, not by process.
 import copy
 import threading
 
+from utils.url import url_has_userinfo
+
 _lock = threading.Lock()
 _by_thread: dict[int, 'RunContext'] = {}
 
@@ -59,6 +61,28 @@ class TokenAccumulator:
             return dict(self._last_totals)
 
 
+_FORBIDDEN_ROUTE_KEYS = {'api_key', 'apikey', 'authorization', 'headers', 'secret', 'token'}
+
+# Ledger attempt the calling thread is dispatching under, so a compatibility
+# retry inside a provider adapter can be counted against it.
+_dispatch = threading.local()
+
+
+def begin_dispatch(attempt_id: str) -> None:
+    """Mark `attempt_id` as the calling thread's active ledger attempt."""
+    _dispatch.attempt_id = attempt_id
+
+
+def end_dispatch() -> None:
+    """Clear the calling thread's active ledger attempt."""
+    _dispatch.attempt_id = None
+
+
+def current_dispatch_attempt() -> str | None:
+    """The calling thread's active ledger attempt, or None outside a dispatch."""
+    return getattr(_dispatch, 'attempt_id', None)
+
+
 class RunContext:
     def __init__(self, slug: str, episode_id: str, run_id: str | None = None):
         self.slug = slug
@@ -67,8 +91,22 @@ class RunContext:
         self.run_id = run_id
         self.recorder = None
         self.tokens = TokenAccumulator()
+        self.route_snapshot = None
         self._thinking_notices = {}
         self._thinking_notice_lock = threading.Lock()
+
+    def set_route_snapshot(self, snapshot: dict) -> None:
+        """Store the non-secret per-phase route for this run. Rejects credential
+        keys and any base_url that embeds userinfo credentials."""
+        for phase in snapshot.values():
+            if not isinstance(phase, dict):
+                continue
+            if _FORBIDDEN_ROUTE_KEYS & {k.lower() for k in phase}:
+                raise ValueError("route snapshot must not contain credentials")
+            base_url = phase.get('base_url')
+            if url_has_userinfo(base_url):
+                raise ValueError("route snapshot base_url must not embed credentials")
+        self.route_snapshot = copy.deepcopy(snapshot)
 
     def add_thinking_notice(self, run_id: str, notice: dict) -> bool:
         """Add one notice to this run, deduplicated across worker threads."""
@@ -113,6 +151,15 @@ def end(ctx: RunContext) -> None:
 def current() -> RunContext | None:
     with _lock:
         return _by_thread.get(threading.get_ident())
+
+
+def route_for_phase(phase: str) -> dict | None:
+    """This thread's run route for `phase` ({provider_key, configured_model}),
+    or None outside a run or before the snapshot is resolved."""
+    ctx = current()
+    if ctx is None or not ctx.route_snapshot:
+        return None
+    return ctx.route_snapshot.get(phase)
 
 
 def run_in_worker_thread(fn):

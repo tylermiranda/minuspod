@@ -3,6 +3,7 @@ import json
 import math
 import os
 import logging
+from contextlib import contextmanager
 from decimal import Decimal, InvalidOperation
 from dataclasses import dataclass
 from typing import Any
@@ -13,6 +14,8 @@ from config import (
     coerce_bool_setting, get_env_backed_int,
     STAGE_TUNABLE_DEFAULTS,
     DEFAULT_OPENAI_BASE_URL,
+    PROVIDER_ANTHROPIC, PROVIDER_OPENROUTER, PROVIDER_OPENAI_COMPATIBLE,
+    PROVIDER_OLLAMA,
     WHISPER_COMPUTE_TYPE_DEFAULT,
     AD_DETECTION_PARALLEL_WINDOWS_DEFAULT,
     AD_REVIEWER_PARALLEL_ADS_DEFAULT,
@@ -20,6 +23,7 @@ from config import (
     MAX_AUDIO_DOWNLOAD_MB_MIN,
     MIN_CONTENT_BETWEEN_ADS_SECONDS,
     MAX_AD_DURATION, MAX_AD_DURATION_CONFIRMED,
+    REVIEW_MAX_BOUNDARY_SHIFT_DEFAULT,
     AUDIO_CUE_FREQ_MIN_HZ, AUDIO_CUE_FREQ_MAX_HZ, AUDIO_CUE_PROMINENCE_DB,
     AUDIO_CUE_MIN_CONFIDENCE, AUDIO_CUE_TEMPLATE_SCORE,
     AUDIO_CUE_FORMANT_ATTEN_DB,
@@ -280,6 +284,31 @@ SETTINGS_REGISTRY: dict[str, SettingSpec] = {
         factory=_seed_env_openai_model, seeded=True, in_ad_reset=True,
         payload_key='chaptersModel', payload_kind='str', default=None),
 
+    # Per-phase LLM provider routing (see llm_route.py): each stage picks
+    # a SLOT (primary/secondary), not a provider type. Unset resolves to
+    # primary (verification/chapters resolve to detection's slot instead
+    # when also unset, via the same_as_detection sentinel).
+    'detection_provider': SettingSpec(default=None, seeded=True),
+    'verification_provider': SettingSpec(default=None, seeded=True),
+    'chapters_provider': SettingSpec(default=None, seeded=True),
+
+    # Secondary provider: an optional second full provider config.
+    # Disabled by default; a stage referencing the
+    # 'secondary' slot while this is false falls back to primary (see
+    # llm_route.py). secondary_provider_api_key lives in SECRET_SETTING_KEYS
+    # (registered below with the other provider secrets).
+    'secondary_provider_enabled': SettingSpec(
+        default='false', seeded=True, resettable=False,
+        payload_key='secondaryProviderEnabled', payload_kind='bool'),
+    'secondary_provider': SettingSpec(
+        default=None, seeded=True, in_ad_reset=True,
+        payload_key='secondaryProvider',
+        validator=_one_of(PROVIDER_ANTHROPIC, PROVIDER_OPENROUTER,
+                           PROVIDER_OPENAI_COMPATIBLE, PROVIDER_OLLAMA)),
+    'secondary_provider_base_url': SettingSpec(
+        default=DEFAULT_OPENAI_BASE_URL, seeded=True, in_ad_reset=True,
+        payload_key='secondaryProviderBaseUrl'),
+
     # -- Ad reviewer (seeded; only the prompts are resettable) --
     'enable_ad_review': SettingSpec(
         default='false', seeded=True, resettable=False,
@@ -287,8 +316,11 @@ SETTINGS_REGISTRY: dict[str, SettingSpec] = {
     'review_model': SettingSpec(
         default='same_as_pass', seeded=True, resettable=False,
         payload_key='reviewModel'),
+    'review_provider': SettingSpec(
+        default='same_as_pass', seeded=True, resettable=False,
+        payload_key='reviewProvider'),
     'review_max_boundary_shift': SettingSpec(
-        default='60', seeded=True, resettable=False,
+        default=str(REVIEW_MAX_BOUNDARY_SHIFT_DEFAULT), seeded=True, resettable=False,
         payload_key='reviewMaxBoundaryShift', payload_kind='int'),
 
     # -- General processing --
@@ -552,6 +584,9 @@ SETTINGS_REGISTRY: dict[str, SettingSpec] = {
     'min_content_between_ads_seconds': SettingSpec(
         default=str(MIN_CONTENT_BETWEEN_ADS_SECONDS),
         payload_key='minContentBetweenAdsSeconds', payload_kind='float'),
+    'ad_detection_exclude_start_seconds': SettingSpec(
+        default='0', in_ad_reset=True,
+        payload_key='adDetectionExcludeStartSeconds', payload_kind='float'),
 
     # Length past which an ad needs a confirmed sponsor, and the hard ceiling
     # even a confirmed one cannot pass. Over the first, an otherwise valid ad
@@ -651,6 +686,22 @@ SETTINGS_REGISTRY: dict[str, SettingSpec] = {
     'max_audio_download_mb': SettingSpec(
         env_backed=True, in_ad_reset=True, payload_key='maxAudioDownloadMb',
         payload_factory=_payload_max_audio_download_mb),
+    # Manual per-provider request-rate limits (#747); 0 = unlimited.
+    'provider_requests_per_min': SettingSpec(
+        env_backed=True, payload_key='providerRequestsPerMin', payload_kind='int'),
+    'provider_requests_per_day': SettingSpec(
+        env_backed=True, payload_key='providerRequestsPerDay', payload_kind='int'),
+    'secondary_provider_requests_per_min': SettingSpec(
+        env_backed=True, payload_key='secondaryProviderRequestsPerMin',
+        payload_kind='int'),
+    'secondary_provider_requests_per_day': SettingSpec(
+        env_backed=True, payload_key='secondaryProviderRequestsPerDay',
+        payload_kind='int'),
+    'provider_tokens_per_min': SettingSpec(
+        env_backed=True, payload_key='providerTokensPerMin', payload_kind='int'),
+    'secondary_provider_tokens_per_min': SettingSpec(
+        env_backed=True, payload_key='secondaryProviderTokensPerMin',
+        payload_kind='int'),
 
     # -- Audio cue detection (#350) --
     'audio_cue_detection_enabled': SettingSpec(
@@ -898,6 +949,46 @@ def iter_refreshable_defaults():
 class SettingsMixin:
     """Settings management methods."""
 
+    @contextmanager
+    def settings_transaction(self):
+        """Commit every settings write inside the block together, or none.
+
+        The writers below commit per call on the shared thread-local
+        connection; while this is open they join it instead, so a caller
+        applying a multi-field payload can roll the whole set back.
+        """
+        conn = self.get_connection()
+        if getattr(self._local, 'settings_txn', False):
+            yield conn
+            return
+        if conn.in_transaction:
+            logger.warning("Rolled back a leaked transaction before the settings transaction")
+            conn.rollback()
+        conn.execute("BEGIN IMMEDIATE")
+        self._local.settings_txn = True
+        try:
+            yield conn
+        except BaseException:
+            conn.rollback()
+            raise
+        else:
+            conn.commit()
+        finally:
+            self._local.settings_txn = False
+
+    def in_settings_transaction(self) -> bool:
+        """Whether this thread is inside settings_transaction()."""
+        return bool(getattr(self._local, 'settings_txn', False))
+
+    @contextmanager
+    def _settings_write(self):
+        """Connection for one settings write: the open settings transaction, else its own."""
+        if self.in_settings_transaction():
+            yield self.get_connection()
+            return
+        with self.transaction(immediate=True) as conn:
+            yield conn
+
     def get_setting(self, key: str) -> str | None:
         """Get a setting value."""
         conn = self.get_connection()
@@ -1035,12 +1126,13 @@ class SettingsMixin:
         """Set a setting value."""
         conn = self.get_connection()
         self._upsert_setting(conn, key, value, is_default)
-        conn.commit()
+        if not self.in_settings_transaction():
+            conn.commit()
 
     def get_or_create_setting(self, key: str, value: str,
                               is_default: bool = False) -> str:
         """Return the stored value, inserting ``value`` atomically if absent."""
-        with self.transaction(immediate=True) as conn:
+        with self._settings_write() as conn:
             row = conn.execute(
                 "SELECT value FROM settings WHERE key = ?", (key,)
             ).fetchone()
@@ -1052,7 +1144,7 @@ class SettingsMixin:
     def replace_setting_if_equal(self, key: str, expected: str,
                                  value: str) -> str:
         """Replace an expected value atomically and return the stored value."""
-        with self.transaction(immediate=True) as conn:
+        with self._settings_write() as conn:
             row = conn.execute(
                 "SELECT value FROM settings WHERE key = ?", (key,)
             ).fetchone()
@@ -1122,7 +1214,7 @@ class SettingsMixin:
         merging concurrently serialize instead of the second dropping the
         first's change. Returns the stored value.
         """
-        with self.transaction(immediate=True) as conn:
+        with self._settings_write() as conn:
             row = conn.execute(
                 "SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
             merged = merge_fn(row['value'] if row else None)
@@ -1133,7 +1225,8 @@ class SettingsMixin:
         """Delete a setting row outright so it reads as unset."""
         conn = self.get_connection()
         conn.execute("DELETE FROM settings WHERE key = ?", (key,))
-        conn.commit()
+        if not self.in_settings_transaction():
+            conn.commit()
 
     def clear_setting_if_equal(self, key: str, expected: str) -> bool:
         """Delete a setting row only while it still holds `expected`.

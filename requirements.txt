@@ -12,10 +12,11 @@ anthropic==1.5.0 \
     --hash=sha256:b25f87f5758861f25993383a5c9bf274eb6e0f1b010c84019ad91854cb4e1bc6 \
     --hash=sha256:d9ce04b29ad1f7025dda3e3bc478cde8d2924d2de5417d2d4a4bb0378ecbc2a6
     # via -r requirements.in
-anyio==4.13.0 \
-    --hash=sha256:08b310f9e24a9594186fd75b4f73f4a4152069e3853f1ed8bfbf58369f4ad708 \
-    --hash=sha256:334b70e641fd2221c1505b3890c69882fe4a2df910cba14d97019b90b24439dc
+anyio==4.14.2 \
+    --hash=sha256:9f505dda5ac9f0c8309b5e8bd445a8c2bf7246f3ce950121e45ea15bc41d1494 \
+    --hash=sha256:cfa139f3ed1a23ee8f88a145ddb5ac7605b8bbfd8592baacd7ce3d8bb4313c7f
     # via
+    #   -r requirements.in
     #   anthropic
     #   httpx
     #   httpx2
@@ -1423,9 +1424,9 @@ pytest-cov==7.1.0 \
     --hash=sha256:30674f2b5f6351aa09702a9c8c364f6a01c27aae0c1366ae8016160d1efc56b2 \
     --hash=sha256:a0461110b7865f9a271aa1b51e516c9a95de9d696734a2f71e3e78f46e1d4678
     # via -r requirements.in
-python-slugify==8.0.4 \
-    --hash=sha256:276540b79961052b66b7d116620b36518847f52d5fd9e3a70164fc8c50faa6b8 \
-    --hash=sha256:59202371d1d05b54a9e7720c5e038f928f45daaffe41dd10822f3907b937c856
+python-slugify==9.0.0 \
+    --hash=sha256:1cd20fe7ebf941b11964a92aba9e5319edfe18606276c6e2481b92e737cde44a \
+    --hash=sha256:b1180fb0fd6b3590e7fbd8328b08d56cde9dcac736527a070c0a811480621316
     # via -r requirements.in
 pyyaml==6.0.3 \
     --hash=sha256:00c4bdeba853cc34e7dd471f16b4114f4162dc03e6b7afcc2128711f0eca823c \
@@ -1733,10 +1734,12 @@ sniffio==1.3.1 \
     # via
     #   anthropic
     #   openai
-soupsieve==2.8.4 \
-    --hash=sha256:e121fd02e975c695e4e9e8774a5ee35d74714b59307868dcc5319ad2d9e3328e \
-    --hash=sha256:e7e6b0769c8f51ed59acab6e994b00621096cfb1c640a7509295987388fbaf65
-    # via beautifulsoup4
+soupsieve==2.9 \
+    --hash=sha256:a2b2c76d67df2382d245409fd71e321a571717e58463efa32ace87dcadac2c12 \
+    --hash=sha256:acee8417325c5653e1377dc31eccad59eb82cbc65942afe6174c53b3aaad63fc
+    # via
+    #   -r requirements.in
+    #   beautifulsoup4
 sympy==1.14.0 \
     --hash=sha256:d3d3fe8df1e5a0b42f0e7bdf50541697dbe7d23746e894990c030e2b05e72517 \
     --hash=sha256:e091cc3e99d2141a0ba2847328f5479b05d94a6635cb96148ccb3f34671bd8f5

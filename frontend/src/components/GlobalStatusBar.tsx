@@ -2,8 +2,11 @@ import { useState, useEffect, useRef } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { storeLoginRedirect } from '../utils/loginRedirect';
 import { getStageLabel } from '../utils/processingStage';
+import { EPISODE_STATUS_COLORS } from '../utils/episodeStatus';
 import { focusRing } from './fieldStyles';
+import ChevronCaret from './ChevronCaret';
 import { apiRequest } from '../api/client';
+import { tint } from './badgeStyles';
 
 interface ProcessingJob {
   slug: string;
@@ -100,11 +103,13 @@ function rateLimitText(hold: QueueHold): string {
   return `Provider rate limit. ${resumesText(hold.holdUntil)}${started}`;
 }
 
-/** Short summary for the collapsed bar, or null when nothing is held. */
-function holdSummary(hold: QueueHold | undefined): string | null {
+/** Short summary for the collapsed bar, or null when nothing is held; compact is the phone wording. */
+function holdSummary(hold: QueueHold | undefined, compact = false): string | null {
   if (!hold) return null;
   if (hold.queuePaused) {
-    return hold.holdUntil ? `Paused until ${formatClock(hold.holdUntil)}` : 'Queue paused';
+    if (!hold.holdUntil) return 'Queue paused';
+    const clock = formatClock(hold.holdUntil);
+    return compact ? `Resumes ${clock}` : `Paused until ${clock}`;
   }
   if (hold.offlineHeld > 0) {
     const down = hold.offlineServices.filter((s) => s.reachable === false);
@@ -140,6 +145,17 @@ function formatDuration(seconds: number): string {
 const STATUS_POLL_MS = 2000;
 const STATUS_RETRY_MAX_MS = 30000;
 
+function CountChip({ count, noun, className }: { count: number; noun: string; className: string }) {
+  return (
+    <span
+      title={`${count} ${noun}`}
+      className={`px-1.5 py-0.5 text-xs rounded font-medium shrink-0 ${className}`}
+    >
+      +{count}<span className="hidden sm:inline"> {noun}</span>
+    </span>
+  );
+}
+
 function GlobalStatusBar() {
   const [status, setStatus] = useState<StatusData | null>(null);
   const [isExpanded, setIsExpanded] = useState(false);
@@ -173,7 +189,11 @@ function GlobalStatusBar() {
       setReceivedAt(Date.now());
       const prev = prevStatusRef.current;
       const nextKeys = jobKeys(data);
-      if ([...jobKeys(prev)].some((key) => !nextKeys.has(key))) {
+      const prevKeys = jobKeys(prev);
+      // A run starting matters as much as one finishing: the episode page
+      // reads its jobState and active-run spend from these queries.
+      if (prev && (prevKeys.size !== nextKeys.size
+          || [...nextKeys].some((key) => !prevKeys.has(key)))) {
         queryClient.invalidateQueries({ queryKey: ['episode'] });
         queryClient.invalidateQueries({ queryKey: ['episodes'] });
         queryClient.invalidateQueries({ queryKey: ['feed'] });
@@ -226,6 +246,7 @@ function GlobalStatusBar() {
   // service looks identical to an empty one, which is the case worth surfacing.
   const hold = status?.hold;
   const summary = holdSummary(hold);
+  const compactSummary = holdSummary(hold, true);
   const hasActivity = status?.currentJob || (status?.queueLength ?? 0) > 0
     || (status?.feedRefreshes?.length ?? 0) > 0 || summary !== null;
   if (!hasActivity) {
@@ -235,17 +256,21 @@ function GlobalStatusBar() {
   const currentJob = status?.currentJob;
   const stageLabel = currentJob ? getStageLabel(currentJob.stage) : '';
   const extra = jobs.length - 1;
+  const queued = status?.queueLength ?? 0;
 
   return (
     <div
+      // Only while it is on screen: translated away it costs a popover no room.
+      data-viewport-inset={hasActivity ? 'top' : undefined}
       className={`fixed top-0 left-0 right-0 z-50 bg-card border-b border-border shadow-xs transition-all duration-300 ${
         hasActivity ? 'translate-y-0' : '-translate-y-full'
       }`}
     >
       {/* Collapsed View */}
+      {/* The row must stay one line: Layout.tsx reserves an h-10 spacer for it. */}
       <button
         onClick={() => setIsExpanded(!isExpanded)}
-        className={`w-full px-4 py-2 flex items-center gap-3 hover:bg-accent/50 transition-colors ${focusRing}`}
+        className={`w-full px-4 py-2 flex items-center gap-2 sm:gap-3 overflow-hidden hover:bg-accent/50 transition-colors ${focusRing}`}
         aria-expanded={isExpanded}
         aria-label={isExpanded ? 'Collapse status bar' : 'Expand status bar'}
       >
@@ -270,7 +295,7 @@ function GlobalStatusBar() {
             </div>
 
             {/* Progress bar */}
-            <div className="w-24 h-1.5 bg-muted rounded-full overflow-hidden shrink-0">
+            <div className="w-12 sm:w-24 h-1.5 bg-muted rounded-full overflow-hidden shrink-0">
               <div
                 className="h-full bg-primary transition-all duration-300"
                 style={{ width: `${currentJob.progress}%` }}
@@ -278,53 +303,44 @@ function GlobalStatusBar() {
             </div>
 
             {/* Elapsed time */}
-            <span className="text-xs text-muted-foreground shrink-0 w-14 text-right">
+            <span className="text-xs text-muted-foreground shrink-0 w-14 text-right tabular-nums">
               {formatDuration(jobElapsed(currentJob, now, receivedAt))}
             </span>
           </>
         ) : (
-          <span className="text-xs text-muted-foreground">
+          <span className="text-xs text-muted-foreground min-w-0 truncate">
             {summary ?? 'Processing queue active'}
           </span>
         )}
 
         {/* Hold badge: amber so a stalled queue reads differently from a busy one */}
         {summary && currentJob && (
-          <span className="px-1.5 py-0.5 text-xs font-medium bg-warning/10 text-warning rounded shrink-0">
-            {summary}
+          <span className={`px-1.5 py-0.5 text-xs rounded font-medium ${tint.warning} min-w-0 truncate`}>
+            {compactSummary === summary ? summary : (
+              <>
+                <span className="sm:hidden">{compactSummary}</span>
+                <span className="hidden sm:inline">{summary}</span>
+              </>
+            )}
           </span>
         )}
 
         {/* Other running jobs */}
         {extra > 0 && (
-          <span className="px-1.5 py-0.5 text-xs font-medium bg-primary/10 text-primary rounded shrink-0">
-            +{extra} running
-          </span>
+          <CountChip count={extra} noun="running" className={tint.primary} />
         )}
 
         {/* Queue badge */}
-        {(status?.queueLength ?? 0) > 0 && (
-          <span className="px-1.5 py-0.5 text-xs font-medium bg-primary/10 text-primary rounded shrink-0">
-            +{status?.queueLength} queued
-          </span>
+        {queued > 0 && (
+          <CountChip
+            count={queued}
+            noun="queued"
+            className={EPISODE_STATUS_COLORS.queued}
+          />
         )}
 
         {/* Expand/collapse icon */}
-        <svg
-          className={`w-4 h-4 text-muted-foreground transition-transform shrink-0 ${
-            isExpanded ? 'rotate-180' : ''
-          }`}
-          fill="none"
-          viewBox="0 0 24 24"
-          stroke="currentColor"
-        >
-          <path
-            strokeLinecap="round"
-            strokeLinejoin="round"
-            strokeWidth={2}
-            d="M19 9l-7 7-7-7"
-          />
-        </svg>
+        <ChevronCaret expanded={isExpanded} className="w-4 h-4 shrink-0" />
       </button>
 
       {/* Expanded View */}

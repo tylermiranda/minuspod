@@ -77,11 +77,11 @@ def test_merge_keeps_correct_twin_for_later_ad():
     assert kept_orig[1]['marker'] == 'C'
 
 
-def test_merge_preserves_later_trusted_split_fragment():
+def test_merge_preserves_later_measured_split_fragment():
     processed = [
         {'start': 100.0, 'end': 102.0, 'confidence': 0.85},
         {'start': 106.0, 'end': 108.0, 'confidence': 0.85,
-         '_trusted_split_fragment': True},
+         '_measured_split_fragment': True},
     ]
     original = [
         {'start': 1100.0, 'end': 1102.0},
@@ -90,11 +90,19 @@ def test_merge_preserves_later_trusted_split_fragment():
 
     kept_proc, kept_orig = _run(processed, original)
 
-    assert kept_proc[0]['_trusted_split_fragment'] is True
+    assert kept_proc[0]['_measured_split_fragment'] is True
+    # The twin's span grew with the merge, so it records the same members.
     assert kept_orig[0] == {
         'start': 1100.0,
         'end': 1108.0,
-        '_trusted_split_fragment': True,
+        '_measured_split_fragment': True,
+        'merged_distinct_ads': True,
+        'merged_protected_start': 1100.0,
+        'merged_protected_end': 1108.0,
+        'merged_member_spans': [
+            {'start': 1100.0, 'end': 1102.0, 'stage': None},
+            {'start': 1106.0, 'end': 1108.0, 'stage': None},
+        ],
     }
     applied = AudioProcessor().compute_applied_cuts(kept_proc, 600.0)
     assert [(cut['start'], cut['end']) for cut in applied] == [(100.0, 108.0)]
@@ -469,6 +477,41 @@ def test_non_releasable_hold_never_stamped():
     proc = [_plain_proc(990.0, 1150.0)]
     orig = [_orig(990.0, 1150.0, 'nocue')]
     hold = _held_marker(990.0, 1150.0, hold_reason='no_cue_evidence')
+
+    v_ads_to_cut, _ui, _held, n = _gate_verification_ads_by_confidence(
+        proc, orig, min_cut_confidence=0.8, pass1_held_markers=[hold],
+    )
+
+    assert v_ads_to_cut == []
+    assert n == 0
+    assert 'pass2_corroborated' not in hold
+
+
+def test_boundary_conflict_hold_is_stamped_by_a_corroborating_pass2_ad():
+    """A reviewer trim that lost to a measured member is settled by pass 2
+    re-finding the span on its own."""
+    proc = [_plain_proc(990.0, 1150.0)]
+    orig = [_orig(990.0, 1150.0, 'bconflict')]
+    hold = _held_marker(990.0, 1150.0, hold_reason='reviewer_boundary_conflict')
+
+    v_ads_to_cut, _ui, _held, n = _gate_verification_ads_by_confidence(
+        proc, orig, min_cut_confidence=0.8, pass1_held_markers=[hold],
+    )
+
+    assert v_ads_to_cut == []
+    assert n == 1
+    assert hold['pass2_corroborated'] is True
+
+
+def test_boundary_conflict_hold_is_not_stamped_by_the_rejected_trim():
+    """The stored proposal is the trim that crossed a measured member, so a
+    pass-2 ad agreeing with it must not release the hold: approving it would
+    ship the member the hold protects."""
+    proc = [_plain_proc(990.0, 1058.0)]
+    orig = [_orig(990.0, 1058.0, 'bconflict')]
+    hold = _held_marker(990.0, 1150.0, hold_reason='reviewer_boundary_conflict')
+    hold['reviewer_proposed_start'] = 990.0
+    hold['reviewer_proposed_end'] = 1060.0
 
     v_ads_to_cut, _ui, _held, n = _gate_verification_ads_by_confidence(
         proc, orig, min_cut_confidence=0.8, pass1_held_markers=[hold],

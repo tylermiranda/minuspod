@@ -48,12 +48,17 @@ HOLD_REASON_NO_CUE = 'no_cue_evidence'
 HOLD_REASON_NO_SPLICE = 'no_splice_evidence'
 HOLD_REASON_REVIEWER_CONTRADICTION = 'reviewer_contradiction'
 HOLD_REASON_REVIEWER_BOUNDARY_CONFLICT = 'reviewer_boundary_conflict'
+# The reviewer rejected a span that carries measured evidence or a confirmed
+# sponsor: a human decides, the reject alone does not drop it.
+HOLD_REASON_REVIEWER_REJECT_CONFLICT = 'reviewer_reject_conflict'
 HOLD_REASON_UNCORROBORATED_TAIL = 'uncorroborated_tail'
 HOLD_REASON_DIFFERENTIAL_UNCORROBORATED = 'differential_uncorroborated'
 # A standalone pass-2 detection that overlaps no pass-1 marker: too low a
 # confidence to auto-cut, too high to silently discard (see
 # _gate_verification_ads_by_confidence's fall-through in processing.py).
 HOLD_REASON_VERIFICATION_MISS = 'verification_miss'
+# No longer stamped: a pass-2 finding inside a kept span is dropped, not held.
+# Kept so markers persisted under the old rule still resolve their hold reason.
 HOLD_REASON_VERIFICATION_KEPT_CONFLICT = 'verification_kept_conflict'
 HOLD_REASON_CUE_TEMPLATE_UNPROVEN = 'cue_template_unproven'
 HOLD_REASON_CUE_LOW_CONFIDENCE = 'cue_low_confidence'
@@ -249,11 +254,22 @@ def validate_ad_chapter_categories(value) -> str | None:
 # verification_miss stays out deliberately: pass 2 is the source of these
 # holds, and auto-approving them on a later pass-2 corroboration would let
 # pass 2 approve its own products with no independent second opinion.
+# reviewer_boundary_conflict is in: pass 2 re-detecting the span on its own
+# is the independent second opinion the hold was waiting for.
 PASS2_AUTOAPPROVE_HOLD_REASONS = frozenset({
     HOLD_REASON_DIFFERENTIAL_UNCORROBORATED,
+    HOLD_REASON_REVIEWER_BOUNDARY_CONFLICT,
     HOLD_REASON_REVIEWER_CONTRADICTION,
     HOLD_REASON_NO_SPLICE,
     HOLD_REASON_UNCORROBORATED_TAIL,
+})
+
+# Of those, the reasons a pass-2 ad may only corroborate by covering the held
+# span, never by agreeing with the reviewer's stored proposal. That proposal
+# is the trim the hold was created to block, so approving it would ship the
+# measured member the hold protects.
+PASS2_COVERAGE_ONLY_HOLD_REASONS = frozenset({
+    HOLD_REASON_REVIEWER_BOUNDARY_CONFLICT,
 })
 
 # A pass-2 detection corroborates a differential hold (stamping it for
@@ -288,6 +304,30 @@ def is_cue_backed(ad) -> bool:
     """
     return (bool(ad.get('cue_snap'))
             or ad.get('detection_stage') in ('cue_pair', 'manual'))
+
+
+# Stages whose spans are measured from the audio or from matched transcript
+# text rather than proposed by a model. dai_differential is deliberately not
+# one: a cross-fetch diff earns KeepDifferentialOverride but never outranks a
+# reviewer reject by itself.
+MEASURED_EVIDENCE_STAGES = frozenset({
+    'fingerprint', 'cue_pair', 'text_pattern', 'manual',
+})
+
+
+def measured_evidence(ad) -> list[str]:
+    """Every measured signal backing an ad: its own stage, the measured stages
+    it merged in, a cue snap, and a validator-confirmed sponsor."""
+    # Lazy: utils/__init__ imports utils.audio, which imports this module.
+    from utils.markers import recorded_member_spans
+    stages = {ad.get('detection_stage')}
+    stages.update(span.get('stage') for span in recorded_member_spans(ad))
+    evidence = sorted(s for s in stages if s in MEASURED_EVIDENCE_STAGES)
+    if is_edge_cue_snapped(ad, 'start') or is_edge_cue_snapped(ad, 'end'):
+        evidence.append('cue_snap')
+    if (ad.get('validation') or {}).get('sponsor_confirmed'):
+        evidence.append('sponsor_confirmed')
+    return evidence
 
 
 def is_edge_cue_snapped(ad, edge: str) -> bool:
@@ -423,6 +463,16 @@ RSS_REFRESH_INTERVAL = 900      # Seconds between RSS refreshes (15 min)
 # gates lastRefreshError on the threshold so the UI marker matches.
 FEED_REFRESH_FAILURE_ALERT_THRESHOLD = 3
 FEED_REFRESH_FAILURE_COUNT_INTERVAL = 600  # Seconds between counted failures
+
+# Shared-outage detection for refresh_all_feeds. When most feeds in one
+# batch fail together (a shared network blip, not N unrelated publishers
+# breaking at once), skip per-feed failure counting so healthy feeds are
+# not marked broken, and schedule one bounded retry instead of letting
+# every feed's own retry logic fire in lockstep at the next 15-min tick.
+FEED_REFRESH_OUTAGE_FRACTION = 0.5       # Failed/total ratio that trips outage mode
+FEED_REFRESH_OUTAGE_MIN_FEEDS = 3        # Below this batch size, count failures per-feed as usual
+FEED_REFRESH_OUTAGE_RETRY_BASE_SECONDS = 180   # Base delay before the one retry
+FEED_REFRESH_OUTAGE_RETRY_JITTER_SECONDS = 90  # Random extra delay, avoids thundering-herd retries
 
 # ============================================================
 # Deferred-episode services
@@ -684,6 +734,11 @@ AUDIO_CUE_SUGGEST_MIN_GAP = 0.08        # smallest empty band that counts as cle
 AUDIO_CUE_SUGGEST_MIN_SIGNAL = 3        # occurrences above the gap needed to trust the signal cluster
 AUDIO_CUE_SUGGEST_BAND = (0.40, 0.95)   # suggested value must fall in this band
 AUDIO_CUE_SUGGEST_MARGIN = 0.02         # keep the suggestion off both cluster edges
+# A template peaking just under its threshold is mis-tuned, not absent. Both
+# bounds stay tight: fewer episodes fires on noise, a wider band proposes a
+# threshold down in the noise ceiling.
+AUDIO_CUE_SUGGEST_NEAR_MISS_EPISODES = 3
+AUDIO_CUE_SUGGEST_NEAR_MISS_BAND = 0.2
 # The confidence a cue must reach to affect anything downstream (LLM prompt
 # floor, hardcoded). Snap/pair use their own DB-settable floors; this is a
 # display/annotation mirror only -- do NOT rewire audio_enforcer from it here.
@@ -762,6 +817,14 @@ def resolve_feed_processing_mode(podcast_row):
     if podcast_row.get('detection_mode') == DETECTION_MODE_CUE_ONLY:
         return PROCESSING_MODE_CUE_ONLY
     return PROCESSING_MODE_STANDARD
+
+
+def resolve_processing_mode(podcast_row, episode_row):
+    """Effective mode for one episode: a per-episode pass-through override
+    (issue #746) wins over the feed mode; otherwise the feed mode applies."""
+    if episode_row and episode_row.get('passthrough_enabled'):
+        return PROCESSING_MODE_PASSTHROUGH
+    return resolve_feed_processing_mode(podcast_row)
 
 
 # Invariant: resolve_feed_processing_mode(updates) == mode for every entry
@@ -1084,6 +1147,18 @@ def differential_fetch_effective(explicit, dai_platform=None, dai_likely=False):
     return bool(dai_platform or dai_likely)
 
 
+def resolve_ad_detection_exclude_start_seconds(db, podcast_id) -> float:
+    """Per-feed opening exclusion wins; NULL inherits the global setting."""
+    override = _resolve_override(
+        db, podcast_id, 'ad_detection_exclude_start_override', float, None)
+    if override is not None:
+        return override
+    try:
+        return float(db.get_setting_float('ad_detection_exclude_start_seconds', 0.0))
+    except Exception:
+        return 0.0
+
+
 def resolve_max_ad_duration_override(db, podcast_id) -> float | None:
     """Per-feed max ad duration cap in seconds (Phase C held-for-review).
 
@@ -1127,6 +1202,22 @@ def resolve_max_ad_duration_confirmed(db) -> float:
                                           MAX_AD_DURATION_CONFIRMED))
     except Exception:
         return MAX_AD_DURATION_CONFIRMED
+
+
+REVIEW_MAX_BOUNDARY_SHIFT_DEFAULT = 60
+
+
+def resolve_max_boundary_shift(db) -> int:
+    """Seconds the reviewer may move one boundary of a candidate."""
+    try:
+        raw = db.get_setting('review_max_boundary_shift')
+    except Exception:
+        raw = None
+    try:
+        return (max(1, int(raw)) if raw is not None
+                else REVIEW_MAX_BOUNDARY_SHIFT_DEFAULT)
+    except (TypeError, ValueError):
+        return REVIEW_MAX_BOUNDARY_SHIFT_DEFAULT
 
 
 def resolve_cue_gated_approval(db, podcast_id) -> bool:
@@ -1640,7 +1731,13 @@ STAGE_TUNABLE_DEFAULTS = {
     # reviewer (applies to both reviewer pass 1 and reviewer pass 2)
     'reviewer_temperature': 0.0,
     'reviewer_max_tokens': 4096,
+    # Budget stays None: for Anthropic that means extended thinking off, which
+    # is already cheaper than the 1024-token floor the range allows.
     'reviewer_reasoning_budget': None,
+    # Unset: a default effort costs a rejected request plus a retry per
+    # reviewed ad on a non-reasoning model. Operators who want the reviewer to
+    # think set it in Settings, where 'low' caps a verdict that otherwise
+    # spent ~2k reasoning tokens on a 188-character answer.
     'reviewer_reasoning_level': None,
     # chapter generation: boundary detection
     'chapter_boundary_temperature': 0.1,
@@ -1705,7 +1802,7 @@ STAGE_TUNABLE_RANGES = {
     # detection window geometry. Cross-field constraint (overlap < size) is
     # enforced at the API layer; the per-field bounds here are the static
     # envelope the resolver checks against.
-    'window_size_seconds': (120, 1800),
+    'window_size_seconds': (120, 10800),
     'window_overlap_seconds': (0, 1770),
 }
 
@@ -1888,17 +1985,20 @@ def resolve_chapter_geometry(settings: dict | None = None):
     return target, window, max_boundaries, min_duration
 
 
-def resolve_stage_tunables(prefix: str, settings: dict | None = None):
+def resolve_stage_tunables(prefix: str, settings: dict | None = None,
+                           provider: str | None = None):
     """Read (max_tokens, temperature, reasoning) for a stage prefix.
 
-    Reasoning picks the right key based on the active provider: numeric budget
-    for Anthropic, string-enum level for everyone else. Stage modules call this
-    once at LLM-call time; the underlying DB reads are cached.
+    Reasoning picks the right key based on ``provider``, the provider this
+    stage's call is actually routed to: numeric budget for Anthropic, string
+    enum level for everyone else. Omitted, it falls back to the global
+    effective provider, which is wrong for a stage routed elsewhere. Stage
+    modules call this once at LLM-call time; the DB reads are cached.
     """
     from llm_client import get_effective_provider  # lazy: llm_client imports config
     max_tokens = get_stage_tunable(f'{prefix}_max_tokens', settings=settings)
     temperature = get_stage_tunable(f'{prefix}_temperature', settings=settings)
-    if get_effective_provider() == PROVIDER_ANTHROPIC:
+    if (provider or get_effective_provider()) == PROVIDER_ANTHROPIC:
         reasoning = get_stage_tunable(f'{prefix}_reasoning_budget', settings=settings)
     else:
         reasoning = get_stage_tunable(f'{prefix}_reasoning_level', settings=settings)
@@ -2031,6 +2131,14 @@ def _validate_positive_int(value: str) -> bool:
     rather than being discarded for the fallback default."""
     try:
         return int(value) > 0
+    except (ValueError, TypeError):
+        return False
+
+
+def _validate_non_negative_int(value: str) -> bool:
+    """Manual rate-limit gate: 0 means off, positive is a cap."""
+    try:
+        return int(value) >= 0
     except (ValueError, TypeError):
         return False
 
@@ -2169,6 +2277,21 @@ ENV_BACKED_SETTINGS = (
      str(EPISODE_LOG_RETENTION_DAYS_DEFAULT), _validate_episode_log_retention_days),
     ('episode_log_level', 'EPISODE_LOG_LEVEL', EPISODE_LOG_LEVEL_DEBUG,
      _validate_episode_log_level),
+    # Manual per-provider request-rate limits (issue #747). 0 = unlimited
+    # (off by default). Counted per provider account (primary/secondary) so
+    # MinusPod self-throttles under a low-tier provider's hard limits.
+    ('provider_requests_per_min', 'PROVIDER_REQUESTS_PER_MIN', '0',
+     _validate_non_negative_int),
+    ('provider_requests_per_day', 'PROVIDER_REQUESTS_PER_DAY', '0',
+     _validate_non_negative_int),
+    ('secondary_provider_requests_per_min', 'SECONDARY_PROVIDER_REQUESTS_PER_MIN',
+     '0', _validate_non_negative_int),
+    ('secondary_provider_requests_per_day', 'SECONDARY_PROVIDER_REQUESTS_PER_DAY',
+     '0', _validate_non_negative_int),
+    ('provider_tokens_per_min', 'PROVIDER_TOKENS_PER_MIN', '0',
+     _validate_non_negative_int),
+    ('secondary_provider_tokens_per_min', 'SECONDARY_PROVIDER_TOKENS_PER_MIN',
+     '0', _validate_non_negative_int),
 )
 
 

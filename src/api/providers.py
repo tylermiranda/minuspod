@@ -13,18 +13,28 @@ from flask import request
 import transcriber
 from api import api, error_response, json_response, limiter
 from config import (
-    HTTP_MAX_REDIRECTS_API, HTTP_TIMEOUT_PROBE,
-    PROVIDER_OLLAMA, PROVIDER_OPENAI_COMPATIBLE,
+    DEFAULT_OPENAI_BASE_URL, HTTP_MAX_REDIRECTS_API, HTTP_TIMEOUT_PROBE,
+    PROVIDER_ANTHROPIC, PROVIDER_OLLAMA, PROVIDER_OPENAI_COMPATIBLE,
+    PROVIDER_OPENROUTER,
 )
 from database import Database
-from llm_client import get_effective_base_url, _normalize_base_url_for_provider, _opencode_headers
+from llm_client import (
+    get_effective_base_url, get_effective_secondary_provider_api_key,
+    _normalize_base_url_for_provider, _opencode_headers,
+)
+from llm_route import (
+    SLOT_PRIMARY, VALID_SLOTS, account_identity_for_primary_provider,
+    account_identity_for_slot,
+)
 from rate_limit_hold import clear_hold_for_provider_change
 from secrets_crypto import is_available as crypto_available
 from utils.connection_probe import run_probe, parse_probe_json, rejected_detail
 from utils.http import safe_url_for_log
 from utils.safe_http import URLTrust, safe_get
 from utils.secret_writes import SecretWriteRejected, set_or_clear_secret
-from utils.url import validate_base_url, SSRFError
+from utils.url import (
+    BASE_URL_USERINFO_ERROR, SSRFError, url_has_userinfo, validate_base_url,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -39,6 +49,58 @@ _PROVIDERS = {
 # Providers whose key or endpoint feeds the LLM client, so a write here can
 # invalidate a rate-limit hold. Whisper is a separate service (#696).
 _LLM_PROVIDERS = ('anthropic', 'openai', 'openrouter', 'ollama')
+
+# This endpoint's provider names ('openai') differ from the internal
+# provider_key hold markers are keyed by ('openai-compatible'); map to the
+# real key so clearing a hold here targets the marker that was actually set.
+_HOLD_PROVIDER_KEY = {
+    'anthropic': PROVIDER_ANTHROPIC,
+    'openai': PROVIDER_OPENAI_COMPATIBLE,
+    'openrouter': PROVIDER_OPENROUTER,
+    'ollama': PROVIDER_OLLAMA,
+}
+
+
+# What a save may do to runs frozen against the account it replaces.
+_AFFECTED_RUNS_ACTIONS = ('requeue', 'cancel')
+
+
+def _primary_account_identity(provider: str) -> str | None:
+    """Primary-slot account identity for this endpoint's provider type.
+
+    Keyed by the type being edited, not the globally selected one: a save
+    here moves the account of the type it writes, whichever type is active.
+    """
+    return account_identity_for_primary_provider(_HOLD_PROVIDER_KEY.get(provider))
+
+
+def _affected_runs(account_id: str | None, credential_slot: str) -> list[dict]:
+    """Active runs whose frozen routes still name this account."""
+    if not account_id:
+        return []
+    from main_app.processing import runs_for_account
+    return runs_for_account(account_id, credential_slot)
+
+
+def _apply_affected_runs_action(runs: list[dict], action: str) -> None:
+    """Detach or cancel the runs an account change stranded.
+
+    Both drop the frozen routes so a resumed run re-resolves; 'cancel' also
+    asks the owner to stop now rather than at its next provider call.
+    """
+    from cancel import request_cancellation
+    from main_app.processing import clear_route_snapshot
+    for run in runs:
+        clear_route_snapshot(run['runId'])
+        if action == 'cancel':
+            request_cancellation(run['slug'], run['episodeId'])
+
+
+def _affected_runs_payload(runs: list[dict], action: str | None = None) -> dict:
+    payload = {'count': len(runs), 'runs': runs}
+    if action is not None:
+        payload['action'] = action
+    return payload
 
 
 def _source_for(db, cfg) -> str:
@@ -86,12 +148,33 @@ def update_provider(provider):
     db = Database()
     credentials_changed = False
 
+    action = body.get('affectedRunsAction', 'requeue')
+    if action not in _AFFECTED_RUNS_ACTIONS:
+        return error_response(
+            f'affectedRunsAction must be one of: {", ".join(_AFFECTED_RUNS_ACTIONS)}', 400)
+
     if 'apiKey' in body:
         api_key = body['apiKey']
         if api_key is not None and not isinstance(api_key, str):
             return error_response('apiKey must be a string or null', 400)
+
+    if cfg['base_url'] and 'baseUrl' in body:
+        url = body['baseUrl']
+        if url is not None and not isinstance(url, str):
+            return error_response('baseUrl must be a string or null', 400)
+        if url:
+            if provider in _LLM_PROVIDERS and url_has_userinfo(url):
+                return error_response(BASE_URL_USERINFO_ERROR, 400)
+            try:
+                validate_base_url(url)
+            except SSRFError:
+                return error_response('base URL failed SSRF validation', 400)
+
+    before_identity = _primary_account_identity(provider)
+
+    if 'apiKey' in body:
         try:
-            set_or_clear_secret(db, cfg['secret'], api_key)
+            set_or_clear_secret(db, cfg['secret'], body['apiKey'])
         except SecretWriteRejected:
             return error_response('provider_crypto_unavailable', 409)
         credentials_changed = True
@@ -99,10 +182,6 @@ def update_provider(provider):
     if cfg['base_url'] and 'baseUrl' in body:
         url = body['baseUrl']
         if url:
-            try:
-                validate_base_url(url)
-            except SSRFError:
-                return error_response('base URL failed SSRF validation', 400)
             db.set_setting(cfg['base_url'], url)
             credentials_changed = True
         # Empty baseUrl ignored; clear via DELETE /providers/<name>. Issue #235.
@@ -111,16 +190,39 @@ def update_provider(provider):
         model = body['model'] or ''
         db.set_setting(cfg['model'], model)
 
+    # Identity is read either side of the cache flush: before the write the
+    # cache is still current, and after it the next read is fresh.
+    payload = _finish_provider_write(db, provider, cfg, before_identity, action)
+
+    if credentials_changed and provider in _LLM_PROVIDERS:
+        clear_hold_for_provider_change(
+            db, f'{provider} credentials changed',
+            provider_key=_HOLD_PROVIDER_KEY.get(provider))
+
+    logger.info("provider=%s updated source=%s", provider, _source_for(db, cfg))
+    return json_response(payload, 200)
+
+
+def _finish_provider_write(db, provider: str, cfg: dict,
+                           before_identity: str | None, action: str) -> dict:
+    """Flush the provider cache, then report what the write did to the
+    primary slot's account identity and to runs frozen against the old one."""
     # Drop the TTL-cached provider settings so the next read sees this write
     # immediately (see issue #234: stale cache made Save Changes vanish).
     from llm_client import invalidate_provider_cache
     invalidate_provider_cache()
-
-    if credentials_changed and provider in _LLM_PROVIDERS:
-        clear_hold_for_provider_change(db, f'{provider} credentials changed')
-
-    logger.info("provider=%s updated source=%s", provider, _source_for(db, cfg))
-    return json_response(_provider_status(db, cfg), 200)
+    payload = _provider_status(db, cfg)
+    if provider not in _LLM_PROVIDERS:
+        return payload
+    if _primary_account_identity(provider) == before_identity:
+        return payload
+    runs = _affected_runs(before_identity, SLOT_PRIMARY)
+    _apply_affected_runs_action(runs, action)
+    payload['accountChanged'] = True
+    payload['affectedRuns'] = _affected_runs_payload(runs, action)
+    logger.info("provider=%s account identity changed; %d run(s) %sd",
+                provider, len(runs), action)
+    return payload
 
 
 @api.route('/settings/providers/<provider>', methods=['DELETE'])
@@ -129,16 +231,40 @@ def clear_provider(provider):
         return error_response('unknown provider', 404)
     cfg = _PROVIDERS[provider]
     db = Database()
+    action = (request.get_json(silent=True) or {}).get('affectedRunsAction', 'requeue')
+    if action not in _AFFECTED_RUNS_ACTIONS:
+        return error_response(
+            f'affectedRunsAction must be one of: {", ".join(_AFFECTED_RUNS_ACTIONS)}', 400)
+    before_identity = _primary_account_identity(provider)
     db.clear_secret(cfg['secret'])
     if cfg['base_url']:
         db.set_setting(cfg['base_url'], '')
-    from llm_client import invalidate_provider_cache
-    invalidate_provider_cache()
+    payload = _finish_provider_write(db, provider, cfg, before_identity, action)
     if provider in _LLM_PROVIDERS:
         # Lift even with no key left: the next run fails for its own reason.
-        clear_hold_for_provider_change(db, f'{provider} credentials cleared')
+        clear_hold_for_provider_change(
+            db, f'{provider} credentials cleared',
+            provider_key=_HOLD_PROVIDER_KEY.get(provider))
     logger.info("provider=%s cleared", provider)
-    return json_response(_provider_status(db, cfg), 200)
+    return json_response(payload, 200)
+
+
+@api.route('/settings/providers/<slot>/affected-runs', methods=['GET'])
+def account_affected_runs(slot):
+    """Runs a change to this account slot would strand, for a pre-save check.
+
+    Lists the active runs whose frozen routes still name the slot's current
+    account, so the UI can show what a provider or endpoint change is about
+    to interrupt before it writes anything.
+    """
+    if slot not in VALID_SLOTS:
+        return error_response('unknown provider slot', 404)
+    account_id = account_identity_for_slot(slot)
+    return json_response({
+        'slot': slot,
+        'accountId': account_id,
+        'affectedRuns': _affected_runs_payload(_affected_runs(account_id, slot)),
+    }, 200)
 
 
 def _resolve_key(db, cfg):
@@ -425,6 +551,8 @@ def test_provider_connection(provider):
             {'ok': False, 'reachable': False,
              'detail': 'Enter a base URL first.'}, 200)
     base = base.strip()
+    if provider != 'whisper' and url_has_userinfo(base):
+        return error_response(BASE_URL_USERINFO_ERROR, 400)
 
     # The saved API key goes out only when the tested URL points at the
     # same server as the explicitly saved base URL. Without this gate, any
@@ -460,4 +588,77 @@ def test_provider_connection(provider):
             PROVIDER_OLLAMA if provider == 'ollama'
             else PROVIDER_OPENAI_COMPATIBLE, base)
         result = _probe_models_endpoint(norm, api_key)
+    return json_response(result, 200)
+
+
+# Provider types the secondary slot accepts, matching VALID_LLM_PROVIDERS
+# in api/settings.py (not importable here without a circular import).
+_SECONDARY_PROVIDER_TYPES = (
+    PROVIDER_ANTHROPIC, PROVIDER_OPENROUTER, PROVIDER_OPENAI_COMPATIBLE, PROVIDER_OLLAMA)
+
+
+@api.route('/settings/providers/secondary/test-connection', methods=['POST'])
+def test_secondary_provider_connection():
+    """End-to-end probe of the optional secondary provider slot.
+
+    Mirrors /settings/providers/<provider>/test-connection above, but reads
+    its type, base URL, and key from the secondary_provider_* settings and
+    the secondary_provider_api_key secret instead of the primary provider
+    config, so the operator can validate the secondary slot before routing
+    any stage to it. A fixed-endpoint type (anthropic/openrouter) probes its
+    public URL with the secondary key; a configurable-endpoint type
+    (openai-compatible, ollama) probes the same /models route the real
+    client uses. A `provider` field in the body overrides the saved type
+    (like `baseUrl` already does) so an unsaved dropdown change can be
+    tested before Save, matching the primary test-connection route. The
+    saved key travels only when the requested type still matches the saved
+    type and the tested URL is the explicitly saved one.
+    """
+    db = Database()
+    body = request.get_json(silent=True) or {}
+
+    provider = body['provider'] if 'provider' in body else db.get_setting('secondary_provider')
+    if provider is not None and not isinstance(provider, str):
+        return error_response('provider must be a string', 400)
+    if not provider:
+        return json_response(
+            {'ok': False, 'reachable': False,
+             'detail': 'Configure a secondary provider type first.'}, 200)
+    if provider not in _SECONDARY_PROVIDER_TYPES:
+        return error_response(
+            f'provider must be one of: {", ".join(_SECONDARY_PROVIDER_TYPES)}', 400)
+
+    # The stored key was entered for the saved type, so an unsaved type
+    # override must not borrow it: that would ship the key to a vendor the
+    # operator never designated.
+    saved_key = ''
+    if provider == (db.get_setting('secondary_provider') or ''):
+        saved_key = get_effective_secondary_provider_api_key() or ''
+
+    if provider in _FIXED_PROVIDER_PROBES:
+        return json_response(_probe_fixed_endpoint(provider, saved_key), 200)
+
+    # Effective default matches llm_route; the key gate below sees only an
+    # explicitly saved URL, never that default.
+    gate_base = db.get_setting('secondary_provider_base_url') or ''
+    base = body['baseUrl'] if 'baseUrl' in body else (gate_base or DEFAULT_OPENAI_BASE_URL)
+    if base is not None and not isinstance(base, str):
+        return error_response('baseUrl must be a string', 400)
+    if not base or not base.strip():
+        return json_response(
+            {'ok': False, 'reachable': False,
+             'detail': 'Enter a base URL first.'}, 200)
+    base = base.strip()
+    if url_has_userinfo(base):
+        return error_response(BASE_URL_USERINFO_ERROR, 400)
+
+    # Same anti-exfiltration gate as the primary test-connection route
+    # (#544): the saved key only goes out when the tested URL matches the
+    # explicitly saved secondary base URL.
+    api_key = saved_key if _same_server(base, gate_base) else ''
+
+    norm = _normalize_base_url_for_provider(
+        PROVIDER_OLLAMA if provider == PROVIDER_OLLAMA
+        else PROVIDER_OPENAI_COMPATIBLE, base)
+    result = _probe_models_endpoint(norm, api_key)
     return json_response(result, 200)

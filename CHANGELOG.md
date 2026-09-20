@@ -11,10 +11,229 @@ release notes.
 
 ## [Unreleased]
 
+### Fixed
+
+- On a phone, the LLM spend From and To date inputs no longer overrun the card. They now size to the date they hold and sit together on one line instead of stretching full width, which the native date control could push past the card edge.
+
+## [2.97.7] - 2026-09-18
+
+### Security
+
+- anyio 4.13.0 to 4.14.2 to clear CVE-2026-63374 and CVE-2026-64847 (pulled in by anthropic, httpx, and openai).
+
+### Fixed
+
+- Editing an LLM provider's endpoint or type no longer crashes the Settings page. The pre-save preflight read the affected-runs count and list off the top of the response, but the API nests them under `affectedRuns`, so the count read as undefined, the empty-state guard was skipped, and the list render called `.map` on undefined. The client now unwraps the nested object.
+- On the LLM spend section, the From and To date inputs no longer overrun the card on a phone, and a long provider/model name no longer collides with its price. The model name gets its own line and the price sits below it.
+
+## [2.97.6] - 2026-09-17
+
+### Fixed
+
+- The low-ad-yield action also runs when a run ends through the pass-2 auto-approve recut. That exit returned before the yield check, so a run that auto-approved a corroborated hold never queued its rerun, however little it removed. One such run removed 121 s against a 563 s feed average and was skipped.
+- A hold placed because the reviewer's trim disagreed with a measured member (`reviewer_boundary_conflict`) is now auto-approved when pass 2 independently re-detects the span, the same as the other corroborated holds. Pass 2 had re-found two such spans at 0.98 and 0.9 confidence and dropped both as overlapping a held span, so the episode shipped with 2 of its 4 ads still in it. Only covering the held span corroborates this reason: the trim the hold recorded is the one that crossed the measured member, so a pass-2 ad agreeing with that trim does not release the hold.
+- A count that opens an ad reason ("Two consecutive cross-promotion ads") is no longer taken as the sponsor. One such reason created two patterns for a sponsor named "Two".
+- On the episode page the appended chapter list is rendered as its own block below the description. The blank-line join between the two never showed on the page: the description renderer treats whitespace between block tags as insignificant and collapsed it to a single line break.
+- Word timestamps from an OpenAI-compatible transcription server are read again. The verbose_json spec returns them in a top-level `words` array, but the remote parser only looked for them nested inside each segment, so a spec-compliant server (OpenVINO Model Server, OpenAI itself) returned a full transcript with the words dropped. Boundary refinement was then skipped with a "no word timestamps" warning. The words are now folded into the segment covering each one. The in-process faster-whisper path, which already nests them, is unchanged.
+
+### Changed
+
+- Feed refreshes are staggered across the interval instead of refreshing every feed at once. The scheduler wakes on a short tick and refreshes only the feeds due that tick, oldest attempt first, sized so the whole set is covered once per interval. The old whole-corpus sweep produced a burst of concurrent writes that queued behind each other and, during a run, made the periodic search index rebuild wait out its lock timeout and fail. Due selection is keyed off the last refresh attempt, so a feed that keeps failing retries once per interval like any other rather than being tried every tick. Force Refresh All still refreshes every feed at once. The dashboard "all feeds fresh as of" time is now the oldest successful per-feed refresh, computed on read; a feed that has never succeeded is ignored rather than blanking it, and one that stopped refreshing holds it back to show the staleness.
+- The search index rebuild retries its final table swap on a lost write lock instead of discarding the whole rebuild. The corpus is already staged, so a busy database costs a short wait, not a full re-index.
+- Dependency updates: python-slugify 8.0.4 to 9.0.0 (#744), react and react-dom 19.2.8 to 19.3.0 with matching @types (#738), and soupsieve 2.8.4 to 2.9 to clear CVE-2026-85999 and CVE-2026-86000. Slug output is unchanged across the python-slugify bump.
+
+## [2.97.4] - 2026-09-15
+
+### Fixed
+
+- The dashboard row Process/Reprocess control is back to the compact 96 px chip. The 44 px card button in 2.97.3 let "Reprocess" outgrow the width floor, so the two labels rendered at different sizes.
+- On desktop, the Process/Reprocess menu on the last episode of a dashboard group is no longer clipped by the group's border.
+- A merged ad is no longer held for review when the reviewer trims a text-pattern tail that was only estimated from the pattern's average duration. The matched text stays protected and the estimated remainder does not. A pattern with no outro match had extended a break by 79 s.
+- The reviewer tolerates up to 3 s of boundary disagreement with a measured member (fingerprint, cue, text pattern) before holding a merged ad. The cut is still clamped to the member's edge, so no evidence is lost. A 2.5 s trim had held a 195 s break.
+- The processing status bar fits a 360 px phone. The progress bar shrinks, and long hold labels truncate instead of pushing the expand chevron off screen. On phones a timed pause reads "Resumes 9:59 PM" and the running and queued count chips drop their word. The queued chip uses the purple queued color from the episode status palette.
+- A provider rate limit that fails every verification window now re-queues the episode to resume after the hold, the same as a first-pass limit. The verification wrapper had swallowed the hold, so the episode finalized with its first-pass cuts and none of the second pass.
+- A reviewer proposal that the boundary clamp rejected no longer triggers a second recovery call or marks the ad as moved.
+- Badges share one recipe across the app (8 px side padding, 20 percent tint from a named set of theme tokens) instead of hand-written variants in 40 files. The last 10 and 15 percent tints are raised to 20 percent.
+- Dashboard dropdown menus render in one layer above the page containers and the sticky header, and leave the fixed status and save bars their room. A menu flips upward when there is no room below, scrolls when tall, follows its trigger, is keyboard reachable, and closes when the trigger scrolls away or focus moves elsewhere. Popovers inside dialogs and under the software keyboard keep their inline placement.
+- Genre and industry tags use the neutral chip, since seven theme hues cannot tell 48 tags apart. Only the universal tag keeps its accent.
+- Badge text uses per-hue on-tint tokens. A guard test checks each token against the card and the page, inside a 10 percent panel of the same hue, and under a 30 percent hover fill. All 20 bundled themes clear 4.5:1 in both modes. Neutral chips now take the secondary text color. The muted foreground color they used before missed 4.5:1 in 34 of the 40 theme and mode pairs, down to 2.58:1 on Slate dark.
+- A pass-2 finding contained inside a span the segment-action map keeps is dropped with a log line instead of filed for review. The keep is a decision the operator already made, so re-detecting it every run is not a contradiction. One feed carried 32 such holds across 33 episodes. At least 90 percent of a finding has to sit inside the kept spans it overlaps, counted as one union, to be dropped. Anything less is held under `verification_kept_conflict`, since a 90 s sponsor read that touches a 20 s kept intro by one second was never ruled on.
+- Ads parsed from a detection window carry their stage (`claude`, or `verification` in pass 2) before the window-dedup merge records them as members. An unstamped member reads as measured evidence at the reviewer's protection check, so any trim beyond 0.1 s held the merged ad. On one feed 51 of 92 members had no stage, and 31 of 33 episodes held a merged ad the reviewer only meant to trim. Markers persisted before this change keep the old union rule.
+- A reviewer reject no longer drops an ad outright. When the span carries measured evidence (fingerprint, cue, text pattern) or a sponsor the validator confirmed, it is held for review under the new `reviewer_reject_conflict` reason. One reject discarded a 191 s sponsor-confirmed block that pass 2 then re-found at 0.99 confidence, at the cost of a second transcription and a recut. Another run rejected 8 of 9 ads in a single pass.
+- A detection window proposal that runs past either edge of its window is clamped instead of being discarded. The clamp targets what the model was shown: the window bounds the prompt prints, widened by any straddling transcript segment and by the two-minute placement tolerance. An ad that straddles a window edge keeps its full span, and the cross-window merge re-unions it. A proposal starting beyond that tolerance is still dropped as out of window. The seven-minute ceiling is judged on the raw span, so an over-long guess is refused rather than trimmed until it fits. One verification window returned the whole episode (0.0 s to 1789.1 s).
+- Review calls send no reasoning effort unless one is set. `reviewerReasoningLevel` caps it. One 188-character verdict had cost about 2k reasoning tokens. A default effort, though, costs a rejected request and a retry per reviewed ad on a model that takes no reasoning parameter. Which key a stage reads (Anthropic's token budget or an effort level) now follows that stage's resolved route, not the global provider.
+- The detection summary line reports the differential stage alongside the fingerprint, text, and LLM counts. Differential matches were tracked but never printed.
+- A feed whose body never parses is no longer re-downloaded every cycle. Each unparseable body is counted on the feed, and the full fetches are held for a window that doubles from 30 minutes to a 6 hour ceiling. The conditional GET still runs, so a 304 stays free and a changed body is read at once. A feed that sends no ETag or Last-Modified stops re-downloading the same body, and a manual force refresh still fetches. The count waits for the batch verdict during a full sweep, so a shared outage does not put every feed into backoff. Only a body that parses clears the counter, and a refresh during the window says how long is left. One feed serving a 4 MB body that ended mid-token had been refetched 101 times in 10 hours.
+- A host that claims gzip but sends an undecodable stream is asked for identity encoding on the next fetch, for an hour. The plain retry already recovered the body, but every cycle still paid for the failed transfer first.
+- A detection or verification window given up on now records which status class lost it. The classes are provider 5xx, rate limit, unreachable endpoint, a budget spent on reasoning, and an answer cut off at max tokens. The log line and the episode page's coverage note name it too. A cut-off with no reasoning behind it is not retried, since the same budget truncates the same way. 5xx responses still retry with exponential backoff, not a rate limit's Retry-After.
+- A detection or verification window whose output budget was spent on reasoning is a failed window, not a clean one. A cut-off completion carrying only `{}` or `{"ads": null}` had been read as "no ads", so the span counted as examined. It buys one retry, with reasoning turned off, wherever in the retry ladder it happens, and is then given up on and counted against coverage. The retry is immediate, since asking again without reasoning is a different request rather than a transient failure. An explicit `{"ads": []}` is still an answer, and so is a blank reply to a category-repair or chapters call.
+- SQLite's busy timeout is raised from 30 s to 60 s. Ordinary feed-refresh writes were observed holding the lock for 28.4 s, which left a waiter almost no margin.
+- A Whisper API response that omits word timestamps after they were requested logs one warning naming the endpoint and model. A server that rejects the granularity outright was already reported. One that answers 200 without words had silently disabled boundary refinement.
+- A retryable failure to fetch the enclosure no longer records a processing run. A freshly published episode 404s while its host provisions the media URL, and each attempt left a failed history row that inflated the eventual run's reprocess number. The episode still carries the error and the retry count, and a terminal failure is still recorded.
+- The original audio is scanned for template cues once per run. Audio analysis and the cross-fetch differential each ran their own pass over the same file. The differential now takes the analyzer's result and scans only if that produced nothing usable.
+- When a cue template peaks just under its threshold on three consecutive episodes and matches nothing, the run logs the threshold that would have matched all three. The Cue Template Quiet alert carries it. The near-miss scores were recorded but nothing read them back, so a mis-tuned template stayed silent.
+- A confirmed miss over the duration ceiling is split on more than a transition phrase. Dividers also come from the member spans a merge recorded, a brand handoff in the transcript, and the gaps between measured DAI regions. The split editor offers the same set. Back-to-back reads with no handoff phrase produced no divider at all, so a 191 s two-brand span was dropped whole and nothing was learned.
+- Pattern learning refuses a span that reads a second registry brand, not only one that runs past the ceiling. The screen keyed on duration, so a 102 s span holding a self-promo and two advertisers was stored as one brand's template. A single passing name-drop still learns. Two mentions of another brand, or merge members carrying different sponsors, do not.
+- A sponsor taken from an episode description has to look like a brand before it can confirm an ad. Hosting platforms, listening apps, and social links are dropped, and a token under four characters is ignored unless it is a known short brand. Confirmation then matches on word boundaries: a three-letter outlet token had confirmed any span whose letters happened to contain it, which lifted the duration ceiling. A two-word brand listed in a description now also confirms when the transcript spells it with a space.
+- URL and "dot com" tokens harvested from a transcript go through the same brand gate before they can extend an ad's end. They were filtered on length alone, so a generic web word such as "info" counted as an advertiser and pushed a boundary out by 10 s. A brand that ends in one ("zoominfo") is still a candidate and only matters where the transcript reads it.
+- The sponsor-label gate rejects role and structural words ("Produced", "Material", "Final", "Non-English", "Post-signoff") and possessives of them ("Show's"). It also rejects possessive phrases with no brand in them ("our sponsor"), podcast hosting platforms, and the show's own title. A platform is recognized behind a lead-in or a trailing generic word too ("Hosted on Acast", "Anchor FM", "Acast.com"). A host lead-in ("their friends and sponsors at Acme") and a credit lead-in ("Sponsored by Acme") are stripped, so the brand behind them survives. Each of these reached pattern creation and cost a text pattern.
+- A reviewer reject held over measured evidence survives a boundary snap between the review call and the merge. The merge matched a verdict to its marker by exact timestamp, so a sub-second shift dropped the hold and the ad was neither cut nor queued for review. Where two markers sit inside one tolerance window, each verdict takes the closest one no other verdict has claimed. A verdict that names a marker's exact bounds claims it before any tolerance match, so verdict order cannot hand that marker to another verdict.
+- A sponsor label keeps only the brand when the model prefixes it with a credit phrase, in the marker, in the learned pattern, and in the sponsor registry. "Sponsored by Acme" had been stored as "by Acme" on the marker. Pattern learning had kept the whole phrase, which matched nothing in the transcript, so the pattern was thrown away.
+- Pattern learning counts another brand's mentions on word boundaries, so "cramped" no longer counts as a Ramp read and refuses a clean single-sponsor span as contaminated. The boundary test also matches a brand that ends in punctuation, such as the "Liquid I.V." alias.
+- A registry row named after a podcast hosting platform still compiles into the brand matcher. The hosting screen belongs on new labels, not on rows already stored.
+- A sponsor the detection model named only in its own reason no longer counts as confirmed evidence against that same model's reviewer. It still lifts the duration ceiling, as before.
+- A feed held in parse backoff is no longer counted as a failed refresh, and the shared-outage check is judged over the feeds actually attempted. The sweep's completion timestamp froze and, on a small instance, the skipped feeds both diluted a real outage and read as one themselves.
+- A cross-fetch differential refuses a non-callable cue hook outright instead of swallowing the error and silently discarding every cue anchor.
+- The dashboard view toggle is back to label-width segments on a narrow phone. The shared component had applied the popover row's stretched sizing to it.
+- A run's window failure classes are documented in the API schema and typed in the frontend client. The field was already being sent.
+- Registry confirmation of a long ad needs one brand named twice, not two brands named once each. A span of several minutes that mentions two known companies in passing had been treated as a confirmed sponsor read, which lifted the duration ceiling.
+- A rejected settings save no longer leaves earlier fields written. `PUT /settings/ad-detection` now applies every accepted change inside one transaction and rolls the whole payload back when any field is refused. A request carrying `reviewMaxBoundaryShift` 42 together with `providerRequestsPerMin` -1 answered 400 and still moved the boundary shift from 60 s to 42 s. A provider key in the same payload was stored the same way. A storage failure partway through the save now leaves the stored configuration untouched and answers 500.
+- The side effects of a settings save run after its commit, in a fixed order: cache invalidation, then rate-limit hold clearing, then reviewer calibration. Endpoint re-probing, the provider model-catalog prune, feed re-renders, conditional-GET etag clears, and Whisper pool refreshes no longer act on values a later field could still roll back.
+- Reviewer calibration runs once per committed configuration, against the review route resolved from the saved settings. A save that changed the reviewer model and a provider endpoint together could start the self-test against the old endpoint, and a save changing both the reviewer and the detection model could start two runs for one configuration. A calibration whose configuration changes while it runs is discarded and re-run for the current one, and the stored result records which configuration it describes.
+- Whisper API base URL validation runs before the settings transaction opens. The check resolves DNS, so leaving it in the write path held the database write lock for the length of the lookup.
+- Saving retention, email notification, or scheduled backup settings is all-or-nothing. Each endpoint validates the whole body before it writes anything, then applies the set in one transaction. A late invalid field returns 400 and a failed write returns 500, with none of the earlier fields persisted. Retention had written `retentionDays` before it checked `originalRetentionDays`, and a failed write left the SMTP password saved without the settings sent with it. A boolean `retentionDays` is rejected instead of stored as `True`.
+- One mobile hit-target rule, applied to the interactive element rather than the gap around it. The header Search, Theme, Log out and Menu buttons and the dashboard empty-state Add button are 44 px boxes on phones, matching the toolbar controls. They drop to their natural icon size from the `sm` breakpoint up. The rule is in the design guide and shared as `touchTarget` in `buttonStyles.ts`.
+- Eleven fixes ported from an external audit of this branch. The reviewer route snapshot inherits the detection pass's account slot and endpoint, so an all-secondary job is not held on an unused primary account. A feed that skips its second pass no longer keeps a verification route in queue admission. The usage ledger keeps successful calls with no token counts visible as unknown cost instead of dropping them, and counts a provider-reported charge on a failed call. The reasoning retry checks the manual request cap before dispatching again. Provider settings validate the key type and endpoint URL before either field is written. Collapsed settings sections are inert, so keyboard focus cannot land on hidden fields. Mobile model-usage cards get the desktop sort controls. Addressing counters and summary cards stay aligned when a label wraps, and the token card labels its input and output breakdown instead of calling them Min and Max. The connection-probe tests clear inherited provider keys. Several docs claims were corrected to match the code.
+- CodeQL alerts on the branch are resolved: a carved-fragment helper and marker field were renamed because CodeQL's secret heuristic matched on "trusted" and tainted every ad dict logged after it; the sponsor lead-in regexes are anchored so whitespace cannot backtrack polynomially; HTML comment stripping in prompts matches multi-line comments while leaving four-space-indented ones alone; a test asserts the logged Whisper endpoint by parsed hostname.
+- Ad markers that begin inside a configurable opening window are ignored. `adDetectionExcludeStartSeconds` (0 to 600 s) applies globally; each feed can inherit it, disable it with 0, or set its own 1 to 600 s window. The exclusion covers the first pass, cue pairs and the verification pass (#753).
+- Changing a provider slot's type or endpoint no longer lets an in-flight or
+- A run stranded by a provider account change is requeued with the hold reason
+- Manual request caps are now reservations rather than a check followed by a
+- Manual request caps now count every outbound request. A provider adapter's
+- The tokens-per-minute cap now reserves an estimate (prompt tokens plus
+- `GET /api/v1/settings/providers/{slot}/affected-runs` lists the active runs
+- Saving or clearing a provider now reports `accountChanged` and `affectedRuns`
+- Every queued entry in `GET /api/v1/episodes/processing` carries an
+- Removed two unused token-accumulator helpers from the LLM client
+
+### Changed
+
+- The AI Models header button and the reviewer's "Refresh models" link share one component and one hook, so both run the same request, pending state, and failure message. Each button keeps its own error, so a failed stage refresh no longer clears the reviewer's.
+- One SegmentedToggle component renders every segmented button group: the segment actions, the inherit/on/off toggles, the dashboard Podcasts/Episodes switch, and the View menu's layout and sort rows. Settings rows keep the radio pattern with its roving tabindex and arrow keys. Toolbar rows stay plain buttons but are now a labelled group whose selected segment carries aria-pressed, so a screen reader is not left with color alone.
+- The reviewer calibration self-test runs as soon as the phase that saves the review model succeeds. The phases commit as they go, so a request rejected by a later field still leaves the new model saved. Waiting until the end of the save left that model in use with no self-test behind it. A request rejected before that phase starts nothing.
+- One `client_for_route` helper in `llm_route` resolves the LLM client for the reviewer, the chapters generator, and the detector passes. An override wins, then the run's routed provider, then the caller's fallback.
+- Numeric columns in the Stats spend tables align their headers the way their cells already were: Calls, Known Cost and Coverage in provider and model usage, and Runs, Latest Run and Cumulative in episode costs. Amounts and counts across the Stats tables and cards use tabular figures so digits line up between rows.
+- The Totals row uses three columns at desktop widths and six once there is room for them, so Total Tokens is no longer orphaned on its own row at 1024 px.
+- Dashboard feed ordering by title now follows the name the UI renders, so a feed with a custom title sorts where it appears. The feed-detail prev/next navigation walks the same sequence.
+- The design guide documents Popover with usePopoverTabs, SegmentedToggle and badgeStyles, using the class strings the components ship. Each entry covers placement and layering, Escape and outside dismissal with the reason each close reports, focus movement between trigger and panel, selected and disabled states, and mobile placement. The guide also names the two summary-card variants, Counter and Metric, with their shared spacing and typography, and states the numeric-alignment rule for tables.
+- The design guide's badge ownership rule is corrected: `badgeStyles.ts` owns the shape and the reusable tints, `episodeStatus.ts` owns which status maps to which hue. Its sample palette is marked as a copy of the app's theme definitions, which stay the source.
+- The version label moves below the dependency and application layers in both Dockerfiles, so a release that changes only the version reuses the multi-gigabyte PyTorch layer instead of rebuilding it (#752).
+
 ### Added
 
+- The dashboard reads one page of feeds at a time instead of the whole subscription list. `GET /feeds` takes `sortBy` (`recent` or `title`) and `sortDir`, orders the whole list before slicing, and breaks every tie on slug so paging cannot duplicate or skip a feed. Each view fetches only its own projection: the Podcasts grid no longer pays for the episode projection, and the Episodes view no longer fetches a second bare feed list. Page controls match the episode pagination. Screens that need every feed, such as the podcast pickers on Stats, History and Patterns, keep their own unpaginated request.
+- Stats keeps its spend filters, both tables' sort columns and directions, and both page numbers in the page URL, so reloading restores the view and the address bar is a shareable link to a specific cost question. Only filter values, sort keys and page numbers are written, and a value left at its default is omitted.
+- A row of section links under the Stats heading jumps straight to Overview, Charts, Reviewer, Addressing, Audio cues, Spend or Podcasts, so the ledger is one tap away on a phone rather than a long scroll. Only sections on the page are listed.
+- `GET /stats/spend/attempts` lists the ledger rows behind a spend total, scoped by `runId` or by `slug` plus `episodeId`, with each attempt's phase, provider and account slot, model, outcome, tokens, cost or null, and timestamps. It applies the same billable predicate the totals are summed with, so the listed rows are exactly the contributing ones, and caps at 200 rows with a `truncated` flag.
+- The Incomplete chip on an episode's cumulative spend is now a disclosure button that opens those contributing calls in a panel, so an unpriced call can be named instead of leaving an unexplained gap in a total.
+- A failed run's reason is readable without a pointer. In the Processing stats table the word "failed" is a focusable disclosure that expands the error text inline with a Copy error action.
+- Queued rows in the Processing Queue panel explain why the scheduler will not admit them yet, naming the blocked phase, the account slot, the reason and when the block lifts. Rows render unchanged on builds that do not report it.
+- Changing a provider slot's endpoint or provider type lists the runs still bound to the current account before the save, and asks whether to requeue them on the new account (the default) or cancel them. The choice is sent with the save as `affectedRunsAction`, and only when the preflight answered, so a build without that endpoint is never handed a field it cannot act on.
+
+## [2.97.3] - 2026-09-15
+
+### Added
+
+- Rate-limit holds reset when a stage model changes, since a new model can carry different limits. A "Reset holds now" control (API and UI) clears active holds without turning the feature off.
+- `POST /settings/models/refresh` accepts an optional `slot` so the secondary provider's catalog can be refreshed; the reviewer's "Refresh models" button uses it.
+
+### Fixed
+
+- The ad reviewer no longer holds a merged ad over any inward trim (regression since 2.96.24, issue #750). Each merge records its member spans. The reviewer may trim a coarse LLM span as long as every member keeps some overlap, and holds only when a trim would drop a detected member or cut into measured evidence (fingerprint, cue pair, text-pattern match). The old 0.1 s edge tolerance turned a 7 s trim on a four-minute break into a hold of the whole break.
+- The confirm endpoint no longer widens its trim envelope with an unvalidated reviewer proposal, and rejects a confirmed span longer than the confirmed-sponsor cap.
+- The sponsor registry no longer learns common English words ("all", "out", "show"), bare pronouns ("you", "we"), contractions ("Let's", "You're"), possessives of common words, or audio-signal labels a weak verification model echoes ("volume_decrease", "splice evidence: digital silence") as brand names. A one-word entry matched ordinary speech, and two matches in a span granted the confirmed-sponsor duration ceiling, so an over-long false positive could be cut without the length check. Existing junk entries are ignored at match time, and a possessive of a known brand resolves to that brand's row.
+- The sponsor-name parser drops a hyphenated descriptor prefix such as "Host-read", so a brand is no longer stored twice.
+- The per-window retry fallback honors the provider's Retry-After once, up to the 300 s queue-hold threshold, and the wait ends early on shutdown. It used a fixed 2 s then 5 s backoff, so a rate-limited review call failed both attempts and the ad was cut with unreviewed boundaries.
+- The system status endpoint reports the transcription backend, model, and host from settings, not environment defaults that showed a local GPU model while a remote API was configured.
+- The rate-limit hold view shows provider-scoped holds, so the reset control is reachable when one is active.
+- A credential or base-URL change clears that provider's scoped hold, and saving the secondary provider no longer wipes the primary's hold.
+- A blanket (unscoped) hold pauses secondary-routed runs as well as primary ones.
+- The hold probe uses the held account's own client and a model routed to it, covers review-only routes, and probes each held pair on its own cadence.
+- A single settings request that enables the secondary slot and routes a stage to it keeps that stage's model instead of pruning it.
+- Pass-through, cue-only, and skip-detection runs, including the per-episode pass-through override, are no longer refused by a provider hold. The dispatcher skips blocked episodes individually instead of bouncing a claim, and the retry-detection endpoint honors the per-episode override.
+- A 429 without a provider key inside a run records a hold scoped to that phase's route.
+- Deleting a podcast waits briefly for an in-flight run to acknowledge cancellation, a failed cancellation record returns 503 again, and a cancelled run no longer recreates the deleted feed's directory.
+- The search index rebuild backs off after a failure and does not start while a run is active. It was retried on every cleanup pass under lock contention, rebuilding the full index each time.
+- The shared-outage refresh retry backs off per attempt instead of re-arming on every pass, and the health panel's next-retry time is the attempt the loop actually makes.
+- The Stats episode-cost page aggregates the usage ledger once per request instead of five times.
+- The artwork failure cache prunes expired entries on write and is capped.
+- The pre-ledger usage-cost path was removed. An unpriced model no longer logs a warning; the Stats unknown-cost column is the signal.
+- The dashboard toolbar on narrow phones spreads the view toggle and action buttons to the card width.
+- Episode marker rows share one play-button and jump-button height across every section.
+- On the episode page, the processing-runs table scrolls sideways so the token and cost columns are reachable, "Not an ad" is disabled during a run like its siblings, the Reprocess menu shows its in-flight label and says why it is disabled, and a recut blocked after a correction is reported instead of dropped.
+- A correction saved while the episode page refreshes no longer shows a false "Failed to save" error.
+- In Settings, the reset-holds control and the reviewer's model refresh report failures, and the verification, chapters, and reviewer model lists show loading and error states instead of an empty select.
+- An enabled secondary provider with no type is shown as such instead of masked as Anthropic, and the settings form saves in one request, so a failed save leaves nothing half-applied.
+- Rate-limit fields are grouped per provider for screen readers.
+- On the dashboard, the phone controls popover closes on scroll and resize, row actions and bulk toolbar buttons meet the 44 px touch target, and the podcast title is no longer squeezed by the "View all episodes" link on a 360 px phone.
+- Filter, sort, and page changes keep the current content on screen while the next page loads.
+- Stats tables load with row skeletons, the date inputs have visible labels, both tables share one keyboard-accessible sort header, and "ledger" wording reads "spend".
+- The system health panel uses the shared badge and panel recipes, and accessible names match visible button labels.
+
+## [2.97.2] - 2026-09-14
+
+### Fixed
+
+- The dashboard toolbar no longer clips the Add button on narrow phones. The View and Refresh controls drop their dropdown chevron below the small breakpoint so the row fits. On very narrow screens the row scrolls within itself, not the page.
+
+## [2.97.1] - 2026-09-14
+
+### Added
+
+- Dashboard episode groups collapse per podcast, and the choice persists per feed.
+- The Ad Reviewer settings gained a Refresh models control for the review slot's catalog.
 - Remove HTML-style comments from LLM prompts before sending.
 - Scrub podcast and episode descriptions of HTML, timestamps, URLs, and excessive whitespace and length before injecting into LLM prompts.
+
+### Changed
+
+- The dashboard toolbar stays a single row on a phone. Layout, sort, and episodes-per-podcast moved into a View menu, leaving the Podcasts/Episodes toggle, Refresh, and Add always visible.
+- Processing run phase breakdowns stack into cards on narrow screens instead of scrolling sideways, both on the episode page and in the Stats run-cost expansion.
+- The bulk Delete button moved to the end of the feed toolbar, and the episode list supports shift-click range selection.
+- Saving a secondary provider API key inline now stores that slot's provider type and base URL with the key and refreshes its model list, so the connection test targets the right endpoint.
+- Appended chapter lists are separated from the episode description by one blank line.
+
+### Fixed
+
+- Reviewer calibration now routes through the resolved review slot's provider, endpoint, and model, not the primary client. A review model on a secondary or OpenRouter slot no longer 404s and trips that endpoint's breaker.
+- The OpenAI-compatible model catalog fetch (OpenRouter, openai-compatible, Ollama) retries transient upstream failures like an OpenRouter 408, and serves the last good catalog on a transient failure, so valid model ids no longer show as not in catalog.
+
+## [2.97.0] - 2026-09-14
+
+### Added
+
+- Ad detection, verification, chapters, and the reviewer can each route to an independent secondary LLM provider with its own type, endpoint, and API key. Each stage picks a routing slot (Primary or Secondary, plus Same as pass for the reviewer) rather than a raw provider type, and model discovery follows the selected slot. The slots are independent routes, not a failover chain: a failed call retries on the same slot and never spills to the other provider. Secondary is off by default.
+- Rate-limit holds, cached clients, and circuit breakers are scoped per credential slot instead of per provider type, so two accounts on the same provider no longer share a pause, a connection, or an open breaker. Rotating or clearing a key takes effect without a restart, including in sibling workers.
+- An append-only LLM usage ledger now records every call. Run totals and provider budget reconciliation derive from it instead of an in-process counter, which closes a race that could drop a late pool worker's tokens from the recorded run. Each run's routing is snapshotted at start, so a mid-run provider or endpoint change cannot re-route work already underway.
+- Processing runs report a phase-by-phase cost breakdown (provider, model, tokens, cost), and the episode detail response carries `activeRunSpend`, `latestRunSpend`, `cumulativeSpend`, and `hasBeenProcessed`. A run with no ledger rows reports `breakdownAvailable: false` rather than a misleading zero.
+- New Stats page LLM cost ledger: paginated, sortable provider/model usage and per-episode cost lists, filtered by date range, podcast, provider, and model, and labelled lifetime or interval depending on whether a date filter is set. `GET /stats/ledger-filter-options` supplies the complete, unpaginated provider and model choices so a value past the first page stays selectable.
+- Grouped Episodes view on the dashboard: one section per podcast with its newest episodes and total episode count, filled by a single paginated request rather than one per feed. `GET /feeds` now accepts page/limit and an opt-in `includeLatestEpisodes` projection (`episodesPerFeed`, default 3).
+- Each Stats episode-cost row expands to a per-run, per-phase breakdown (provider, model, tokens, cost) reusing the episode page's run table, with the episode's most-expensive model shown first in the collapsed row.
+- Settings > System Status gains a collapsible System health panel that rolls transcriber, Podping node, and feed-refresh state into a single green, amber, or red summary above the version line.
+- Episodes can be flagged for pass-through individually, overriding the feed's processing mode for that episode, from the episode detail Reprocess menu or as a bulk action on the feed page. `POST /feeds/{slug}/episodes/passthrough` reports per-episode `accepted` and `rejected` outcomes alongside the counts.
+- Manual per-provider rate limits: optional requests-per-minute, requests-per-day, and tokens-per-minute caps per provider account, counted from the usage ledger and enforced through the existing queue-hold machinery at admission and as a pre-call backstop. A cap crossed mid-run defers the episode with its reset time instead of failing it, and a manual hold clears only when its reset passes. Off by default. The detection window size cap rose to 10800 seconds so a low-request-rate account can fit a transcript into fewer calls (#747).
+- Podping tracks each Hive RPC node's health across restarts (failure streak, last success, next retry, last failure reason) with exponential jittered backoff, and surfaces a non-fatal all-nodes-down signal on `/system/status` and `GET /podping/hosts`. RSS polling remains the fallback, so readiness is unaffected.
+- The 15-minute feed refresh recognizes a shared network outage and skips per-feed failure counting instead of marking healthy feeds broken, scheduling one jittered early retry; `/system/status` exposes the aggregate without naming any feed.
+- Local Whisper transcription records its final batch size, retry count, device, and outcome after a GPU-memory downshift, and a bounded admission guard stops concurrent local transcriptions double-allocating GPU memory. `/system/status` reports the health of the configured transcription backend, so a remote-API install no longer reads a meaningless local value.
+- Feed artwork refresh tries itunes:image and the RSS `<image>` URL in order and keeps the cached cover when both fail, skipping a candidate that starts failing once another resolves. A confirmed-missing cover backs off longer than a transient error, and the backoff survives a restart.
+- Reprocess and bulk episode-action responses carry the authoritative `jobState`, including on a duplicate submission's 409, and episode controls derive their enabled state from it. The status badge reads "queued" rather than "pending" once a job is waiting, and action buttons share a fixed minimum width so they line up.
+
+### Fixed
+
+- An LLM attempt finalized twice (recovery or retry) no longer double-counts its tokens and cost; the repeat is a no-op that returns the already-recorded figure. An endpoint alias that resolves to a differently-named priced model now prices correctly instead of recording unknown cost.
+- Resuming new work takes effect on the next dispatcher pass instead of after a stale backoff. While paused the dispatcher now idle-waits rather than claiming and bouncing each queued entry, which had ramped the retry backoff to its 5-minute ceiling and left resumed work sitting for minutes.
+- The per-run token and cost figures in the episode processing-runs table are derived from the usage ledger, so they match the run-spend header and phase breakdown instead of a separate history counter that could disagree.
+- A latest-run cost is flagged incomplete only when that run itself has an unpriced call, not when an earlier run of the same episode did.
+- Provider budget reconciliation stays conservative when part of a run's cost is unknown, settling at the reservation rather than releasing budget as if the run spent less than it did.
+- Provider budget reconciliation no longer counts a finalized call with no tokens and no cost as unknown spend. A run whose ledger is complete settles instead of holding its full reservation.
+- Enabling pass-through on an episode a run already owns is rejected per item with a reason instead of silently not taking effect, and the endpoint validates its body: a non-object body, a missing or empty `episodeIds`, or a non-string id is a 400.
+- The Stats `from` and `to` filters select whole UTC days inclusive of both ends, so the final second of the chosen day is no longer dropped; an unparseable date is a 400 naming the offending parameter.
+- LLM base URLs that embed `user:pass@host` credentials are rejected on save and on a connection test, since the URL is copied into the non-secret run route snapshot and returned by `GET /settings`. The remote Whisper endpoint is covered on save too, and stays exempt from the other LLM endpoint rules.
+- The secondary provider connection test no longer sends the saved API key when the request overrides the provider type, so an unsaved dropdown change cannot ship a key to a vendor that was never designated.
+- Deleting a podcast cancels any processing episode and completes in one request instead of returning 202 and waiting for the client to retry. The delete cascades to the run row, so a worker that never checks in no longer leaves the podcast stuck, and the confirmation says when a job is active (#745).
+- Confirm trimmed accepts a boundary the ad reviewer already proposed, even past the originally detected span, closing a case where a reviewer-boundary-conflict hold could not be confirmed. A failed correction now marks only the action that was clicked.
+- Dashboard toolbar controls share a 44px outer height instead of mixing 32px icon buttons with 40px text buttons.
+- Documentation corrections: pass-through is no transcription or ad removal rather than byte-identical audio, since a non-MP3 enclosure is transcoded for serving; the Whisper pool diagram's four episodes are an example, with concurrency configurable from 1 to 16 and pool activation limited to the remote API backend.
 
 ## [2.96.25] - 2026-09-12
 
