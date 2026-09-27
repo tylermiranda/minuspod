@@ -33,6 +33,7 @@ from utils.time import parse_iso_utc, utc_now
 # ad_detector -> utils.llm_call without pulling in jinja2/flask transitively.
 from utils.llm_response import json_object_is_blank
 from utils.retry import calculate_backoff
+from utils.circuit_breaker import CircuitBreakerOpen
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +43,12 @@ logger = logging.getLogger(__name__)
 FALLBACK_RETRY_AFTER_CAP_SECONDS = float(MIN_HOLD_RESET_SECONDS)
 # Slice that wait so a container stop is not sat out.
 RETRY_SLEEP_SLICE_SECONDS = 5.0
+# Headroom past the breaker's reported cooldown so jitter never lands a
+# retry back inside the cooldown window.
+BREAKER_RETRY_MARGIN_SECONDS = 1.0
+# Longest a per-window retry will wait out a breaker cooldown; past this the
+# outage is treated as ongoing and the window is given up on as before.
+BREAKER_WAIT_CAP_SECONDS = 90.0
 
 
 def json_schema_format(name: str, schema: dict, description: str | None = None) -> dict:
@@ -298,6 +305,8 @@ def _is_retryable(error) -> bool:
     # A truncated answer is terminal: the same budget truncates again.
     if isinstance(error, OutputTruncatedError):
         return False
+    if isinstance(error, CircuitBreakerOpen):
+        return True
     return isinstance(error, EmptyCompletionError) or is_retryable_error(error)
 
 
@@ -383,6 +392,32 @@ def _fallback_delay(error, base_delay: float, honor_retry_after: bool) -> float:
         if retry_after is not None:
             return retry_after + random.uniform(0.0, 2.0)
     return base_delay
+
+
+def _wait_past_breaker_cooldown(remaining_seconds: float) -> bool:
+    """Sleep past a breaker cooldown plus margin; False without sleeping when
+    that wait exceeds BREAKER_WAIT_CAP_SECONDS."""
+    wait = remaining_seconds + BREAKER_RETRY_MARGIN_SECONDS
+    if wait > BREAKER_WAIT_CAP_SECONDS:
+        logger.warning(
+            f"Breaker cooldown wait {wait:.1f}s exceeds the "
+            f"{BREAKER_WAIT_CAP_SECONDS:.0f}s cap; giving up"
+        )
+        return False
+    return _sleep_before_retry(wait)
+
+
+def _breaker_retry_delay(llm_client, error, base_delay: float) -> float:
+    """Wait past the active breaker cooldown without shortening backoff."""
+    remaining = (error.seconds_until_retry
+                 if isinstance(error, CircuitBreakerOpen) else None)
+    if remaining is None:
+        retry_after = getattr(llm_client, 'circuit_retry_after', None)
+        remaining = retry_after() if callable(retry_after) else None
+    if remaining is None:
+        return base_delay
+    return (max(base_delay, float(remaining) + BREAKER_RETRY_MARGIN_SECONDS)
+            + random.uniform(0.0, 0.25))
 
 
 def _fire_limit_exceeded_webhook(error, model, provider=None):
@@ -650,29 +685,48 @@ def call_llm(
                     )
                 else:
                     delay = calculate_backoff(attempt)
+                    delay = _breaker_retry_delay(llm_client, e, delay)
                     logger.warning(
                         f"[{slug}:{episode_id}] {call_label} API error: {e}. "
                         f"Retrying in {delay:.1f}s"
                     )
-                time.sleep(delay)
+                if not _sleep_before_retry(delay):
+                    break
                 continue
             logger.warning(f"[{slug}:{episode_id}] {call_label} failed: {e}")
             break
 
     if (response is None and last_error is not None and _is_retryable(last_error)
             and not isinstance(last_error, ReasoningExhaustedError)):
-        for retry_num, base_delay in enumerate([2, 5], 1):
+        # A CircuitBreakerOpen on the last fixed rung earns one more rung once
+        # its cooldown clears, appended here rather than pre-planned: no other
+        # error qualifies for it.
+        rungs = [2, 5]
+        retry_num = 0
+        while retry_num < len(rungs):
+            retry_num += 1
             held = _manual_rate_limit_error(provider_key, credential_slot, slug,
                                             episode_id, phase=phase_key)
             if held is not None:
                 return None, _lost_window(held, is_window, slug, episode_id, call_label)
-            delay = _fallback_delay(last_error, base_delay, retry_num == 1)
-            logger.warning(
-                f"[{slug}:{episode_id}] {call_label} per-window retry "
-                f"{retry_num}/2 after {delay:.1f}s backoff"
-            )
-            if not _sleep_before_retry(delay):
-                break
+            rung = rungs[retry_num - 1]
+            if rung == 'breaker':
+                if not _wait_past_breaker_cooldown(last_error.seconds_until_retry):
+                    break
+                wait = last_error.seconds_until_retry + BREAKER_RETRY_MARGIN_SECONDS
+                logger.warning(
+                    f"[{slug}:{episode_id}] {call_label} per-window retry "
+                    f"{retry_num}/{len(rungs)} after breaker cooldown ({wait:.1f}s)"
+                )
+            else:
+                delay = _fallback_delay(last_error, rung, retry_num == 1)
+                delay = _breaker_retry_delay(llm_client, last_error, delay)
+                logger.warning(
+                    f"[{slug}:{episode_id}] {call_label} per-window retry "
+                    f"{retry_num}/{len(rungs)} after {delay:.1f}s backoff"
+                )
+                if not _sleep_before_retry(delay):
+                    break
             try:
                 response = dispatch()
                 logger.info(
@@ -693,9 +747,14 @@ def call_llm(
                 if terminal is not None:
                     last_error = terminal
                     break
+                if not _is_retryable(e):
+                    break
                 logger.warning(
                     f"[{slug}:{episode_id}] {call_label} retry {retry_num} failed: {e}"
                 )
+                if (retry_num == len(rungs) and rungs[-1] != 'breaker'
+                        and isinstance(last_error, CircuitBreakerOpen)):
+                    rungs = rungs + ['breaker']
 
     return None, _lost_window(last_error, is_window, slug, episode_id, call_label)
 

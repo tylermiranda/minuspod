@@ -9,10 +9,97 @@ Alongside the standard sections, a "Breaking" section marks changes
 that require operator action; these are surfaced at the top of stable
 release notes.
 
-## [Unreleased]
+## [2.97.15] - 2026-09-22
 
 ### Fixed
 
+- Prompt comment stripping preserves multiline examples embedded in text or indented as code.
+- Bulk processing respects feed title-skip rules while delete and manual single-episode processing remain available.
+- Reviewer calibration saves its result before another worker can start, preventing older results from overwriting newer results.
+
+## [2.97.14] - 2026-09-22
+
+### Changed
+
+- README now documents the MinusPodJev experiment and its limited support scope.
+
+### Fixed
+
+- History duration summaries no longer display impossible values such as `17m 60s` when rounded seconds reach the next minute.
+- Audio editor transport controls remain reachable at narrow viewport widths, and zooming the waveform no longer also scrolls the editor.
+- Configuration exports now remove URL queries, fragments, opaque paths, and webhook templates while preserving only known provider endpoint paths in settings.
+- Configuration exports use the bundled public suffix list when masking instance-domain mentions.
+- Ollama native chat requests preserve configured thinking levels and retain rate-limit response headers for retry timing.
+
+## [2.97.13] - 2026-09-22
+
+### Fixed
+
+- The configuration export also masks email addresses and any mention of this instance's domain outside URLs, and leaves out feed author and Podcasting 2.0 owner fields.
+
+## [2.97.12] - 2026-09-22
+
+### Changed
+
+- The configuration export hides this instance's own host as `<domain>` and any provider or transcription endpoint that is not a well-known public service as `<private-host>`, keeping the scheme and path so a bug report still shows how the instance is wired.
+
+### Fixed
+
+- System Status shows LLM input and output tokens on two lines instead of wrapping mid-phrase on a phone.
+- The cue and ad editor transport controls stay on one row with the speed selector on phones instead of wrapping.
+
+## [2.97.11] - 2026-09-21
+
+### Added
+
+- Settings > Data Management has a Configuration Export card. It downloads the instance settings, feed configuration, and webhooks as JSON with every API key, token, password, and feed key removed, ready to attach to a bug report (#781).
+- Processing run history shows chapter generation as its own timing row. It is included in the assets stage total, and reads "Unavailable" when chapters were not generated.
+
+### Fixed
+
+- Detection and verification windows lost to a provider outage are retried once the circuit breaker recovers. The breaker wait now adds a 1 s margin so a retry cannot land just inside the cooldown, a final retry that only hit an open breaker gets one more attempt, and after a pass any windows lost to server errors or connectivity are swept once more. A run previously finished with part of the episode unexamined when a provider returned 500s for a minute.
+- The Ollama context window setting (`num_ctx`) is now sent. Ollama's OpenAI-compatible endpoint cannot accept it, so when the setting is on the Ollama client uses the native chat API, which honors it (#780).
+- LLM answers shaped `{"ad_segments": [...]}` are now parsed; they previously counted as zero ads (#780).
+- The low ad yield rerun no longer fails to publish its queue entry. The status publisher passes the run id to every status method, and the queue method did not accept it.
+- A feed body that fails to parse is refetched once before the feed enters parse backoff. A host serving a body cut mid-document usually returns a complete one on the next request, so the 30 minute backoff no longer delays new episodes for a one-off glitch.
+- A feed whose episodes are all processed no longer forces a full fetch on every refresh. The unchanged-feed path counted only unprocessed episodes to decide whether the feed had been discovered.
+- The search index rebuild holds the write lock for milliseconds instead of about 10 s during the swap. The old FTS5 table is renamed aside and purged in small batches after the swap instead of being dropped inside the swap transaction.
+
+## [2.97.10] - 2026-09-20
+
+### Fixed
+
+- Podping checks every Hive node when the listener starts and every five minutes while it is enabled. System Health identifies the active node, refreshes while Settings is open, and has a Check now action that also works when the listener is off.
+- Reviewer inconclusive responses no longer count as provider outages, and retries wait for the circuit breaker recovery window.
+
+## [2.97.9] - 2026-09-20
+
+### Fixed
+
+- Podping failover replaces the unavailable `hived.emre.sh` endpoint with `api.deathwing.me` and adds `techcoderx.com` as another fallback.
+- The Queue navigation badge keeps readable contrast when Queue is selected.
+- OPML export actions now sit below their description instead of leaving a large blank gap beside the taller backup card.
+
+## [2.97.8] - 2026-09-20
+
+### Added
+
+- System Health can expand Podping into concise rows with each node's endpoint, latest HTTP status, and last-seen time. The last connected node survives restarts, and the panel notes that RSS polling is independent of Podping health (#762).
+- Settings now provides global defaults for chapter generation, verification, and cross-fetch detection. Feeds inherit them unless explicitly overridden. The automatic migration preserves every existing feed choice, including the legacy automatic cross-fetch mode, while new feeds inherit the globals (#763).
+- A Queue page combines active progress and cancellation, the complete paginated waiting list, episode links, priority controls, and queue tuning. Queue counts use the full server-reported backlog, and the global status popover links to the page (#764).
+- Processing run history now shows total duration and wall-clock timing for each pipeline stage, plus one FFmpeg total. Stage timings may overlap. Detection, transcription, and verification are labeled when skipped instead of appearing as zero (#765).
+
+### Changed
+
+- Fuzzy text-pattern matching now uses RapidFuzz's optimized partial-ratio alignment with the existing length-adjusted score cutoff, avoiding the Python window scan on every candidate (#766).
+
+### Fixed
+
+- Database backup downloads now fail closed when encryption is requested but no master passphrase is configured. A separate plaintext action shows a warning and requires a second click. Audit logs record the file's actual encryption state.
+- Verification now maps nested evidence spans and boundary records back to original-audio timestamps after pass 1 cuts. Review and validation use those original coordinates, while cutting keeps the processed-audio copy.
+- Provider request rejections unrelated to pass settings no longer retry with defaults or consume the episode retry limit. Local CUDA transcription releases a failed Whisper pipeline before retrying with a new instance, and a run that exhausts GPU memory no longer retries the whole episode.
+- Search index rebuilds read source rows on a dedicated SQLite connection, so batched shadow writes do not try to upgrade a stale WAL snapshot. Concurrent commits are replayed from the change journal, and transient write contention is retried without losing indexed data.
+- OPML export actions now keep equal dimensions on narrow screens when one label wraps.
 - On a phone, the LLM spend From and To date inputs no longer overrun the card. They now size to the date they hold and sit together on one line instead of stretching full width, which the native date control could push past the card edge.
 
 ## [2.97.7] - 2026-09-18

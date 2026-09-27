@@ -17,6 +17,7 @@ from api import (
 )
 from config import (
     is_pending_review, normalize_segment_category, resolve_chapters_in_notes,
+    title_matches_skip_patterns,
     resolve_processing_mode, DEFAULT_SEGMENT_ACTION,
     PROCESSING_MODE_PASSTHROUGH, PROCESSING_MODE_SKIP_DETECTION, PROCESSING_MODE_CUE_ONLY,
 )
@@ -291,7 +292,9 @@ def list_episodes(slug):
         item = _episode_base_json(
             ep, slug=owner_slug,
             is_local=(ep.get('source_feed_type') == 'local') if source_slug else is_local,
-            storage=storage)
+            storage=storage,
+            title_skip_patterns=(ep.get('source_title_skip_patterns')
+                                 if source_slug else podcast.get('title_skip_patterns')))
         item['ad_count'] = ep['ads_removed']
         item['episodeNumber'] = ep.get('episode_number')
         item['jobState'] = _job_state(
@@ -362,7 +365,8 @@ def _episode_job_state(db, slug, episode_id, status):
     return _job_state(status, states.get((slug, episode_id)))
 
 
-def _episode_base_json(ep, *, slug=None, is_local=False, storage=None):
+def _episode_base_json(ep, *, slug=None, is_local=False, storage=None,
+                       title_skip_patterns=None):
     """Shared camelCase fields for the episode list and detail serializers.
 
     Status is mapped for frontend compatibility: 'processed' -> 'completed';
@@ -404,6 +408,8 @@ def _episode_base_json(ep, *, slug=None, is_local=False, storage=None):
         'error': ep.get('error_message'),
         'artworkUrl': artwork_url,
         'pendingReviewCount': ep.get('pending_review_count', 0),
+        'titleSkipped': title_matches_skip_patterns(
+            ep.get('title'), title_skip_patterns),
         'passthroughEnabled': bool(ep.get('passthrough_enabled')),
         # Stable Process/Reprocess eligibility: a completed episode that is
         # queued again reverts to 'pending', so status alone flips the label.
@@ -417,6 +423,7 @@ def _run_stats_to_api(stats):
         return None
     stage_hits = stats.get('stage_hits')
     markers = stats.get('markers')
+    timings = stats.get('timings')
     result = {
         'mode': stats.get('mode'),
         'detectionSkipped': stats.get('detection_skipped'),
@@ -441,6 +448,21 @@ def _run_stats_to_api(stats):
         } if markers else None,
         'verificationAdsCut': stats.get('verification_ads_cut'),
         'secondsRemoved': stats.get('seconds_removed'),
+        'timings': {
+            'downloadSeconds': timings.get('download'),
+            'transcriptionSeconds': timings.get('transcription'),
+            'differentialSeconds': timings.get('differential'),
+            'audioAnalysisSeconds': timings.get('audio_analysis'),
+            'detectionSeconds': timings.get('detection'),
+            'refineValidateSeconds': timings.get('refine_validate'),
+            'cutSeconds': timings.get('cut'),
+            'verificationSeconds': timings.get('verification'),
+            'normalizationSeconds': timings.get('normalization'),
+            'assetsSeconds': timings.get('assets'),
+            'chaptersSeconds': timings.get('chapters'),
+            'finalizeSeconds': timings.get('finalize'),
+            'ffmpegSeconds': timings.get('ffmpeg'),
+        } if timings is not None else None,
     }
     transcription = stats.get('transcription')
     if transcription:
@@ -473,15 +495,7 @@ def _run_stats_to_api(stats):
 
 
 def _processing_runs(db, episode, run_totals=None):
-    """Per-run history rows for the episode page's Processing stats section
-    (#519). ``stats`` is the pipeline's per-run JSON blob; null for runs
-    recorded before 2.53.0 and for recuts.
-
-    ``phases`` is the ledger's per-run phase/provider/model breakdown;
-    ``breakdownAvailable`` is false for a run with no ledger rows (legacy,
-    pre-ledger, or outside a bound run context), which keeps only its
-    known processing_history total.
-    """
+    """Serialize run history, retaining totals for runs without ledger rows."""
     podcast_id = episode['podcast_id']
     episode_id = episode['episode_id']
     phase_usage = db.get_episode_phase_usage(podcast_id, episode_id)
@@ -666,7 +680,9 @@ def get_episode(slug, episode_id):
         except (json.JSONDecodeError, TypeError):
             dai_differential = None
 
-    base = _episode_base_json(episode, slug=slug, is_local=is_local, storage=storage)
+    base = _episode_base_json(
+        episode, slug=slug, is_local=is_local, storage=storage,
+        title_skip_patterns=podcast.get('title_skip_patterns'))
     # Separate from description: the local-episode editor round-trips that
     # field, and the block must never be written back (#720).
     base['chapterNotes'] = (format_chapter_block(episode.get('chapters_json'))
@@ -1630,6 +1646,14 @@ def bulk_episode_action(slug):
             episode = episodes_by_id.get(episode_id)
             if not episode:
                 skipped += 1
+                continue
+            if title_matches_skip_patterns(
+                    episode.get('title'), podcast.get('title_skip_patterns')):
+                skipped += 1
+                skipped_episodes.append({
+                    'episodeId': episode_id,
+                    'reason': 'Title matches feed title-skip patterns',
+                })
                 continue
             if episode.get('status') == EpisodeStatus.DISCOVERED.value:
                 eligible_ids.append(episode_id)

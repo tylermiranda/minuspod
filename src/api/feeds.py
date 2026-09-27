@@ -31,6 +31,7 @@ from config import (
     VALID_CHAPTERS_MODES,
     SEGMENT_CATEGORIES, SEGMENT_ACTIONS,
     differential_fetch_effective,
+    resolve_differential_fetch_mode,
     resolve_feed_processing_mode,
     resolve_max_ad_duration_confirmed,
     PROCESSING_MODE_STANDARD,
@@ -868,6 +869,10 @@ def _podcast_base_json(podcast, feed_url) -> dict:
         'p20': _deserialize_p20_channel(podcast.get('p20_channel_json')),
         'detectionMode': podcast.get('detection_mode'),
         'chaptersMode': podcast.get('chapters_mode'),
+        'differentialFetchMode': (
+            podcast.get('differential_fetch_mode')
+            if podcast.get('differential_fetch_mode') in ('auto', 'on', 'off')
+            else 'inherit'),
         'chaptersInNotes': podcast.get('chapters_in_notes'),
         'adChaptersEnabled': podcast.get('ad_chapters_enabled_override'),
         'adChapterCategories': _deserialize_json_map(
@@ -971,6 +976,28 @@ def _podcast_listing_fields(podcast, podping) -> dict:
     }
 
 
+def get_feeds_export_list(db) -> list[dict]:
+    """All feeds with override fields, unpaginated, for GET /system/config-export."""
+    feed_auth_key = get_feed_auth_key(db)
+    podping = _podping_context(db)
+    feeds = []
+    for podcast in db.get_all_podcasts():
+        feed_url = _public_feed_url(podcast['slug'], feed_auth_key)
+        entry = {
+            **_podcast_base_json(podcast, feed_url),
+            **_podcast_listing_fields(podcast, podping),
+            'lastEpisodeDate': podcast.get('last_episode_date'),
+            # Upstream RSS URL the instance polls, explicit for bug reports
+            # about a host serving bad RSS (redact_config strips credentials).
+            'sourceFeedUrl': podcast.get('source_url'),
+        }
+        # author/p20 are identity metadata (Podcasting 2.0 owner/lock), not config.
+        entry.pop('author', None)
+        entry.pop('p20', None)
+        feeds.append(entry)
+    return feeds
+
+
 _FEEDS_DEFAULT_LIMIT = 50
 _FEEDS_MAX_LIMIT = 200
 _LATEST_EPISODES_DEFAULT_PER_FEED = 3
@@ -999,7 +1026,8 @@ def _sort_podcasts(podcasts: list[dict], sort_by: str, sort_dir: str) -> list[di
                   reverse=reverse)
 
 
-def _episode_summary_json(ep, *, slug, is_local, storage, job_states) -> dict:
+def _episode_summary_json(ep, *, slug, is_local, storage, job_states,
+                          title_skip_patterns=None) -> dict:
     """Bounded per-feed episode projection for the /feeds listing.
 
     Reuses the episode-list serializer so the grouped dashboard view matches
@@ -1007,7 +1035,9 @@ def _episode_summary_json(ep, *, slug, is_local, storage, job_states) -> dict:
     second way. Trimmed to the fields the dashboard card renders, plus the
     hold, pass-through and error signals a card must not silently drop.
     """
-    base = _episode_base_json(ep, slug=slug, is_local=is_local, storage=storage)
+    base = _episode_base_json(
+        ep, slug=slug, is_local=is_local, storage=storage,
+        title_skip_patterns=title_skip_patterns)
     description = ep.get('description')
     return {
         'id': base['id'],
@@ -1021,6 +1051,7 @@ def _episode_summary_json(ep, *, slug, is_local, storage, job_states) -> dict:
         'artworkUrl': base['artworkUrl'],
         'error': base['error'],
         'pendingReviewCount': base['pendingReviewCount'],
+        'titleSkipped': base['titleSkipped'],
         'passthroughEnabled': base['passthroughEnabled'],
         'hasBeenProcessed': base['hasBeenProcessed'],
         'description': truncate(description, 200) if description else None,
@@ -1100,7 +1131,8 @@ def list_feeds():
             feed_json['latestEpisodes'] = [
                 _episode_summary_json(
                     ep, slug=podcast['slug'], is_local=is_local_feed(podcast),
-                    storage=storage, job_states=job_states)
+                    storage=storage, job_states=job_states,
+                    title_skip_patterns=podcast.get('title_skip_patterns'))
                 for ep in latest_by_podcast.get(podcast['id'], [])
             ]
         feeds.append(feed_json)
@@ -1671,7 +1703,7 @@ def get_feed(slug):
         # recent episodes (#519). The pipeline evaluates each new episode's
         # own enclosure URL, so this is a prediction, not a guarantee.
         'differentialFetchEffective': differential_fetch_effective(
-            _deserialize_nullable_bool(podcast.get('differential_fetch_enabled')),
+            resolve_differential_fetch_mode(db, podcast['id']),
             dai_platform=podcast.get('dai_platform'),
             dai_likely=dai_likely,
         ),
@@ -1936,6 +1968,22 @@ def update_feed(slug):
             if err:
                 return error_response(err, 400)
             updates[db_col] = v
+
+    if 'differentialFetchMode' in data:
+        mode = data['differentialFetchMode']
+        if mode is None:
+            mode = 'inherit'
+        if mode not in ('inherit', 'auto', 'on', 'off'):
+            return error_response(
+                'differentialFetchMode must be inherit, auto, on, or off', 400)
+        updates['differential_fetch_mode'] = None if mode == 'inherit' else mode
+        updates['differential_fetch_enabled'] = {
+            'inherit': None, 'auto': None, 'on': 1, 'off': 0,
+        }[mode]
+    elif 'differentialFetchEnabled' in data:
+        legacy = updates.get('differential_fetch_enabled')
+        updates['differential_fetch_mode'] = (
+            'on' if legacy else 'off') if legacy is not None else 'auto'
 
     # Handle maxEpisodes
     if 'maxEpisodes' in data:

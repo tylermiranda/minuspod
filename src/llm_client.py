@@ -63,6 +63,7 @@ from config import (
     PROVIDER_OPENAI_COMPATIBLE,
     PROVIDERS_NON_ANTHROPIC,
     coerce_bool_setting,
+    get_stage_tunable,
     ModelNotConfiguredError,
 )
 from llm_capabilities import (
@@ -461,6 +462,11 @@ def get_effective_ollama_api_key() -> str | None:
     return os.environ.get('OLLAMA_API_KEY')
 
 
+def get_effective_ollama_num_ctx() -> int | None:
+    """Return the configured Ollama context window, or None when unset/0/out of range (#780)."""
+    return get_stage_tunable('ollama_num_ctx')
+
+
 def get_effective_secondary_provider_api_key() -> str | None:
     """Return the secondary-slot API key. DB secret only, no env fallback:
     the secondary slot is not backed by a legacy env var."""
@@ -510,6 +516,24 @@ def _provider_error_kind(error: Exception) -> str:
     except (TypeError, ValueError):
         return kind
     return f'{kind} HTTP {status}'
+
+
+def is_review_inconclusive_error(error: Exception) -> bool:
+    """True for the review service's explicit inconclusive response."""
+    try:
+        status = int(_provider_status_code(error))
+    except (TypeError, ValueError):
+        return False
+    if status != 422:
+        return False
+    body = extract_error_body(error)
+    if not isinstance(body, dict):
+        return False
+    code = body.get('code')
+    nested = body.get('error')
+    if code is None and isinstance(nested, dict):
+        code = nested.get('code')
+    return code == 'jev_review_inconclusive'
 
 
 def _safe_reasoning_value(value: Union[int, str] | None):
@@ -623,6 +647,7 @@ class LLMClient(ABC):
 
     def __init__(self):
         self._circuit_breaker: CircuitBreaker | None = None
+        self._breaker_probe = threading.local()
         # Which account this client authenticates as; part of the model-list
         # cache identity so two accounts on one endpoint never share a list.
         self.credential_slot = 'primary'
@@ -646,16 +671,31 @@ class LLMClient(ABC):
 
     def _check_circuit_breaker(self):
         """Check circuit breaker before API call. Raises CircuitBreakerOpen if open."""
+        self._breaker_probe.token = None
         if self._circuit_breaker:
-            self._circuit_breaker.check()
+            self._breaker_probe.token = self._circuit_breaker.check()
 
     def _record_circuit_breaker(self, success: bool, error: Exception | None = None):
         """Record success/failure on the circuit breaker after API call."""
         if self._circuit_breaker:
+            token = getattr(self._breaker_probe, 'token', None)
             if success:
-                self._circuit_breaker.record_success()
+                self._circuit_breaker.record_success(token=token)
             else:
-                self._circuit_breaker.record_failure(error)
+                self._circuit_breaker.record_failure(error, token=token)
+            self._breaker_probe.token = None
+
+    def circuit_retry_after(self) -> float | None:
+        """Remaining breaker cooldown, when this route is unavailable."""
+        if self._circuit_breaker is None:
+            return None
+        return self._circuit_breaker.seconds_until_retry()
+
+    def _release_circuit_breaker_probe(self) -> None:
+        if self._circuit_breaker is not None:
+            token = getattr(self._breaker_probe, 'token', None)
+            self._circuit_breaker.release_probe(token=token)
+            self._breaker_probe.token = None
 
     def _warn_if_truncated(self, stop_indicator: str, max_tokens: int, model: str):
         """Log a warning if the LLM response was truncated due to max_tokens."""
@@ -719,16 +759,23 @@ class LLMClient(ABC):
                 try:
                     response = send_fn(eff_max, eff_temp, eff_reasoning)
                 except Exception as e2:
-                    if not is_rate_limit_error(e2):
+                    if (not is_rate_limit_error(e2)
+                            and not is_review_inconclusive_error(e2)):
                         self._record_circuit_breaker(success=False, error=e2)
+                    else:
+                        self._release_circuit_breaker_probe()
                     raise
                 return response, eff_max, eff_temp, eff_reasoning
 
             will_fallback = _should_fallback_retry(
                 e, pass_name, started_in_fallback)
-            if not is_rate_limit_error(e) and not will_fallback:
+            if (not is_rate_limit_error(e) and not will_fallback
+                    and not is_review_inconclusive_error(e)):
                 self._record_circuit_breaker(success=False, error=e)
             if not will_fallback:
+                if (is_rate_limit_error(e)
+                        or is_review_inconclusive_error(e)):
+                    self._release_circuit_breaker_probe()
                 raise
             _log_fallback(provider_label, episode_id, pass_name, model,
                           user_max, user_temp, user_reasoning, e)
@@ -741,8 +788,11 @@ class LLMClient(ABC):
             try:
                 response = send_fn(defaults.max_tokens, defaults.temperature, defaults.reasoning_effort)
             except Exception as e2:
-                if not is_rate_limit_error(e2):
+                if (not is_rate_limit_error(e2)
+                        and not is_review_inconclusive_error(e2)):
                     self._record_circuit_breaker(success=False, error=e2)
+                else:
+                    self._release_circuit_breaker_probe()
                 raise
             return response, defaults.max_tokens, defaults.temperature, defaults.reasoning_effort
 
@@ -1009,6 +1059,16 @@ class AnthropicClient(LLMClient):
         return "anthropic"
 
 
+class OllamaNativeChatError(Exception):
+    """A non-2xx response from Ollama's native /api/chat endpoint; carries
+    status_code so the shared classifiers recognize it without an SDK type."""
+
+    def __init__(self, message: str, status_code: int | None = None, response=None):
+        super().__init__(message)
+        self.status_code = status_code
+        self.response = response
+
+
 class OpenAICompatibleClient(LLMClient):
     """OpenAI-compatible API client.
 
@@ -1023,7 +1083,7 @@ class OpenAICompatibleClient(LLMClient):
         base_url: str | None = None,
         api_key: str | None = None,
         default_model: str | None = None,
-        extra_headers: dict[str, str] | None = None
+        extra_headers: dict[str, str] | None = None,
     ):
         super().__init__()
         self.base_url = base_url or os.environ.get('OPENAI_BASE_URL', DEFAULT_OPENAI_BASE_URL)
@@ -1088,6 +1148,7 @@ class OpenAICompatibleClient(LLMClient):
         pass_name: str | None = None,
     ) -> LLMResponse:
         self._check_circuit_breaker()
+
         self._ensure_client()
 
         all_messages = [{"role": "system", "content": system}] + messages
@@ -1505,18 +1566,20 @@ class OpenAICompatibleClient(LLMClient):
         from llm_capabilities import configured_stage_models
         return configured_stage_models(_get_cached_setting) or [fallback_model]
 
-    def _try_ollama_native_list(self) -> list[LLMModel]:
-        """Try Ollama's native /api/tags endpoint as a fallback for model listing.
-
-        Strips /v1 from self.base_url to derive the Ollama root, then queries
-        GET {root}/api/tags. Returns a list of LLMModel on success, empty list
-        on any failure.
-        """
+    def _ollama_native_root(self) -> str:
+        """Strip /v1 from self.base_url to derive the Ollama native API root."""
         root = self.base_url.rstrip('/')
         if root.endswith('/v1'):
             root = root[:-3]
+        return root
 
-        url = f"{root}/api/tags"
+    def _try_ollama_native_list(self) -> list[LLMModel]:
+        """Try Ollama's native /api/tags endpoint as a fallback for model listing.
+
+        Queries GET {root}/api/tags. Returns a list of LLMModel on success,
+        empty list on any failure.
+        """
+        url = f"{self._ollama_native_root()}/api/tags"
         try:
             from utils.safe_http import URLTrust, safe_get
             resp = safe_get(
@@ -1538,6 +1601,170 @@ class OpenAICompatibleClient(LLMClient):
         except Exception as e:
             logger.debug(f"Ollama native /api/tags fallback failed: {e}")
             return []
+
+
+class OllamaNativeClient(OpenAICompatibleClient):
+    """Ollama client routed through native /api/chat instead of the
+    OpenAI-compatible endpoint, the only one that honors num_ctx (#780)."""
+
+    def __init__(self, *, ollama_num_ctx: int, **kwargs):
+        super().__init__(**kwargs)
+        self._ollama_num_ctx = ollama_num_ctx
+
+    def messages_create(
+        self,
+        model: str,
+        max_tokens: int,
+        system: str,
+        messages: list[dict],
+        temperature: float = 0.0,
+        timeout: float = 120.0,
+        response_format: dict[str, str] | None = None,
+        reasoning_effort: Union[int, str] | None = None,
+        episode_id: str | None = None,
+        pass_name: str | None = None,
+    ) -> LLMResponse:
+        self._check_circuit_breaker()
+        return self._native_ollama_chat(
+            model, max_tokens, system, messages, temperature, timeout,
+            response_format, reasoning_effort, episode_id, pass_name,
+        )
+
+    def _native_ollama_chat(
+        self,
+        model: str,
+        max_tokens: int,
+        system: str,
+        messages: list[dict],
+        temperature: float,
+        timeout: float,
+        response_format: dict[str, str] | None,
+        reasoning_effort: Union[int, str] | None,
+        episode_id: str | None,
+        pass_name: str | None,
+    ) -> LLMResponse:
+        all_messages = [{"role": "system", "content": system}] + messages
+
+        eff_max, eff_temp, eff_reasoning, started_in_fallback = _apply_pass_fallback(
+            episode_id, pass_name, max_tokens, temperature, reasoning_effort
+        )
+        self._log_messages("Ollama native", system, messages, model, eff_temp, eff_max)
+
+        def _send(tok, tmp, reasoning):
+            body = self._build_ollama_native_request(
+                model, all_messages, tok, tmp, reasoning, response_format)
+            return self._send_ollama_native_request(body, timeout)
+
+        data, eff_max, eff_temp, eff_reasoning = self._send_with_fallback(
+            "Ollama native", PROVIDER_OLLAMA, model,
+            eff_max, eff_temp, eff_reasoning,
+            max_tokens, temperature, reasoning_effort,
+            episode_id, pass_name,
+            started_in_fallback,
+            _send,
+        )
+        self._record_circuit_breaker(success=True)
+        return self._map_ollama_native_response(data, model, eff_max)
+
+    def _build_ollama_native_request(
+        self, model: str, all_messages: list[dict], max_tokens: int,
+        temperature: float, reasoning_effort: Union[int, str] | None,
+        response_format: dict[str, str] | None,
+    ) -> dict:
+        """Build the native /api/chat request body."""
+        body = {
+            "model": model,
+            "messages": all_messages,
+            "stream": False,
+            "options": {
+                "num_ctx": self._ollama_num_ctx,
+                "temperature": temperature,
+                "num_predict": max_tokens,
+            },
+        }
+        if response_format:
+            rf_type = response_format.get('type')
+            if rf_type == 'json_schema':
+                schema = (response_format.get('json_schema') or {}).get('schema')
+                if schema:
+                    body["format"] = schema
+            elif rf_type == 'json_object':
+                body["format"] = "json"
+        normalized_reasoning = translate_reasoning_effort(
+            PROVIDER_OLLAMA, reasoning_effort).get("reasoning_effort")
+        body["think"] = (
+            False if normalized_reasoning in (None, "none") else normalized_reasoning
+        )
+        return body
+
+    def _send_ollama_native_request(self, body: dict, timeout: float) -> dict:
+        """POST body to the native /api/chat root and return the parsed JSON.
+        Root derivation and auth header mirror _try_ollama_native_list."""
+        from utils.safe_http import URLTrust, safe_post
+        url = f"{self._ollama_native_root()}/api/chat"
+        headers = {}
+        if self.api_key and self.api_key != 'not-needed':
+            headers['Authorization'] = f'Bearer {self.api_key}'
+        resp = safe_post(
+            url,
+            trust=URLTrust.OPERATOR_CONFIGURED,
+            timeout=timeout,
+            json=body,
+            headers=headers or None,
+            max_redirects=HTTP_MAX_REDIRECTS_API,
+        )
+        if not resp.ok:
+            raise self._ollama_native_status_error(resp)
+        return resp.json()
+
+    @staticmethod
+    def _ollama_native_status_error(resp) -> OllamaNativeChatError:
+        """Translate a non-2xx native response into an error the shared
+        classifiers recognize by status_code and message wording."""
+        status = resp.status_code
+        detail = (resp.text or '')[:300]
+        if status == 429:
+            message = f"Ollama native chat rate limit (429): {detail}"
+        else:
+            message = f"Ollama native chat failed ({status}): {detail}"
+        return OllamaNativeChatError(message, status_code=status, response=resp)
+
+    def _map_ollama_native_response(self, data: dict, model: str, max_tokens: int) -> LLMResponse:
+        """Map a native /api/chat JSON body into LLMResponse."""
+        message = data.get('message') or {}
+        content = message.get('content') or ""
+        finish_reason = data.get('done_reason')
+        self._warn_if_truncated(finish_reason, max_tokens, model)
+
+        input_tokens = data.get('prompt_eval_count')
+        output_tokens = data.get('eval_count')
+        usage = None
+        if input_tokens is not None and output_tokens is not None:
+            usage = {'input_tokens': input_tokens, 'output_tokens': output_tokens}
+
+        reasoning_present = bool(message.get('thinking'))
+
+        llm_response = LLMResponse(
+            content=content,
+            model=model,
+            usage=usage,
+            finish_reason=finish_reason,
+            reasoning_present=reasoning_present,
+            reasoning_exhausted=(
+                not content.strip() and reasoning_present and finish_reason == 'length'
+            ),
+            returned_model=data.get('model'),
+        )
+
+        _log_content("Ollama native response", content)
+        if llm_response.usage:
+            io_logger.info(
+                f"Ollama native response: model={llm_response.model}"
+                f" in={llm_response.usage['input_tokens']}"
+                f" out={llm_response.usage['output_tokens']}"
+                f" len={len(content)}"
+            )
+        return llm_response
 
 
 # =============================================================================
@@ -1821,6 +2048,13 @@ def _build_client(provider: str, base_url: str | None = None,
                 logger.info(f"Ollama provider: normalized base_url to {safe_url_for_log(normalized_base_url)}")
             api_key = (get_effective_secondary_provider_api_key() if secondary
                        else get_effective_ollama_api_key()) or 'not-needed'
+            ollama_num_ctx = get_effective_ollama_num_ctx()
+            if ollama_num_ctx:
+                logger.info(f"Ollama provider: num_ctx={ollama_num_ctx}, using native /api/chat")
+                return OllamaNativeClient(
+                    base_url=normalized_base_url, api_key=api_key,
+                    extra_headers=_opencode_headers(normalized_base_url),
+                    ollama_num_ctx=ollama_num_ctx)
         else:
             api_key = (get_effective_secondary_provider_api_key() if secondary
                        else get_effective_openai_api_key()) or 'not-needed'
@@ -1969,6 +2203,20 @@ def _provider_status_code(error) -> int | None:
     return getattr(error, 'status_code', None)
 
 
+_PERMANENT_REQUEST_REJECTION_STATUSES = frozenset({
+    400, 402, 405, 406, 410, 411, 412, 413, 414, 415, 416, 417, 418,
+    422, 426, 428, 431, 451,
+})
+
+
+def is_permanent_request_rejection_status(status) -> bool:
+    """True for provider 4xx statuses that retrying unchanged cannot fix."""
+    try:
+        return int(status) in _PERMANENT_REQUEST_REJECTION_STATUSES
+    except (TypeError, ValueError):
+        return False
+
+
 def is_retryable_error(error: Exception) -> bool:
     """Check if an error is retryable (transient).
 
@@ -1976,6 +2224,8 @@ def is_retryable_error(error: Exception) -> bool:
     """
     # Unconfigured model never self-resolves; no LLM call was even attempted.
     if isinstance(error, ModelNotConfiguredError):
+        return False
+    if isinstance(error, ProviderRequestRejectedError):
         return False
     # Structural 429s are never retryable -- the request itself exceeds the
     # provider's per-minute cap, no amount of backoff will help.
@@ -2247,6 +2497,14 @@ class LimitExceededError(Exception):
     ``is_retryable_error``.
     """
     pass
+
+
+class ProviderRequestRejectedError(ValueError):
+    """A provider rejected the request with a non-retryable 4xx response."""
+
+    def __init__(self, message: str, status_code: int | None = None):
+        super().__init__(message)
+        self.status_code = status_code
 
 
 class ProviderRateLimitedError(Exception):

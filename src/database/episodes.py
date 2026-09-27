@@ -141,6 +141,16 @@ class EpisodeMixin:
         episodes = [dict(row) for row in cursor.fetchall()]
         return episodes, total
 
+    def has_episodes(self, slug: str) -> bool:
+        """Whether a podcast has any episode rows at all, of any status."""
+        podcast = self.get_podcast_by_slug(slug)
+        if not podcast:
+            return False
+        conn = self.get_connection()
+        cursor = conn.execute(
+            "SELECT 1 FROM episodes WHERE podcast_id = ? LIMIT 1", (podcast['id'],))
+        return cursor.fetchone() is not None
+
     def get_latest_episodes_for_podcasts(self, podcast_ids: list[int],
                                          per_feed_limit: int) -> dict[int, list[dict]]:
         """Latest `per_feed_limit` episodes for each of `podcast_ids`, newest first.
@@ -970,7 +980,8 @@ class EpisodeMixin:
                       "AND e.published_at IS NOT NULL AND e.published_at >= ?")
     _RECENTS_SOURCE_COLS = ("p.slug AS source_slug, "
                             "COALESCE(NULLIF(p.title_override, ''), NULLIF(p.title, ''), p.slug) AS source_title, "
-                            "p.feed_type AS source_feed_type, p.chapters_in_notes AS source_chapters_in_notes")
+                            "p.feed_type AS source_feed_type, p.chapters_in_notes AS source_chapters_in_notes, "
+                            "p.title_skip_patterns AS source_title_skip_patterns")
 
     def count_recent_processed_episodes(self, since: str) -> int:
         return self.get_connection().execute(

@@ -16,6 +16,8 @@ logger = logging.getLogger(__name__)
 # the whole rebuild. The busy_timeout waits within each attempt.
 _SWAP_LOCK_RETRIES = 3
 _SWAP_LOCK_BACKOFF_SECONDS = 2.0
+_REBUILD_LOCK_RETRIES = 3
+_REBUILD_LOCK_BACKOFF_SECONDS = 1.0
 
 # Grouped-search snippet delimiters: literal "<mark>" in indexed text must not read as a highlight.
 _HL_OPEN = '\x02'
@@ -43,6 +45,11 @@ SEARCH_INDEX_DDL = """CREATE VIRTUAL TABLE IF NOT EXISTS {name} USING fts5(
 )"""
 _SHADOW_PREFIX = 'search_index_new'
 _SHADOW_NAME_RE = re.compile(r'^search_index_new_[0-9]+_[0-9]+$')
+# The old index is renamed aside rather than dropped in the swap transaction
+# (an FTS5 DROP walks and deletes the whole corpus); it is purged afterwards.
+_RETIRED_PREFIX = 'search_index_retired'
+_RETIRED_NAME_RE = re.compile(r'^search_index_retired_[0-9]+_[0-9]+$')
+_PURGE_CHUNK_ROWS = 500
 
 
 @contextmanager
@@ -178,12 +185,17 @@ class SearchMixin:
             try:
                 return self._rebuild_search_index_locked()
             finally:
-                conn = self.get_connection()
-                if conn.execute(
-                        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
-                        (shadow,)).fetchone():
-                    conn.execute(f'DROP TABLE IF EXISTS "{shadow}"')
-                    conn.commit()
+                try:
+                    conn = self.get_connection()
+                    if conn.execute(
+                            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+                            (shadow,)).fetchone():
+                        conn.execute(f'DROP TABLE IF EXISTS "{shadow}"')
+                        conn.commit()
+                except Exception as exc:
+                    # Preserve the rebuild failure. A later rebuild removes a
+                    # leftover shadow while holding the same process lock.
+                    logger.warning("Search index shadow cleanup failed: %s", exc)
 
     def _rebuild_search_index_locked(self) -> int:
         """Rebuild the FTS5 search index from scratch.
@@ -199,7 +211,7 @@ class SearchMixin:
         conn = self.get_connection()
         self._drop_stale_shadows(conn)
         shadow = f"{_SHADOW_PREFIX}_{os.getpid()}_{threading.get_ident()}"
-        with self.transaction(immediate=True) as tx:
+        def create_shadow(tx):
             active = [row['name'] for row in tx.execute(
                 "SELECT name FROM sqlite_master WHERE type = 'table' AND name GLOB ?",
                 (f'{_SHADOW_PREFIX}_[0-9]*_[0-9]*',),
@@ -210,27 +222,46 @@ class SearchMixin:
             start_seq = tx.execute(
                 "SELECT COALESCE(MAX(seq), 0) FROM search_index_changes"
             ).fetchone()[0]
+            return start_seq
+
+        start_seq = self._run_rebuild_write(create_shadow)
 
         insert = (f"INSERT INTO {shadow} (content_type, content_id, podcast_slug, title, body, metadata) "  # noqa: S608
                   "VALUES (?, ?, ?, ?, ?, ?)")
+        source_chunks = self._search_source_chunks()
         try:
-            for rows in self._search_source_chunks(conn):
-                with self.transaction(immediate=True) as tx:
-                    tx.executemany(insert, rows)
+            for rows in source_chunks:
+                self._run_rebuild_write(lambda tx, rows=rows: tx.executemany(insert, rows))
             self._swap_in_shadow(shadow, insert, start_seq)
         except Exception:
             conn.rollback()
-            conn.execute(f'DROP TABLE IF EXISTS "{shadow}"')
-            conn.commit()
             raise
+        finally:
+            source_chunks.close()
 
         count = conn.execute("SELECT COUNT(*) FROM search_index").fetchone()[0]
         logger.info(f"Search index rebuilt with {count} items")
         return count
 
+    def _run_rebuild_write(self, operation):
+        """Run one rebuild write transaction, retrying transient contention."""
+        for attempt in range(_REBUILD_LOCK_RETRIES):
+            try:
+                with self.transaction(immediate=True) as tx:
+                    return operation(tx)
+            except sqlite3.OperationalError as exc:
+                if 'locked' not in str(exc).lower() or attempt == _REBUILD_LOCK_RETRIES - 1:
+                    raise
+                logger.warning(
+                    "Search index rebuild write was locked (attempt %d/%d); retrying",
+                    attempt + 1, _REBUILD_LOCK_RETRIES)
+                time.sleep(_REBUILD_LOCK_BACKOFF_SECONDS * (attempt + 1))
+
     def _swap_in_shadow(self, shadow, insert, start_seq):
-        """Replay pending changes into the shadow and swap it in as the live
-        index, retrying the swap on a lost write lock (see the module note)."""
+        """Replay changes into the shadow and swap it in, retrying on a lost write lock.
+        The outgoing table is renamed aside (metadata-only, so the lock is held briefly);
+        the FTS5 drop that actually holds the lock runs after, in _purge_retired_shadow."""
+        retired = f"{_RETIRED_PREFIX}_{os.getpid()}_{threading.get_ident()}"
         for attempt in range(_SWAP_LOCK_RETRIES):
             try:
                 with self.transaction(immediate=True) as tx:
@@ -239,8 +270,16 @@ class SearchMixin:
                         "SELECT COALESCE(MAX(seq), 0) FROM search_index_changes"
                     ).fetchone()[0]
                     tx.execute("DELETE FROM search_index_changes WHERE seq <= ?", (applied_seq,))
-                    tx.execute("DROP TABLE search_index")
+                    tx.execute(f'ALTER TABLE search_index RENAME TO "{retired}"')
                     tx.execute(f'ALTER TABLE "{shadow}" RENAME TO search_index')
+                try:
+                    self._purge_retired_shadow(retired)
+                except Exception as exc:
+                    # The swap already committed; a purge failure must not be
+                    # reported as a failed rebuild. The next rebuild's
+                    # _drop_stale_shadows finishes the cleanup.
+                    logger.warning("Search index retired-table purge failed for %s: %s",
+                                   retired, exc)
                 return
             except sqlite3.OperationalError as exc:
                 if 'locked' not in str(exc).lower() or attempt == _SWAP_LOCK_RETRIES - 1:
@@ -250,8 +289,25 @@ class SearchMixin:
                     attempt + 1, _SWAP_LOCK_RETRIES)
                 time.sleep(_SWAP_LOCK_BACKOFF_SECONDS * (attempt + 1))
 
-    @staticmethod
-    def _search_source_chunks(conn):
+    def _purge_retired_shadow(self, name: str) -> None:
+        """Empty a renamed-aside index in short transactions, then drop it.
+        Raises on failure; callers must not let that fail the rebuild, since a table left behind is purged by the next rebuild."""
+        while True:
+            with self.transaction(immediate=True) as tx:
+                cur = tx.execute(
+                    f'DELETE FROM "{name}" WHERE rowid IN '  # noqa: S608
+                    f'(SELECT rowid FROM "{name}" LIMIT {_PURGE_CHUNK_ROWS})')
+                if cur.rowcount <= 0:
+                    break
+        with self.transaction(immediate=True) as tx:
+            tx.execute(f'DROP TABLE IF EXISTS "{name}"')
+
+    def _search_source_chunks(self):
+        # Keep the source snapshot off the connection that writes the shadow.
+        # Change-journal replay covers commits made during this read pass.
+        read_conn = sqlite3.connect(str(self.db_path), timeout=60)
+        read_conn.row_factory = sqlite3.Row
+        read_conn.execute('PRAGMA busy_timeout = 60000')
         sources = (
             ("SELECT slug, title, description FROM podcasts",
              lambda r: ('podcast', r['slug'], r['slug'], r['title'],
@@ -270,10 +326,13 @@ class SearchMixin:
              lambda r: ('sponsor', str(r['id']), 'global', r['name'],
                         r['aliases'] or '', '')),
         )
-        for sql, shape in sources:
-            cursor = conn.execute(sql)
-            while batch := cursor.fetchmany(_REBUILD_TX_ROWS):
-                yield [shape(row) for row in batch]
+        try:
+            for sql, shape in sources:
+                cursor = read_conn.execute(sql)
+                while batch := cursor.fetchmany(_REBUILD_TX_ROWS):
+                    yield [shape(row) for row in batch]
+        finally:
+            read_conn.close()
 
     @staticmethod
     def _replay_search_changes(conn, shadow, insert, start_seq):
@@ -321,7 +380,8 @@ class SearchMixin:
         return tuple(row) if row is not None else None
 
     def _drop_stale_shadows(self, conn) -> None:
-        """Remove shadows while the caller holds the exclusive rebuild lock."""
+        """Remove shadows while the caller holds the exclusive rebuild lock,
+        and finish purging any retired table a crash left mid-swap."""
         names = [r['name'] for r in conn.execute(
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name GLOB ? "
             "AND sql LIKE 'CREATE VIRTUAL TABLE%USING fts5%'",
@@ -334,6 +394,18 @@ class SearchMixin:
         if dropped:
             conn.commit()
             logger.warning(f"Dropped {dropped} stale search index shadow table(s)")
+
+        retired_names = [r['name'] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name GLOB ? "
+            "AND sql LIKE 'CREATE VIRTUAL TABLE%USING fts5%'",
+            (f"{_RETIRED_PREFIX}_[0-9]*_[0-9]*",))
+            if _RETIRED_NAME_RE.fullmatch(r['name'])]
+        for name in retired_names:
+            logger.warning(f"Purging retired search index table left by a previous rebuild: {name}")
+            try:
+                self._purge_retired_shadow(name)
+            except Exception as exc:
+                logger.warning("Search index retired-table purge failed for %s: %s", name, exc)
 
     def index_episode(self, episode_id: str, slug: str) -> bool:
         """Index or re-index a single episode in the search index."""
