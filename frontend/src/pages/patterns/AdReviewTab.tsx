@@ -5,6 +5,7 @@ import {
   type DetectionReviewerFilter,
   type DetectionSort,
   type DetectionStatusFilter,
+  type HoldReason,
   type ReviewDetection,
 } from '../../api/detections';
 import { feedsQueryOptions } from '../../api/feeds';
@@ -22,6 +23,7 @@ import { DetectionFilterBar } from './DetectionFilterBar';
 import { useDetectionCorrections } from './useDetectionCorrections';
 import { PendingRecutsBar } from './PendingRecutsBar';
 import { sortFeeds } from '../../utils/feedSort';
+import { HOLD_REASON_LABELS } from '../../utils/holdReason';
 
 const STATUS_OPTIONS: Array<[DetectionStatusFilter, string]> = [
   ['needs_review', 'Needs review'],
@@ -31,12 +33,16 @@ const STATUS_OPTIONS: Array<[DetectionStatusFilter, string]> = [
   ['all', 'All'],
 ];
 
+// Hold reasons only exist on pending detections.
+const HOLD_REASON_STATUSES: DetectionStatusFilter[] = ['needs_review', 'pending'];
+
 export default function AdReviewTab() {
   const [page, setPage] = useState(1);
   const [status, setStatus] = useState<DetectionStatusFilter>('needs_review');
   const [feed, setFeed] = useState('');
   const [category, setCategory] = useState('');
   const [reviewer, setReviewer] = useState<DetectionReviewerFilter>('');
+  const [holdReason, setHoldReason] = useState<HoldReason | ''>('');
   const [q, setQ] = useState('');
   const [debouncedQ, setDebouncedQ] = useState('');
   const [sort, setSort] = useState<DetectionSort>('date');
@@ -62,13 +68,14 @@ export default function AdReviewTab() {
   });
 
   const { data, isLoading, error } = useQuery({
-    queryKey: ['detections', page, status, feed, category, reviewer, debouncedQ, sort, order],
+    queryKey: ['detections', page, status, feed, category, reviewer, holdReason, debouncedQ, sort, order],
     queryFn: () => getDetections({
       page,
       status,
       feed: feed || undefined,
       category: category || undefined,
       reviewer: reviewer || undefined,
+      holdReason: holdReason || undefined,
       q: debouncedQ || undefined,
       sort,
       order,
@@ -79,6 +86,11 @@ export default function AdReviewTab() {
   const sortedFeeds = feeds ? sortFeeds(feeds, 'title') : undefined;
 
   const counts = data?.counts;
+  const holdReasonOptions = (Object.entries(HOLD_REASON_LABELS) as Array<[HoldReason, string]>)
+    .map(([value, label]): [string, string] => {
+      const n = counts?.pendingByHoldReason?.[value];
+      return [value, n ? `${label} (${n})` : label];
+    });
 
   return (
     <div>
@@ -136,9 +148,18 @@ export default function AdReviewTab() {
         onOrderChange={(v) => { setOrder(v); setPage(1); }}
         status={{
           value: status,
-          onChange: (v) => { setStatus(v); setPage(1); },
+          onChange: (v) => {
+            setStatus(v);
+            if (!HOLD_REASON_STATUSES.includes(v)) setHoldReason('');
+            setPage(1);
+          },
           options: STATUS_OPTIONS,
         }}
+        holdReason={HOLD_REASON_STATUSES.includes(status) ? {
+          value: holdReason,
+          onChange: (v) => { setHoldReason(v as HoldReason | ''); setPage(1); },
+          options: holdReasonOptions,
+        } : undefined}
       />
 
       <PendingRecutsBar />
@@ -202,7 +223,7 @@ export default function AdReviewTab() {
             if (s.kind === 'adjust') {
               adjust(d, s.adjustedStart, s.adjustedEnd, s.sponsor);
             } else if (s.kind === 'confirm') {
-              approve(d);
+              approve(d, s.sponsor);
             } else if (s.kind === 'recategorize') {
               recategorize(d, s.category ?? null);
             } else {

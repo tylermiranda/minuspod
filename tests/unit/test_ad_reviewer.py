@@ -1,8 +1,9 @@
 """Tests for the ad reviewer."""
 import logging
 import re
-from dataclasses import dataclass
-from unittest.mock import MagicMock, patch
+
+import pytest
+from unittest.mock import patch
 
 from tests.app_bootstrap import bootstrap
 
@@ -13,8 +14,10 @@ from ad_reviewer import (
     BOUNDARY_SNAP_TOLERANCE_S,
     RESURRECT_BAND_WIDTH,
     _first_num,
+    _review_inconclusive_reason,
     split_resurrection_pool,
 )
+from tests.unit.reviewer_test_utils import _build_reviewer, _mock_episode_meta, _resp
 
 
 def test_first_num_prefers_start_and_rejects_non_finite():
@@ -35,38 +38,6 @@ def _mock_segments():
         {'start': 180.0, 'end': 240.0, 'text': 'after ad'},
         {'start': 240.0, 'end': 300.0, 'text': 'more show content'},
     ]
-
-
-def _mock_episode_meta():
-    return {
-        'podcast_name': 'Test Podcast',
-        'episode_title': 'Test Episode',
-        'episode_description': 'desc',
-        'podcast_description': 'pod desc',
-        'slug': 'test-pod',
-        'episode_id': 'ep1',
-        'podcast_id': 'p1',
-    }
-
-
-def _build_reviewer(db_settings=None, conn=None):
-    db_settings = db_settings or {}
-    db = MagicMock()
-    db.get_setting.side_effect = lambda key: db_settings.get(key)
-    db.get_connection.return_value = conn or MagicMock()
-    llm_client = MagicMock()
-    return AdReviewer(db=db, llm_client=llm_client, sponsor_service=None)
-
-
-@dataclass
-class _LLMResp:
-    """Matches the LLMResponse dataclass shape (content is a string)."""
-    content: str
-    model: str = "test-model"
-
-
-def _resp(body: str) -> _LLMResp:
-    return _LLMResp(content=body)
 
 
 def test_clamp_to_cap_limits_shifts():
@@ -330,6 +301,7 @@ def test_merged_dai_core_inward_shrink_keeps_existing_core_clamp():
         'resurrect_prompt': 'resurrect',
         'review_max_boundary_shift': '60',
     })
+    # 130/160 are no transcript edges, so the unsupported trim keeps the core.
     reviewer._llm_client.messages_create.return_value = _resp(
         '[{"start": 130.0, "end": 160.0, "confidence": 0.85}]'
     )
@@ -396,16 +368,16 @@ def test_empty_array_yields_reject():
     assert result.rejected_by_reviewer[0]['was_cut'] is False
 
 
-# ---------- Timestamped candidate prompt (a55cb5b8216d regression) ----------
+# ---------- Timestamped candidate prompt (a1b2c3d4e5f6 regression) ----------
 
-def _dillon_segments():
-    """the-tim-dillon-show a55cb5b8216d: DAI candidate 0.0-35.03s. The ad's
+def _dai_candidate_segments():
+    """example-podcast a1b2c3d4e5f6: DAI candidate 0.0-35.03s. The ad's
     final sentence ends at the 28.42s segment edge; no segment edge sits
     near the 20.0s the model emitted (it was an interpolated guess)."""
     return [
-        {'start': 0.0, 'end': 6.5, 'text': 'Shell V-Power Nitro Plus is engineered with four levels of defense.'},
+        {'start': 0.0, 'end': 6.5, 'text': 'Acme Fuel Plus is engineered with four levels of defense.'},
         {'start': 6.5, 'end': 15.0, 'text': 'It removes gunk and protects against wear and corrosion.'},
-        {'start': 15.0, 'end': 28.42, 'text': 'So fuel up with Shell V-Power Nitro Plus today.'},
+        {'start': 15.0, 'end': 28.42, 'text': 'So fuel up with Acme Fuel Plus today.'},
         {'start': 28.42, 'end': 35.03, 'text': 'Welcome back to the show, everybody.'},
         {'start': 35.03, 'end': 60.0, 'text': 'more show content'},
     ]
@@ -470,8 +442,8 @@ def test_resurrect_prompt_candidate_lines_are_timestamped():
     assert 'rejected for low confidence' in prompt
 
 
-def test_tim_dillon_final_sentence_anchor_visible_in_prompt():
-    """Regression a55cb5b8216d: with only the two span-edge anchors the model
+def test_final_sentence_anchor_visible_in_prompt():
+    """Regression a1b2c3d4e5f6: with only the two span-edge anchors the model
     trimmed the candidate to an interpolated end=20.0s while its reasoning
     named the ad's final sentence, which ends at 28.42s. The timestamped
     candidate lines now put that 28.4s edge in the prompt; the behavioral
@@ -479,11 +451,11 @@ def test_tim_dillon_final_sentence_anchor_visible_in_prompt():
     reviewer = _build_reviewer({'review_prompt': 'review'})
     prompt = reviewer._build_user_prompt(
         ad={'start': 0.0, 'end': 35.03},
-        segments=_dillon_segments(),
+        segments=_dai_candidate_segments(),
         episode_meta=_mock_episode_meta(),
         pool='accepted',
     )
-    assert '[15.0s-28.4s] So fuel up with Shell V-Power Nitro Plus today.' in prompt
+    assert '[15.0s-28.4s] So fuel up with Acme Fuel Plus today.' in prompt
     # The old shape gave exactly two anchors ([0.0s] and [35.0s]) with all
     # candidate text between them stripped of timestamps.
     assert '28.4s' in prompt
@@ -681,9 +653,9 @@ def test_empty_array_in_resurrection_pool_yields_reject():
     assert result.accepted_after_review == []
 
 
-# ---------- Failure / fall-through ----------
+# ---------- Failure holds ----------
 
-def test_unparseable_response_falls_through():
+def test_unparseable_response_holds_unsupported_ad():
     reviewer = _build_reviewer({
         'review_prompt': 'review',
         'resurrect_prompt': 'resurrect',
@@ -697,27 +669,82 @@ def test_unparseable_response_falls_through():
         segments=_mock_segments(), episode_meta=_mock_episode_meta(),
         pass_num=1, pass_model='claude-test',
     )
-    assert result.accepted_after_review == [ad]
+    assert result.accepted_after_review == []
+    assert result.held_by_inconclusive[0]['hold_reason'] == 'reviewer_failed'
     assert result.verdicts[0].verdict == 'failure'
 
 
-def test_llm_call_failure_falls_through():
-    """Per-ad LLM failure: ad stays unchanged, verdict logged as failure."""
+def test_inconclusive_review_holds_unsupported_bounds_and_reason():
+    class InconclusiveError(Exception):
+        status_code = 422
+        body = {
+            'error': {
+                'code': 'jev_review_inconclusive',
+                'reason': 'transcript_gap',
+                'stage': 'choice_rank',
+                'score': 0.41,
+                'threshold': 0.7,
+            },
+        }
+
     reviewer = _build_reviewer({
         'review_prompt': 'review',
         'resurrect_prompt': 'resurrect',
     })
-    with patch('ad_reviewer.call_llm_for_window', return_value=(None, RuntimeError('boom'))):
-        ad = {'start': 120.0, 'end': 180.0, 'confidence': 0.9}
+    ad = {'start': 120.0, 'end': 180.0, 'confidence': 0.9}
+    with patch('ad_reviewer.call_llm_for_window',
+               return_value=(None, InconclusiveError('inconclusive'))):
         result = reviewer.review(
             accepted_ads=[ad], resurrection_eligible=[],
             segments=_mock_segments(), episode_meta=_mock_episode_meta(),
             pass_num=1, pass_model='claude-test',
         )
 
-    assert result.accepted_after_review == [ad]  # unchanged
-    assert result.verdicts[0].verdict == 'failure'
-    assert result.verdicts[0].success is False
+    assert result.accepted_after_review == []
+    assert result.verdicts[0].inconclusive_hold is True
+    assert result.held_by_inconclusive[0]['held_for_review'] is True
+    assert result.verdicts[0].verdict == 'inconclusive'
+    assert result.verdicts[0].success is True
+    assert 'Reviewer abstained: transcript gap.' in result.verdicts[0].reasoning
+    assert 'Stage: choice rank;' in result.verdicts[0].reasoning
+    assert 'score: 0.41;' in result.verdicts[0].reasoning
+    assert 'threshold: 0.7.' in result.verdicts[0].reasoning
+    assert result.verdicts[0].reasoning.endswith('Original marker retained.')
+
+
+def test_inconclusive_reason_does_not_expose_unknown_provider_text():
+    class InconclusiveError(Exception):
+        status_code = 422
+        body = {
+            'error': {
+                'code': 'jev_review_inconclusive',
+                'reason': ['provider-internal-details'],
+                'message': 'secret prompt text',
+                'stage': ['internal-debug'],
+                'score': 0.2,
+            },
+        }
+
+    assert _review_inconclusive_reason(InconclusiveError()) == (
+        'Reviewer abstained. score: 0.2. Original marker retained.'
+    )
+
+
+def test_inconclusive_reason_preserves_boundary_coverage_details():
+    class InconclusiveError(Exception):
+        status_code = 422
+        body = {
+            'error': {
+                'code': 'jev_review_inconclusive',
+                'reason': 'missing_boundary_coverage',
+                'stage': 'boundary_coverage',
+            },
+        }
+
+    assert _review_inconclusive_reason(InconclusiveError()) == (
+        'Reviewer abstained: missing boundary coverage. '
+        'Stage: boundary coverage. Original marker retained.'
+    )
 
 
 def test_per_ad_failure_does_not_block_other_ads():
@@ -748,7 +775,8 @@ def test_per_ad_failure_does_not_block_other_ads():
     assert len(result.verdicts) == 2
     assert result.verdicts[0].verdict == 'failure'
     assert result.verdicts[1].verdict == 'confirmed'
-    assert len(result.accepted_after_review) == 2
+    assert [a['start'] for a in result.accepted_after_review] == [200.0]
+    assert [a['start'] for a in result.held_by_inconclusive] == [100.0]
 
 
 def test_inverted_boundaries_keep_original():
@@ -793,21 +821,6 @@ def test_multi_element_array_takes_first():
     assert out['start'] == 120.0
     assert out['end'] == 180.0
     assert result.verdicts[0].verdict == 'confirmed'
-
-
-def test_catastrophic_failure_returns_inputs_unchanged():
-    reviewer = _build_reviewer({
-        'review_prompt': 'review',
-        'resurrect_prompt': 'resurrect',
-    })
-    ad = {'start': 100.0, 'end': 120.0, 'confidence': 0.9}
-    with patch.object(reviewer, '_review_inner', side_effect=RuntimeError('catastrophic')):
-        result = reviewer.review(
-            accepted_ads=[ad], resurrection_eligible=[],
-            segments=_mock_segments(), episode_meta=_mock_episode_meta(),
-            pass_num=1, pass_model='claude-test',
-        )
-    assert result.accepted_after_review == [ad]
 
 
 # ---------- Resurrection pool selector ----------
@@ -949,7 +962,7 @@ def _merged_ad(start, end, p_start='absent', p_end='absent'):
 
 
 def test_clamp_trims_differential_tail_when_no_protected_members():
-    # Tosh 6e9f8a115e24: two differential regions merged; reviewer trims
+    # example-podcast a1b2c3d4e5f6: two differential regions merged; reviewer trims
     # the imprecise tail. Null protection means fully trimmable.
     r = _build_reviewer()
     ad = _merged_ad(837.2, 1068.5, p_start=None, p_end=None)
@@ -995,7 +1008,152 @@ def test_clamp_preserves_dai_core_but_trims_outer_candidate():
         'dai_core_spans': [{'start': 100.0, 'end': 160.0}],
     }
 
+    # No segments: neither edge is transcript-supported.
     s, e = r._clamp_proposed_bounds(
         ad, 120.0, 140.0, 80.0, 180.0, 60.0, 'slug', 'ep')
 
     assert (s, e) == (100.0, 160.0)
+
+
+def _review_with_barriers(llm_body, barriers):
+    reviewer = _build_reviewer({
+        'review_prompt': 'review',
+        'resurrect_prompt': 'resurrect',
+        'review_max_boundary_shift': '60',
+    })
+    reviewer._llm_client.messages_create.return_value = _resp(llm_body)
+    meta = dict(_mock_episode_meta(), hard_barriers=barriers)
+    return reviewer.review(
+        accepted_ads=[{'start': 120.0, 'end': 180.0, 'confidence': 0.9}],
+        resurrection_eligible=[], segments=_mock_segments(),
+        episode_meta=meta, pass_num=1, pass_model='claude-test',
+    )
+
+
+def test_reviewer_widening_stops_at_a_hard_barrier():
+    result = _review_with_barriers(
+        '[{"start": 95.0, "end": 200.0, "confidence": 0.95}]',
+        [{'start': 100.0, 'end': 110.0}, {'start': 190.0, 'end': 230.0}])
+
+    out = result.accepted_after_review[0]
+    assert (out['start'], out['end']) == (110.0, 190.0)
+
+
+def test_reviewer_widening_away_from_barriers_is_unchanged():
+    result = _review_with_barriers(
+        '[{"start": 115.0, "end": 185.0, "confidence": 0.95}]',
+        [{'start': 100.0, 'end': 110.0}, {'start': 190.0, 'end': 230.0}])
+
+    out = result.accepted_after_review[0]
+    assert (out['start'], out['end']) == (115.0, 185.0)
+
+
+def test_a_reject_without_reasoning_clears_the_earlier_reviewer_fields():
+    reviewer = _build_reviewer({
+        'review_prompt': 'review',
+        'resurrect_prompt': 'resurrect',
+    })
+    reviewer._llm_client.messages_create.return_value = _resp('[]')
+    ad = {'start': 120.0, 'end': 180.0, 'confidence': 0.85,
+          'reviewer_reasoning': 'earlier pass reasoning', 'reviewer_confidence': 0.4,
+          'reviewer_model': 'earlier-model'}
+    result = reviewer.review(
+        accepted_ads=[ad], resurrection_eligible=[],
+        segments=_mock_segments(), episode_meta=_mock_episode_meta(),
+        pass_num=1, pass_model='claude-test',
+    )
+    verdict = result.verdicts[0]
+    assert verdict.verdict == 'reject' and verdict.reasoning is None
+    marked = result.rejected_by_reviewer[0]
+    assert marked['reviewer_reasoning'] is None
+    assert (marked['reviewer_confidence'], marked['reviewer_model']) == (
+        verdict.confidence, verdict.model_used)
+
+
+_ABSORBED = [{'start': 792.6, 'end': 815.6}, {'start': 995.1, 'end': 1002.8}]
+
+
+@pytest.mark.parametrize('extra,absorbed,expected', [
+    pytest.param({}, _ABSORBED, (792.6, 1002.8), id='no_core_absorbed'),
+    pytest.param({'dai_core_spans': [{'start': 800.0, 'end': 990.0}]}, _ABSORBED,
+                 (792.6, 1002.8), id='core_absorbed'),
+    pytest.param({}, None, (815.6, 995.1), id='no_core_plain'),
+    pytest.param({'dai_core_spans': [{'start': 800.0, 'end': 990.0}]}, None,
+                 (800.0, 995.1), id='core_plain'),
+])
+def test_clamp_never_trims_absorbed_silence(extra, absorbed, expected):
+    ad = {'start': 792.6, 'end': 1002.8, 'confidence': 0.95, **extra}
+    if absorbed:
+        ad['silent_absorbed_spans'] = [dict(s) for s in absorbed]
+    assert _build_reviewer()._clamp_proposed_bounds(
+        ad, 815.6, 995.1, 792.6, 1002.8, 60.0, 'slug', 'ep', segments=[]) == expected
+
+
+@pytest.mark.parametrize('keep,proposal_end,expected', [
+    pytest.param({'start': 997.0, 'end': 1002.8}, 995.1, (792.6, 997.0), id='keep_inside_silence'),
+    pytest.param({'start': 1000.0, 'end': 1010.0}, 995.1, (792.6, 1000.0), id='keep_straddles_end'),
+    pytest.param({'start': 1005.0, 'end': 1020.0}, 1010.0, (792.6, 1005.0), id='keep_outside'),
+    pytest.param(None, 995.1, (792.6, 1002.8), id='no_keep'),
+])
+def test_silence_floor_stops_at_hard_barriers(keep, proposal_end, expected):
+    ad = {'start': 792.6, 'end': 1002.8, 'confidence': 0.95,
+          'silent_absorbed_spans': [dict(s) for s in _ABSORBED]}
+    assert _build_reviewer()._clamp_proposed_bounds(
+        ad, 815.6, proposal_end, 792.6, 1002.8, 60.0, 'slug', 'ep', segments=[],
+        hard_barriers=[keep] if keep else None) == expected
+
+
+def _hole_segments(pause):
+    return [
+        {'start': 700.0, 'end': 728.77, 'text': 'and that wraps up the listener mail. Great!'},
+        {'start': 728.77 + pause, 'end': 800.0,
+         'text': 'And the nicest thing? It works with Acme.'},
+        {'start': 800.2, 'end': 939.9, 'text': 'Try Acme free at acme.example today.'},
+        {'start': 941.0, 'end': 990.0, 'text': 'Okay so back to the show.'},
+    ]
+
+
+def test_user_prompt_names_untranscribed_audio_inside_the_candidate():
+    reviewer = _build_reviewer({'review_prompt': 'review'})
+    prompt = reviewer._build_user_prompt(
+        ad={'start': 728.8, 'end': 939.9}, segments=_hole_segments(752.55 - 728.77),
+        episode_meta=_mock_episode_meta(), pool='accepted')
+    gap_line = '[728.77s-752.55s] (23.8 s of audio with no transcript)'
+    assert prompt.count(gap_line) == 1
+    candidate = prompt.split('>>> CANDIDATE AD START [728.8s] >>>\n', 1)[1]
+    assert candidate.startswith(gap_line + '\n[752.5s-800.0s] And the nicest thing?')
+
+
+def test_user_prompt_has_no_gap_line_for_a_short_pause():
+    reviewer = _build_reviewer({'review_prompt': 'review'})
+    prompt = reviewer._build_user_prompt(
+        ad={'start': 728.8, 'end': 939.9}, segments=_hole_segments(2.0),
+        episode_meta=_mock_episode_meta(), pool='accepted')
+    assert 'with no transcript' not in prompt
+
+
+def test_default_review_prompt_explains_untranscribed_audio():
+    from database import DEFAULT_REVIEW_PROMPT
+    assert 'may be speech the transcript missed; do not move an edge across it' in DEFAULT_REVIEW_PROMPT
+
+
+def test_user_prompt_places_each_gap_line_between_its_neighbours():
+    reviewer = _build_reviewer({'review_prompt': 'review'})
+    segments = [
+        {'start': 100.0, 'end': 110.0, 'text': 'one'},
+        {'start': 120.0, 'end': 130.0, 'text': 'two'},
+        {'start': 130.5, 'end': 140.0, 'text': 'three'},
+        {'start': 150.0, 'end': 160.0, 'text': 'four'},
+    ]
+    prompt = reviewer._build_user_prompt(
+        ad={'start': 100.0, 'end': 160.0}, segments=segments,
+        episode_meta=_mock_episode_meta(), pool='accepted')
+    candidate = prompt.split('>>> CANDIDATE AD START [100.0s] >>>\n', 1)[1].split('\n<<<', 1)[0]
+    assert candidate.split('\n') == [
+        '[100.0s-110.0s] one',
+        '[110.00s-120.00s] (10.0 s of audio with no transcript)',
+        '[120.0s-130.0s] two',
+        '[130.5s-140.0s] three',
+        '[140.00s-150.00s] (10.0 s of audio with no transcript)',
+        '[150.0s-160.0s] four',
+    ]

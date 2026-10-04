@@ -1,5 +1,5 @@
-import { describe, expect, it, beforeEach } from 'vitest';
-import { render, screen } from '@testing-library/react';
+import { describe, expect, it, beforeEach, vi } from 'vitest';
+import { act, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import CollapsibleSection from './CollapsibleSection';
 import { SettingsBulkCollapseProvider } from '../context/SettingsBulkCollapseContext';
@@ -177,5 +177,66 @@ describe('CollapsibleSection forceOpen', () => {
       </CollapsibleSection>,
     );
     expect(screen.queryByText('forced content')).toBeNull();
+  });
+});
+
+describe('CollapsibleSection body clipping', () => {
+  const body = () => screen.getByText('body content').parentElement!.parentElement!;
+  const toggle = () => act(() => {
+    screen.getByRole('button', { name: /clip section/i }).click();
+  });
+
+  it('clips collapsed, opening and closing bodies, but not a fully open one', () => {
+    vi.useFakeTimers();
+    const height = vi.spyOn(HTMLElement.prototype, 'scrollHeight', 'get').mockReturnValue(120);
+    try {
+      render(
+        <CollapsibleSection title="Clip Section" storageKey="clip-section" defaultOpen={false}>
+          <input aria-label="first control" />
+          <div>body content</div>
+        </CollapsibleSection>,
+      );
+      expect(body().className).toContain('overflow-hidden');
+
+      toggle();
+      expect(body().className).toContain('overflow-hidden');
+      act(() => {
+        vi.advanceTimersByTime(300);
+      });
+      expect(body().className).not.toContain('overflow-hidden');
+
+      // Closing sets an explicit height first, then 0px on the next frame: both clip.
+      toggle();
+      expect(body().style.maxHeight).toBe('120px');
+      expect(body().className).toContain('overflow-hidden');
+      act(() => {
+        vi.advanceTimersByTime(300);
+      });
+      expect(body().style.maxHeight).toBe('0px');
+      expect(body().className).toContain('overflow-hidden');
+    } finally {
+      height.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it('clips a body hidden by search and not one a search reveals', () => {
+    const { rerender } = render(
+      <SettingsSearchContext.Provider value={new Set<string>()}>
+        <CollapsibleSection title="Clip Section" storageKey="clip-search" defaultOpen>
+          <div>body content</div>
+        </CollapsibleSection>
+      </SettingsSearchContext.Provider>,
+    );
+    expect(body().className).toContain('overflow-hidden');
+
+    rerender(
+      <SettingsSearchContext.Provider value={new Set(['clip-search'])}>
+        <CollapsibleSection title="Clip Section" storageKey="clip-search" defaultOpen>
+          <div>body content</div>
+        </CollapsibleSection>
+      </SettingsSearchContext.Provider>,
+    );
+    expect(body().className).not.toContain('overflow-hidden');
   });
 });

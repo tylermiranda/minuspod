@@ -6,7 +6,9 @@ RapidFuzz for fuzzy intro/outro phrase detection. This is effective
 for host-read ads that follow similar scripts but aren't identical.
 """
 import logging
+import math
 import re
+import threading
 from dataclasses import dataclass, field, replace
 import json
 
@@ -22,12 +24,14 @@ from community_export import (
     count_brand_occurrences, brand_match_candidates,
     declared_sponsor_names_lower, find_foreign_sponsors,
     first_brand_occurrence, get_sponsor_row_or_stub)
-from utils.text import extract_text_from_segments, timed_spans_from_segments
+from utils.text import extract_text_from_segments, timed_spans_from_segments, word_boundary_re
 from sponsor_normalize import get_or_create_known_sponsor, segment_category_for
+from sponsor_context import COMMERCIAL_CONTEXT_RE, domain_labels
 from sponsor_service import SponsorService
 from utils.constants import (
     canonical_sponsor,
     INVALID_SPONSOR_VALUES,
+    squash_brand,
     LEARNING_BRAND_ONSET_FRACTION,
     LEARNING_MAX_PATTERN_DURATION,
     LEARNING_MIN_PATTERN_DURATION,
@@ -37,10 +41,155 @@ from utils.constants import (
 )
 from utils.community_tags import UNIVERSAL_TAG
 from utils.language import get_pattern_language
+from utils.markers import labels_compatible, member_label
+from utils.pattern_catalog import scoped_catalog
 from utils.pattern_similarity import similarity, canonicalize_for_dedupe
+from utils.time import overlap_seconds, utc_now_iso
 
 logger = logging.getLogger('podcast.textmatch')
 
+
+def _segments_for_pattern_learning(segments, start, end):
+    """Use timed words where available and decline ambiguous boundary text."""
+    clipped = []
+    for segment in segments:
+        seg_start = segment.get('start', 0)
+        seg_end = segment.get('end', 0)
+        if seg_end <= start or seg_start >= end:
+            continue
+        partial = seg_start < start or seg_end > end
+        words = segment.get('words')
+        if not words and not partial:
+            clipped.append(segment)
+            continue
+        source = segment.get('text') or ''
+        if not isinstance(words, list) or not words or not source:
+            return None
+        cursor = 0
+        previous_end = seg_start
+        aligned = []
+        for word in words:
+            if not isinstance(word, dict):
+                return None
+            word_start = word.get('start')
+            word_end = word.get('end')
+            token = word.get('word')
+            if (not isinstance(word_start, (int, float))
+                    or not isinstance(word_end, (int, float))
+                    or not isinstance(token, str) or not token.strip()
+                    or not all(map(math.isfinite, (word_start, word_end)))
+                    or word_start < seg_start - 0.01
+                    or word_end > seg_end + 0.01
+                    or word_start < previous_end - 0.01
+                    or word_end <= word_start):
+                return None
+            match = re.search(re.escape(token.strip()), source[cursor:], re.IGNORECASE)
+            if not match or re.search(r'\w', source[cursor:cursor + match.start()]):
+                return None
+            char_start = cursor + match.start()
+            char_end = cursor + match.end()
+            cursor = char_end
+            previous_end = word_end
+            aligned.append((word_start, word_end, char_start))
+        if re.search(r'\w', source[cursor:]):
+            return None
+        for index, (word_start, word_end, char_start) in enumerate(aligned):
+            if (word_start < start - 0.01 or word_end > end + 0.01
+                    or word_end <= start or word_start >= end):
+                continue
+            char_end = aligned[index + 1][2] if index + 1 < len(aligned) else len(source)
+            clipped.append({
+                'start': max(start, word_start),
+                'end': min(end, word_end),
+                'text': source[char_start:char_end].strip(),
+            })
+    return clipped
+
+
+# Leading sentences of the previous read shorter than this are dropped from a learned piece.
+LEAD_TRIM_MAX_S = 10.0
+# Silence after a leading segment that marks it as a separate read's tail, not this read's opening.
+LEAD_TAIL_GAP_S = 1.0
+# Longest such tail segment: a closing line, not an unbranded opening of the read itself.
+LEAD_TAIL_MAX_S = 3.0
+_SENTENCE_END_RE = re.compile(r'[.!?]["\')\]]*$')
+
+
+def _sentences(units: list[dict]) -> list[dict]:
+    """Group timed units (words, or whole untimed segments) into sentences."""
+    sentences, current = [], []
+    for unit in units:
+        current.append(unit)
+        if _SENTENCE_END_RE.search((unit.get('text') or '').strip()):
+            sentences.append(current)
+            current = []
+    if current:
+        sentences.append(current)
+    return [{'start': group[0]['start'], 'end': group[-1]['end'],
+             'text': ' '.join(u['text'] for u in group)} for group in sentences]
+
+
+def _drop_paused_tail(sentences, segment_bounds, lo, sponsor_re):
+    """Drop one short leading segment before the first sponsor sentence when a pause follows it."""
+    first_named = next((x['start'] for x in sentences if sponsor_re.search(x['text'])), None)
+    lead = min(((a, b) for a, b in segment_bounds if a >= lo - 0.01), default=None)
+    if first_named is None or lead is None or lead[1] > first_named + 0.01:
+        return sentences
+    following = min((a for a, _ in segment_bounds if a >= lead[1] - 0.01), default=None)
+    if (following is not None and following - lead[1] >= LEAD_TAIL_GAP_S
+            and lead[1] - lead[0] <= LEAD_TAIL_MAX_S):
+        return [x for x in sentences if x['end'] > lead[1] + 0.01]
+    return sentences
+
+
+def trim_piece_to_read(units, segment_bounds, lo, hi, sponsor_re, other_brand_res, handoff_re,
+                       trim_lead: bool, min_s: float = 0.0) -> tuple[float, float, str] | None:
+    """A learned piece narrowed to its sponsor's own copy, or None when it never names the sponsor.
+
+    trim_lead drops the previous read's short tail: the fragment of a segment the piece starts inside,
+    or leading segments set off by a pause; after the last sponsor sentence, a handoff or another
+    read's brand ends the piece. A trim that would leave the read under min_s is not applied.
+    """
+    sentences = untrimmed = _sentences([u for u in units if u['end'] > lo and u['start'] < hi])
+    # Only a piece starting inside a segment carries the previous read's tail.
+    straddled = next((seg_end for seg_start, seg_end in segment_bounds
+                      if seg_start < lo - 0.01 < seg_end), None)
+    if trim_lead and straddled is not None:
+        lead = [x for x in sentences if x['end'] <= straddled + 0.01]
+        if (lead and lead[-1]['end'] - lead[0]['start'] < LEAD_TRIM_MAX_S
+                and not any(sponsor_re.search(x['text']) for x in lead)):
+            sentences = sentences[len(lead):]
+    elif trim_lead:
+        sentences = _drop_paused_tail(sentences, segment_bounds, lo, sponsor_re)
+    naming = [i for i, x in enumerate(sentences) if sponsor_re.search(x['text'])]
+    if not naming:
+        return None
+    for i in range(naming[-1] + 1, len(sentences)):
+        text = sentences[i]['text']
+        if handoff_re.match(text) or any(other.search(text) for other in other_brand_res):
+            sentences = sentences[:i]
+            break
+    if sentences[-1]['end'] - sentences[0]['start'] < min_s <= untrimmed[-1]['end'] - untrimmed[0]['start']:
+        logger.info(f"Keeping learned piece {lo:.1f}-{hi:.1f}s untrimmed: the trim would leave "
+                    f"{sentences[-1]['end'] - sentences[0]['start']:.1f}s, under the {min_s:.0f}s minimum")
+        sentences = untrimmed
+    return (sentences[0]['start'], sentences[-1]['end'],
+            ' '.join(x['text'] for x in sentences))
+
+
+def bounded_segment_texts(segments, start, end) -> list[str]:
+    """Text of each segment overlapping [start, end]; an edge segment keeps only its in-span words."""
+    texts = []
+    for seg in segments:
+        seg_start, seg_end = seg.get('start', 0), seg.get('end', 0)
+        if seg_start >= end or seg_end <= start:
+            continue
+        if seg_start >= start and seg_end <= end:
+            texts.append(seg.get('text', ''))
+        else:
+            clipped = _segments_for_pattern_learning([seg], start, end)
+            texts.append(' '.join(word['text'] for word in clipped) if clipped else '')
+    return texts
 
 def is_defined_pattern(pattern: dict) -> bool:
     """Tier-1 trust: user-created or community patterns; auto-learned are not."""
@@ -119,6 +268,8 @@ FUZZY_DISCRIMINATIVE_LENGTH = 60
 # above every scaled threshold, so a short verbatim-common phrase matched
 # anywhere it appeared; local extraction already floors well above this.
 MIN_FUZZY_VARIANT_CHARS = 20
+# Sentence boundary followed by a capitalized word.
+_CLAUSE_SPLIT_RE = re.compile(r'(?<=[.!?])\s+(?=[A-Z])')
 
 
 def required_fuzzy_score(phrase_len: int) -> float:
@@ -277,6 +428,12 @@ def split_template_text(text: str) -> list[dict]:
     return segments
 
 
+def can_split_pattern(pattern: dict) -> bool:
+    """Whether the pattern has at least two usable text pieces."""
+    return bool(pattern.get('is_active')) and len(
+        split_template_text(pattern.get('text_template') or '')) > 1
+
+
 @dataclass
 class TextMatch:
     """Represents a text pattern match."""
@@ -347,6 +504,7 @@ class TextPatternMatcher:
             sponsor_service: SponsorService for sponsor name lookups
         """
         self.db = db
+        self._match_lock = threading.RLock()
         self.sponsor_service = sponsor_service
         self._vectorizer = None
         self._pattern_vectors = None
@@ -356,6 +514,7 @@ class TextPatternMatcher:
         self._patterns: list[AdPattern] = []
         self._pattern_buckets = {}
         self._initialized = False
+        self._pattern_snapshot = None
         # sponsor_id -> set of tags; populated alongside _load_patterns.
         self._sponsor_tags: dict[int, set] = {}
 
@@ -386,17 +545,39 @@ class TextPatternMatcher:
 
     def is_available(self) -> bool:
         """Check if text pattern matching is available."""
-        self._ensure_initialized()
-        return self._initialized and self._vectorizer is not None
+        with self._match_lock:
+            self._ensure_initialized()
+            return self._initialized and self._vectorizer is not None
 
-    def _load_patterns(self):
+    @staticmethod
+    def _matching_pattern_snapshot(patterns):
+        """Track fields used by matching, excluding match counters."""
+        fields = (
+            'id', 'text_template', 'intro_variants', 'outro_variants',
+            'sponsor_id', 'sponsor', 'scope', 'podcast_id', 'network_id',
+            'avg_duration', 'source', 'source_language', 'category',
+            'sponsor_segment_category', 'sponsor_tags', 'sponsor_active',
+            'created_by',
+        )
+        return tuple(sorted(tuple(p.get(field) for field in fields)
+                            for p in patterns))
+
+    def _load_patterns(self, patterns=None):
+        with self._match_lock:
+            return self._load_patterns_locked(patterns)
+
+    def _load_patterns_locked(self, patterns=None):
         """Load ad patterns from database."""
         if not self.db:
             return
 
         try:
-            patterns = self.db.get_ad_patterns(active_only=True)
+            if patterns is None:
+                patterns = self.db.get_ad_patterns(active_only=True)
             self._patterns = []
+            self._pattern_vectors = None
+            self._pattern_row_index = {}
+            self._pattern_buckets = {}
 
             for p in patterns:
                 # Parse JSON fields
@@ -477,10 +658,25 @@ class TextPatternMatcher:
                     else:
                         logger.warning("Vectorizer unavailable, patterns loaded without TF-IDF indexing")
 
+            self._pattern_snapshot = self._matching_pattern_snapshot(patterns)
+            return True
         except Exception as e:
             logger.error(f"Failed to load patterns: {e}")
+            return False
 
     def find_matches(
+        self,
+        segments: list[dict],
+        podcast_id: str = None,
+        network_id: str = None,
+        podcast_tags: set | None = None,
+        language: str | None = None,
+    ) -> list[TextMatch]:
+        with self._match_lock:
+            return self._find_matches_locked(
+                segments, podcast_id, network_id, podcast_tags, language)
+
+    def _find_matches_locked(
         self,
         segments: list[dict],
         podcast_id: str = None,
@@ -506,7 +702,19 @@ class TextPatternMatcher:
         Returns:
             List of TextMatch objects for found ads
         """
-        if not self.is_available() or not self._patterns:
+        if not self.is_available():
+            return []
+        if self.db:
+            try:
+                patterns = scoped_catalog(
+                    id(self.db), lambda: self.db.get_ad_patterns(active_only=True))
+            except Exception as e:
+                logger.warning(f"Pattern catalog refresh failed; skipping text matches: {e}")
+                return []
+            if (self._matching_pattern_snapshot(patterns) != self._pattern_snapshot
+                    and not self._load_patterns(patterns)):
+                return []
+        if not self._patterns:
             return []
 
         matches = []
@@ -540,15 +748,34 @@ class TextPatternMatcher:
         if not applicable_patterns:
             return []
 
+        # An auto-learned outro with no advertiser or call to action can be
+        # show dialogue accidentally stored after the ad. Keep its intro as
+        # advisory evidence, but do not let that outro or its template set a cut.
+        content_patterns = []
+        phrase_patterns = []
+        sponsor_brands = {}
+        for pattern in applicable_patterns:
+            if pattern.is_defined or not pattern.outro_variants:
+                content_patterns.append(pattern)
+                phrase_patterns.append(pattern)
+                continue
+            trusted_outros = [
+                phrase for phrase in pattern.outro_variants
+                if self._outro_has_ad_evidence(phrase, pattern.sponsor, sponsor_brands)
+            ]
+            phrase_patterns.append(replace(pattern, outro_variants=trusted_outros))
+            if len(trusted_outros) == len(pattern.outro_variants):
+                content_patterns.append(pattern)
+
         # Strategy 1: TF-IDF content matching on sliding windows
         content_matches = self._find_content_matches(
-            full_text, segments, segment_map, applicable_patterns
+            full_text, segments, segment_map, content_patterns
         )
         matches.extend(content_matches)
 
         # Strategy 2: Fuzzy intro/outro phrase matching
         phrase_matches = self._find_phrase_matches(
-            full_text, segments, segment_map, applicable_patterns
+            full_text, segments, segment_map, phrase_patterns
         )
         matches.extend(phrase_matches)
 
@@ -556,7 +783,7 @@ class TextPatternMatcher:
         matches = self._merge_matches(matches)
 
         # Refine boundaries using intro/outro phrases
-        matches = self._refine_boundaries(matches, segments, applicable_patterns)
+        matches = self._refine_boundaries(matches, segments, phrase_patterns)
 
         # Trim/reject spans that ran past the real ad into show content
         matches = self._constrain_overlong_spans(matches, segments)
@@ -566,6 +793,32 @@ class TextPatternMatcher:
             f"(of {len(self._patterns)} loaded), matched {len(matches)}"
         )
         return matches
+
+    def _outro_has_ad_evidence(self, phrase: str, sponsor: str | None,
+                               sponsor_brands: dict | None = None) -> bool:
+        """Whether a clause of phrase names sponsor with an offer or its domain.
+
+        sponsor_brands memoizes each sponsor's matcher for one detection pass.
+        """
+        if not sponsor:
+            return False
+        if sponsor_brands is None:
+            sponsor_brands = {}
+        if sponsor not in sponsor_brands:
+            names = brand_match_candidates(self._get_sponsor_row(sponsor))
+            sponsor_brands[sponsor] = (word_boundary_re(names),
+                                       {squash_brand(name) for name in names})
+        brand, domains = sponsor_brands[sponsor]
+        if brand is None:
+            return False
+        for clause in _CLAUSE_SPLIT_RE.split(phrase):
+            if not brand.search(clause):
+                continue
+            if COMMERCIAL_CONTEXT_RE.search(clause):
+                return True
+            if any(squash_brand(label) in domains for label in domain_labels(clause)):
+                return True
+        return False
 
     def _filter_patterns_by_scope(
         self,
@@ -1347,44 +1600,107 @@ class TextPatternMatcher:
             return []
 
         # Local import: split_planning imports this module for its phrase list.
-        from split_planning import build_split_candidates, build_split_pieces
+        from split_planning import (HANDOFF_RE, brand_mention_offsets, build_split_candidates,
+                                    build_split_pieces)
 
         def create(piece_start, piece_end, piece_sponsor,
-                   from_split=False, piece_text=None):
+                   from_split=False, piece_text=None, piece_category=category):
             pattern_id = self.create_pattern_from_ad(
-                segments, piece_start, piece_end, sponsor=piece_sponsor,
+                learning_segments, piece_start, piece_end, sponsor=piece_sponsor,
                 scope=scope, podcast_id=podcast_id, network_id=network_id,
-                episode_id=episode_id, category=category,
+                episode_id=episode_id, category=piece_category,
                 from_split=from_split, ad_text=piece_text, brand_rows=rows)
             return ([{'id': pattern_id, 'start': piece_start, 'end': piece_end}]
                     if pattern_id else [])
 
+        learning_segments = _segments_for_pattern_learning(segments, start, end)
+        if learning_segments is None:
+            return []
+        segment_bounds = [(seg.get('start', 0.0), seg.get('end', 0.0)) for seg in segments
+                          if seg.get('end', 0.0) > start and seg.get('start', 0.0) < end]
+        cut_down = bool((ad or {}).get('_cut_down'))
+        patterns = self.brand_patterns()
+
+        def trimmed(piece_start, piece_end, piece_sponsor, trim_lead, others):
+            """The piece cut to its sponsor's copy, logged when it moves; None if never named."""
+            sponsor_re = (patterns.get(canonical_sponsor(piece_sponsor))
+                          or word_boundary_re([piece_sponsor]))
+            if sponsor_re is None:
+                return None
+            other_res = [patterns[name] for name in others
+                         if name != canonical_sponsor(piece_sponsor) and name in patterns]
+            result = trim_piece_to_read(learning_segments, segment_bounds, piece_start, piece_end,
+                                        sponsor_re, other_res, HANDOFF_RE, trim_lead,
+                                        min_s=self._pattern_duration_bounds()[0])
+            if result is None:
+                logger.info(f"Learned piece {piece_start:.1f}-{piece_end:.1f}s never names "
+                            f"{piece_sponsor}; not learned")
+            elif (result[0], result[1]) != (piece_start, piece_end):
+                logger.info(f"Trimmed learned piece {piece_start:.1f}-{piece_end:.1f}s to "
+                            f"{result[0]:.1f}-{result[1]:.1f}s, the {piece_sponsor} copy")
+            return result
         _, max_duration = self._pattern_duration_bounds()
-        ad_text = self._get_text_around_time(segments, start, end)
+        ad_text = self._get_text_around_time(learning_segments, start, end)
         # Registry rows once per span: every gate and divider source below
         # matches against the same list.
         rows = self._brand_rows()
         members, cuts, brands = self.split_sources(ad or {}, sponsor, rows)
-        member_sponsors = {(m.get('sponsor') or '').strip().lower()
-                           for m in members if (m.get('sponsor') or '').strip()}
-        contaminated = (len(member_sponsors) > 1
+        member_sponsors = {member_label(m)[0] for m in members} - {None}
+        merged_distinct = bool((ad or {}).get('merged_distinct_ads'))
+        labeled = [m for m in members if member_label(m) != (None, None)]
+        intro_label = outro_label = (None, None)
+        if labeled:
+            intro_label = member_label(
+                next((m for m in labeled if m['start'] <= start + 1.0), labeled[0]))
+            outro_label = member_label(
+                next((m for m in reversed(labeled) if m['end'] >= end - 1.0), labeled[-1]))
+        # A differing label only counts when both reads name it.
+        bundled = bool(labeled) and not labels_compatible(intro_label, outro_label)
+        contaminated = (len(member_sponsors) > 1 or bundled
                         or bool(self._contaminating_brands(ad_text, sponsor, rows)))
+        # Brands another read in this span repeats: a sentence naming one is that read's copy.
+        repeated = [name for name, offsets in
+                    brand_mention_offsets(ad_text, rows, patterns).items()
+                    if len(offsets) >= 2]
         if (end - start <= max_duration
                 and len(find_transition_offsets(ad_text)) <= 1
-                and not contaminated):
-            return create(start, end, sponsor)
+                and not contaminated and not merged_distinct):
+            if (ad or {}).get('_member_of') and sponsor:
+                piece = trimmed(start, end, sponsor, cut_down, repeated)
+                return create(piece[0], piece[1], sponsor, piece_text=piece[2]) if piece else []
+            return create(start, end, sponsor, piece_text=ad_text)
 
-        spans = timed_spans_from_segments(segments, start, end)
-        patterns = self.brand_patterns()
+        spans = timed_spans_from_segments(learning_segments, start, end)
         times = [c['time'] for c in build_split_candidates(
             spans, start, end, members=members, brands=brands, cuts=cuts,
-            compiled=patterns)]
+            compiled=patterns, segments=segments)]
         if not times:
+            if merged_distinct:
+                logger.info("Skipping pattern learning: merged ads have no reliable divider")
+                return []
+            if bundled:
+                (a_sp, a_cat), (b_sp, b_cat) = intro_label, outro_label
+                logger.info(
+                    f"Skipping pattern learning: intro and outro come from different reads "
+                    f"({a_cat}/{a_sp} vs {b_cat}/{b_sp}) and no divider was found")
+                return []
             # Nothing to split on; create_pattern_from_ad logs why it declines.
-            return create(start, end, sponsor)
+            return create(start, end, sponsor, piece_text=ad_text)
+        if any(span['start'] < cut < span['end']
+               for cut in times for span in spans):
+            logger.info("Skipping pattern learning: divider crosses untimed speech")
+            return []
 
         pieces = build_split_pieces(spans, start, end, times, brands=brands,
-                                    compiled=patterns)
+                                    compiled=patterns, sponsor=sponsor)
+        if bundled:
+            logger.info(
+                f"Splitting bundled span {start:.0f}-{end:.0f}s: intro from "
+                f"{intro_label[1]}/{intro_label[0]}, outro from "
+                f"{outro_label[1]}/{outro_label[0]}")
+        # The caller's sponsor names the opening read only when the intro names it too.
+        opening_sponsor = sponsor if not bundled or (
+            intro_label[0] == member_label({'sponsor': sponsor})[0]) else None
         logger.info(
             f"Splitting {end - start:.0f}s span into {len(pieces)} pieces "
             f"for pattern learning"
@@ -1393,16 +1709,27 @@ class TextPatternMatcher:
         for index, piece in enumerate(pieces):
             # No divider sits near the span start, so the caller's sponsor names
             # the opening read; giving it to a later piece would mislabel it.
-            piece_sponsor = piece['sponsor'] or (sponsor if index == 0 else None)
+            piece_sponsor = piece['sponsor'] or (opening_sponsor if index == 0 else None)
             if not piece_sponsor:
                 logger.debug(
                     f"Split piece {piece['start']:.0f}-{piece['end']:.0f}s has no "
                     f"sponsor of its own; not learned")
                 continue
+            # A self-promo piece keeps its own category rather than the span's.
+            overlap, cover = max(
+                ((overlap_seconds(m['start'], m['end'], piece['start'], piece['end']), m)
+                 for m in labeled if m.get('category')),
+                key=lambda pair: pair[0], default=(0.0, None))
+            piece_category = cover['category'] if overlap > 0 else category
+            bounds = trimmed(piece['start'], piece['end'], piece_sponsor,
+                             index > 0 or cut_down, repeated)
+            if bounds is None:
+                continue
             created.extend(
-                create(piece['start'], piece['end'],
+                create(bounds[0], bounds[1],
                        canonical_sponsor(piece_sponsor),
-                       from_split=True, piece_text=piece['text']))
+                       from_split=True, piece_text=bounds[2],
+                       piece_category=piece_category))
         return created
 
     def create_pattern_from_ad(
@@ -1495,7 +1822,10 @@ class TextPatternMatcher:
         # overlap and this extractor includes a segment that merely touches the
         # boundary, so re-extracting would pull in the next piece's opening line.
         if ad_text is None:
-            ad_text = self._get_text_around_time(segments, start, end)
+            learning_segments = _segments_for_pattern_learning(segments, start, end)
+            if learning_segments is None:
+                return None
+            ad_text = self._get_text_around_time(learning_segments, start, end)
 
         if len(ad_text) < MIN_TEXT_LENGTH:
             logger.debug("Ad text too short for pattern creation")
@@ -1541,8 +1871,8 @@ class TextPatternMatcher:
         # Require the brand to appear at least twice in the ad_text. Real
         # ads repeat the brand (intro + outro at minimum); a single mention
         # is a strong signal of a host name-drop rather than a sponsor
-        # read. Pattern #354 (drink-champs Modelo) was the canonical
-        # false-positive: host conversation about "the big Modelo?" got
+        # read. Pattern #354 (one sponsor) was the canonical
+        # false-positive: host conversation about "the big Globex?" got
         # passed to record_verification_misses as a missed ad and turned
         # into a podcast-scoped pattern.
         #
@@ -1648,71 +1978,66 @@ class TextPatternMatcher:
             return []
 
         pattern = self.db.get_ad_pattern_by_id(pattern_id)
-        if not pattern:
-            logger.error(f"Pattern {pattern_id} not found")
+        if not pattern or not can_split_pattern(pattern):
             return []
 
-        text = pattern.get('text_template', '')
-        if not text:
-            logger.warning(f"Pattern {pattern_id} has no text_template")
-            return []
-
-        new_ids = []
+        text = pattern['text_template']
         segments = split_template_text(text)
+        try:
+            prepared = []
+            for seg in segments:
+                segment = seg['text']
+                sponsor = seg['sponsor']
+                intro = _extract_intro_phrase(segment)
+                outro = _extract_outro_phrase(segment)
+                prepared.append({
+                    'text_template': segment,
+                    'intro_variants': [intro] if intro else [],
+                    'outro_variants': [outro] if outro else [],
+                    'sponsor': sponsor,
+                })
 
-        if len(segments) < 2:
-            logger.info(f"Pattern {pattern_id} doesn't need splitting "
-                       f"(only {len(segments)} segment found)")
+            with self.db.transaction(immediate=True) as conn:
+                current = conn.execute(
+                    "SELECT * FROM ad_patterns WHERE id = ?",
+                    (pattern_id,)
+                ).fetchone()
+                if (not current or not current['is_active']
+                        or current['text_template'] != text):
+                    return []
+                new_ids = []
+                for piece in prepared:
+                    sponsor = piece.pop('sponsor')
+                    piece['sponsor_id'] = (
+                        get_or_create_known_sponsor(self.db, sponsor, conn=conn)
+                        if sponsor else None)
+                    new_id = self.db._create_ad_pattern_conn(
+                        conn,
+                        scope=current['scope'],
+                        podcast_id=current['podcast_id'],
+                        network_id=current['network_id'],
+                        dai_platform=current['dai_platform'],
+                        created_from_episode_id=current['created_from_episode_id'],
+                        source_language=current['source_language'],
+                        category=current['category'],
+                        created_by=current['created_by'] or 'auto',
+                        protected_from_sync=current['protected_from_sync'] or 0,
+                        **piece,
+                    )
+                    if not new_id:
+                        raise RuntimeError("Split did not create every pattern")
+                    new_ids.append(new_id)
+                self.db._update_ad_pattern_conn(
+                    conn, pattern_id,
+                    is_active=0,
+                    disabled_at=utc_now_iso(),
+                    disabled_reason=f"Split into patterns: {new_ids}",
+                )
+        except Exception:
+            logger.exception("Failed to split pattern %s", pattern_id)
             return []
 
-        logger.info(f"Pattern {pattern_id}: splitting into {len(segments)} separate patterns")
-
-        # Create new patterns for each segment
-        for seg in segments:
-            segment = seg['text']
-            sponsor = seg['sponsor']
-
-            # Create intro/outro for new pattern
-            intro = _extract_intro_phrase(segment)
-            outro = _extract_outro_phrase(segment)
-
-            try:
-                split_sponsor_id = (
-                    get_or_create_known_sponsor(self.db, sponsor) if sponsor else None
-                )
-                new_id = self.db.create_ad_pattern(
-                    scope=pattern.get('scope', 'podcast'),
-                    text_template=segment,
-                    intro_variants=[intro] if intro else [],
-                    outro_variants=[outro] if outro else [],
-                    sponsor_id=split_sponsor_id,
-                    podcast_id=pattern.get('podcast_id'),
-                    network_id=pattern.get('network_id'),
-                    created_from_episode_id=pattern.get('created_from_episode_id'),
-                    source_language=pattern.get('source_language'),
-                )
-                if new_id:
-                    new_ids.append(new_id)
-                    logger.info(f"Created split pattern {new_id} with sponsor '{sponsor}' "
-                               f"({len(segment)} chars)")
-            except Exception as e:
-                logger.error(f"Failed to create split pattern: {e}")
-
-        # Disable original pattern if we created new ones
-        if new_ids:
-            from utils.time import utc_now_iso
-            self.db.update_ad_pattern(
-                pattern_id,
-                is_active=0,
-                disabled_at=utc_now_iso(),
-                disabled_reason=f"Split into patterns: {new_ids}"
-            )
-            logger.info(f"Disabled original pattern {pattern_id}, "
-                       f"replaced with {len(new_ids)} split patterns: {new_ids}")
-
-            # Reload patterns
-            self._load_patterns()
-
+        self._load_patterns()
         return new_ids
 
     def matches_false_positive(

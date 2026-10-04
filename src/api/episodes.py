@@ -24,6 +24,7 @@ from config import (
 from ad_chapters import (
     merge_ad_chapters, public_chapters, resolve_ad_chapter_config,
 )
+from ad_validator import user_trimmed_keep_ranges
 from ad_yield import latest_completed_run, low_ad_yield
 from audio_peaks import compute_peaks, PeaksError
 from audio_processor import AudioProcessor, get_replacement_duration
@@ -50,7 +51,7 @@ from reprocess_modes import (
     clear_episode_for_mode, reset_episode_for_reprocess,
 )
 from split_planning import build_split_candidates, build_split_pieces
-from utils.markers import find_marker_in_list
+from utils.markers import find_marker_in_list, parse_ad_markers
 from chapter_notes import format_chapter_block
 from utils.constants import EpisodeStatus
 from utils.episode_paths import episode_public_url
@@ -132,14 +133,17 @@ def _same_cut(a, b, tol=0.05) -> bool:
 
 
 def chapters_only_decisions(markers, applied_cuts, original_duration,
-                            actions=None, false_positives=(), confirmed=()):
+                            actions=None, false_positives=(), confirmed=(),
+                            keep_override=None):
     """True when cutting the current markers reproduces the applied cuts.
 
     The decisions then changed only which ad chapters the audio should carry,
     so an apply can rebuild those instead of re-rendering the file. `actions`
     is the feed's resolved category action map, so a recategorized marker is
-    judged the way the recut would judge it. Unknown inputs (no persisted cut
-    list, no known duration) answer False: a recut is the safe fallback.
+    judged the way the recut would judge it; `keep_override(marker)` is True
+    where a pattern or differential rule cuts a keep anyway. Unknown inputs
+    (no persisted cut list, no known duration) answer False: a recut is the
+    safe fallback.
     """
     if applied_cuts is None or not original_duration:
         return False
@@ -152,11 +156,15 @@ def chapters_only_decisions(markers, applied_cuts, original_duration,
         for m in markers
         if m.get('start') is not None and m.get('end') is not None
     ]
+    resolved = [(m, DEFAULT_SEGMENT_ACTION
+                 if action == 'keep' and keep_override and keep_override(m) else action)
+                for m, action in resolved]
+    protected = [*(m for m, action in resolved if action == 'keep'),
+                 *user_trimmed_keep_ranges(list(confirmed))]
     wanted = AudioProcessor().compute_applied_cuts(
         [dict(m, beep=(action == 'beep')) for m, action in resolved
          if _marker_wants_cut(m, action, false_positives, confirmed)],
-        original_duration,
-        cut_barriers=[m for m, action in resolved if action == 'keep'],
+        original_duration, cut_barriers=protected, hard_barriers=protected,
     )
     return (len(wanted) == len(applied_cuts)
             and all(_same_cut(w, a)
@@ -165,6 +173,12 @@ def chapters_only_decisions(markers, applied_cuts, original_duration,
 
 def _apply_needs_chapters_only(db, slug, episode_id, episode, markers) -> bool:
     """chapters_only_decisions for one pending-recut episode."""
+    # Module-level import would be a cycle: main_app imports this package.
+    from main_app.processing import (
+        _keep_overridden, _load_stored_dai_differential, _make_keep_differential_override,
+    )
+    differential_override = _make_keep_differential_override(
+        _load_stored_dai_differential(slug, episode_id))
     return chapters_only_decisions(
         markers, db.get_applied_cuts(slug, episode_id),
         episode.get('original_duration'),
@@ -172,7 +186,8 @@ def _apply_needs_chapters_only(db, slug, episode_id, episode, markers) -> bool:
         false_positives=db.get_false_positive_corrections(
             episode['podcast_id'], episode_id),
         confirmed=db.get_confirmed_corrections(
-            episode['podcast_id'], episode_id))
+            episode['podcast_id'], episode_id),
+        keep_override=lambda m: _keep_overridden(dict(m), differential_override))
 
 
 # Reprocess-mode rules shared by the three reprocess endpoints
@@ -430,6 +445,7 @@ def _run_stats_to_api(stats):
         'verificationSkipped': stats.get('verification_skipped'),
         'cueOnly': stats.get('cue_only'),
         'transcriptionSkipped': stats.get('transcription_skipped'),
+        'normalizationSkipped': stats.get('normalization_skipped'),
         'downloadedDuration': stats.get('downloaded_duration'),
         'transcriptSegments': stats.get('transcript_segments'),
         'windows': stats.get('windows'),
@@ -448,6 +464,8 @@ def _run_stats_to_api(stats):
         } if markers else None,
         'verificationAdsCut': stats.get('verification_ads_cut'),
         'secondsRemoved': stats.get('seconds_removed'),
+        'sourceSecondsRemoved': stats.get('source_seconds_removed'),
+        'replacementSecondsAdded': stats.get('replacement_seconds_added'),
         'timings': {
             'downloadSeconds': timings.get('download'),
             'transcriptionSeconds': timings.get('transcription'),
@@ -649,7 +667,7 @@ def get_episode(slug, episode_id):
     kept_markers = []
     if episode.get('ad_markers_json'):
         try:
-            all_markers = json.loads(episode['ad_markers_json'])
+            all_markers = parse_ad_markers(episode['ad_markers_json']) or []
             for marker in all_markers:
                 decision = marker.get('validation', {}).get('decision', 'ACCEPT')
                 # Markers persisted by a failed run were never cut.
@@ -679,6 +697,8 @@ def get_episode(slug, episode_id):
             dai_differential = json.loads(episode['dai_differential_json'])
         except (json.JSONDecodeError, TypeError):
             dai_differential = None
+
+    splice_calibration = db.get_episode_splice_calibration(slug, episode_id)
 
     base = _episode_base_json(
         episode, slug=slug, is_local=is_local, storage=storage,
@@ -763,6 +783,7 @@ def get_episode(slug, episode_id):
         'partialDetection': _partial_detection(episode, processing_runs),
         'incompleteCoverage': _incomplete_coverage(processing_runs),
         'daiDifferential': dai_differential,
+        'spliceCalibration': splice_calibration,
         'transcript': episode.get('transcript_text'),
         'transcriptAvailable': bool(episode.get('transcript_text')),
         'originalTranscriptAvailable': bool(episode.get('has_original_transcript')),
@@ -1205,80 +1226,8 @@ def get_episode_split_candidates(slug, episode_id):
 @limiter.limit("5 per minute")
 @log_request
 def reprocess_episode(slug, episode_id):
-    """Force reprocess an episode by deleting cached data and reprocessing.
-
-    NOTE: This is the legacy endpoint. Prefer /episodes/<slug>/<episode_id>/reprocess
-    which supports reprocess modes (reprocess vs full).
-    """
-    db = get_database()
-
-    episode = db.get_episode(slug, episode_id)
-    if not episode:
-        return error_response('Episode not found', 404)
-
-    if episode['status'] == EpisodeStatus.PROCESSING:
-        return error_response('Episode is currently processing', 409)
-
-    podcast = db.get_podcast_by_slug(slug)
-    if not podcast:
-        return error_response('Podcast not found', 404)
-
-    try:
-        # Keep existing audio: reprocessing writes a new versioned file and
-        # prunes the old one only after it's durable (orchestration-5).
-        db.clear_episode_details(slug, episode_id)
-
-        # Mark as user-initiated so the background drainer honors it
-        # even on auto-process-disabled feeds.
-        db.upsert_episode(
-            slug, episode_id,
-            status=EpisodeStatus.PENDING.value,
-            reprocess_requested_at=utc_now_iso(),
-            retry_count=0,
-            error_message=None,
-            deferred_at=None,
-            deferred_service=None,
-        )
-
-        episode_url = episode.get('original_url')
-        episode_title = episode.get('title', 'Unknown')
-        podcast_name = podcast.get('title', slug)
-        episode_description = episode.get('description')
-        episode_published_at = episode.get('published_at')
-
-        from main_app.processing import start_background_processing
-        logger.info(f"[{slug}:{episode_id}] Starting reprocess (async)")
-
-        started, reason = start_background_processing(
-            slug, episode_id, episode_url, episode_title,
-            podcast_name, episode_description, None, episode_published_at
-        )
-
-        if started:
-            return json_response({
-                'message': 'Episode reprocess started',
-                'episodeId': episode_id,
-                'status': 'processing'
-            }, 202)
-        else:
-            priority = compute_queue_priority(
-                podcast.get('queue_priority'), episode_published_at, manual=True)
-            db.upsert_episode_for_processing(
-                slug, episode_id, episode_url, episode_title,
-                episode_published_at, episode_description, priority=priority
-            )
-            get_status_service().queue_episode(slug, episode_id, episode_title, podcast_name)
-            logger.info(f"[{slug}:{episode_id}] Queue busy ({reason}), added to processing queue")
-            return json_response({
-                'message': 'Episode queued for reprocess',
-                'episodeId': episode_id,
-                'status': 'queued',
-                'reason': reason
-            }, 202)
-
-    except Exception:
-        logger.exception(f"Failed to reprocess episode {slug}:{episode_id}")
-        return error_response('Failed to reprocess', 500)
+    """Legacy URL for the mode-aware reprocess handler."""
+    return _reprocess_episode_with_mode(slug, episode_id, legacy=True)
 
 
 @api.route('/feeds/<slug>/episodes/<episode_id>/regenerate-chapters', methods=['POST'])
@@ -1357,12 +1306,7 @@ def _regenerate_chapters_job(slug, episode_id, stamp):
 
 def _markers_from_row(episode):
     """Parsed ad markers from an episode row; None when absent or unreadable."""
-    if not episode.get('ad_markers_json'):
-        return None
-    try:
-        return json.loads(episode['ad_markers_json'])
-    except (json.JSONDecodeError, TypeError):
-        return None
+    return parse_ad_markers(episode.get('ad_markers_json'))
 
 
 def _regenerate_chapters(db, storage, slug, episode_id, episode, podcast, podcast_name, stamp):
@@ -2433,9 +2377,18 @@ def reprocess_episode_with_mode(slug, episode_id):
       transcription or LLM (issue #422). Requires the retained original audio,
       saved segments, and existing ad markers.
     """
+    return _reprocess_episode_with_mode(slug, episode_id)
+
+
+def _reprocess_episode_with_mode(slug, episode_id, legacy=False):
     db = get_database()
 
-    data = request.get_json() or {}
+    # Legacy clients post no body or a non-JSON one; both mean the default mode.
+    data = request.get_json(silent=legacy)
+    if legacy and data is None:
+        data = {}
+    if not isinstance(data, dict):
+        return error_response('Request body must be a JSON object', 400)
     mode = data.get('mode', 'reprocess')
 
     if not _mode_allowed(mode, 'single'):
@@ -2494,7 +2447,9 @@ def reprocess_episode_with_mode(slug, episode_id):
 
         if started:
             return json_response({
-                'message': f'Episode {mode} reprocess started',
+                'message': ('Episode reprocess started' if legacy and mode == 'reprocess'
+                            else f'Episode {mode} reprocess started'),
+                'episodeId': episode_id,
                 'mode': mode,
                 'status': 'processing',
                 'jobState': _episode_job_state(db, slug, episode_id,
@@ -2510,7 +2465,9 @@ def reprocess_episode_with_mode(slug, episode_id):
             get_status_service().queue_episode(slug, episode_id, episode_title, podcast_name)
             logger.info(f"[{slug}:{episode_id}] Queue busy ({reason}), added to processing queue")
             return json_response({
-                'message': f'Episode queued for {mode} reprocess',
+                'message': ('Episode queued for reprocess' if legacy and mode == 'reprocess'
+                            else f'Episode queued for {mode} reprocess'),
+                'episodeId': episode_id,
                 'mode': mode,
                 'status': 'queued',
                 'reason': reason,

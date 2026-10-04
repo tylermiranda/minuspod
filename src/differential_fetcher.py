@@ -23,6 +23,7 @@ from config import HTTP_MAX_REDIRECTS_FEED
 from utils.audio import get_audio_duration
 from user_agent import download_user_agent
 from utils.http import safe_url_for_log
+from utils.markers import DAI_PROBE_REF_S, dai_probe_window, merge_runs
 from utils.safe_http import URLTrust, safe_get, stream_to_file_capped
 from utils.subprocess_registry import tracked_run
 from utils.ffmpeg_run import SAFE_MEDIA_INPUT_ARGS
@@ -84,7 +85,7 @@ MAX_SILENCE_MARKS = 400
 # Interval tolerance for duration-matched chaining.
 CHAIN_TOLERANCE_S = 0.5
 # Normalized cross-correlation: reference length and search radius.
-XCORR_REF_S = 4.0
+XCORR_REF_S = DAI_PROBE_REF_S
 XCORR_SEARCH_S = 2.0
 # Minimum peak correlation to call a block identical across fetches.
 XCORR_MIN_CORR = 0.75
@@ -167,46 +168,62 @@ def _chain_marks(run_marks: list, ref_marks: list) -> list:
     return pairs
 
 
+def _prepare_template(run_pcm: np.ndarray, run_t: float, ref_s: float):
+    """Mean-removed run reference at run_t with its norm; None when short or silent."""
+    ref_len = int(ref_s * PCM_RATE)
+    a0 = int(run_t * PCM_RATE)
+    template = run_pcm[a0:a0 + ref_len].astype(np.float64)
+    if len(template) < ref_len:
+        return None
+    template = template - template.mean()
+    t_norm = np.sqrt(np.sum(template ** 2))
+    if t_norm < 1e-9:
+        return None
+    # Template spectra keyed by FFT size, filled on first use.
+    return {'template': template, 'norm': t_norm, 'spectra': {}}
+
+
 def _block_correlation(run_pcm: np.ndarray, ref_pcm: np.ndarray, run_t: float,
                        coarse_offset: float, *, ref_s: float = XCORR_REF_S,
-                       search_s: float = XCORR_SEARCH_S):
+                       search_s: float = XCORR_SEARCH_S, prepared=None):
     """Peak normalized cross-correlation of one run block against the refetch.
 
     Correlates a ref_s reference from the run file at run_t against the
     refetch file within +-search_s of the coarse silence-chain offset.
     FFT-based so a 4s reference over an 8s search span stays cheap.
     Returns the peak NCC in [-1, 1], or None when a window falls outside
-    either file or the reference is silent.
+    either file or the reference is silent. `prepared` is the block's
+    _prepare_template result, so several offsets share one template.
 
     Only the correlation confidence is consumed: the coarse silence-midpoint
     boundaries already meet the 0.5s region tolerance and the +-3s downstream
     corroboration, so the sub-sample peak lag is not fed back into region
     boundaries and is not returned.
     """
-    ref_len = int(ref_s * PCM_RATE)
-    a0 = int(run_t * PCM_RATE)
-    template = run_pcm[a0:a0 + ref_len].astype(np.float64)
-    if len(template) < ref_len:
+    if prepared is None:
+        prepared = _prepare_template(run_pcm, run_t, ref_s)
+    if prepared is None:
         return None
+    template, t_norm = prepared['template'], prepared['norm']
+    ref_len = len(template)
     b0 = max(0, int((run_t + coarse_offset - search_s) * PCM_RATE))
     b1 = int((run_t + coarse_offset + search_s) * PCM_RATE) + ref_len
+    # A window ending before the refetch starts would wrap the slice to most of the file.
+    if b1 - b0 < ref_len:
+        return None
     haystack = ref_pcm[b0:b1].astype(np.float64)
     if len(haystack) < ref_len:
         return None
-
-    template = template - template.mean()
     haystack = haystack - haystack.mean()
-    t_norm = np.sqrt(np.sum(template ** 2))
-    if t_norm < 1e-9:
-        return None
 
     n_lags = len(haystack) - ref_len + 1
     nfft = 1
     while nfft < len(haystack) + ref_len:
         nfft <<= 1
-    corr = np.fft.irfft(
-        np.fft.rfft(haystack, nfft) * np.conj(np.fft.rfft(template, nfft)),
-        nfft)[:n_lags]
+    spectrum = prepared['spectra'].get(nfft)
+    if spectrum is None:
+        spectrum = prepared['spectra'][nfft] = np.conj(np.fft.rfft(template, nfft))
+    corr = np.fft.irfft(np.fft.rfft(haystack, nfft) * spectrum, nfft)[:n_lags]
     # Sliding L2 norm of every haystack window. The haystack mean is removed
     # once globally rather than per-window: an approximation that holds for
     # AC-coupled audio and keeps normalization O(n).
@@ -217,36 +234,46 @@ def _block_correlation(run_pcm: np.ndarray, ref_pcm: np.ndarray, run_t: float,
 
 
 def _probe_block(run_pcm: np.ndarray, ref_pcm: np.ndarray, start: float,
-                 end: float, offset: float, *, allow_retry: bool = False):
+                 end: float, offsets: list, *, allow_retry: bool = False):
     """Measure one silence-delimited run block against the refetch.
 
     Returns (kind, corr): ('identical'|'differential', float) for a usable
     probe, ('unknown', None) when the block is too short to probe or the
     probe window is unusable (silent template, window outside either file).
 
-    With allow_retry (unmatched blocks probed at an inherited neighbor
-    offset), a block scoring below XCORR_MIN_CORR gets ONE retry with a
-    doubled search window (drift re-probe): an inherited offset that is
-    stale by more than XCORR_SEARCH_S -- e.g. silencedetect missed a mark
-    on the refetch -- would otherwise mislabel identical audio as
-    differential. The measured corr is the best of the probes.
+    Each candidate offset is probed and the best corr kept. With allow_retry
+    (unmatched blocks probed at inherited neighbor offsets), a best score
+    below XCORR_MIN_CORR gets ONE retry at the best offset with a doubled search
+    window (drift re-probe): an inherited offset stale by more than
+    XCORR_SEARCH_S, e.g. silencedetect missed a mark on the refetch, would
+    otherwise mislabel identical audio as differential.
     Chain-matched blocks carry their own exact offset, so they are never
     retried: a low score there is a real difference, not drift.
     """
     block_len = end - start
     if block_len < MIN_REGION_S:
         return 'unknown', None
-    ref_s = min(XCORR_REF_S, block_len)
     # Lead past the half-silence at the block edge when there is room.
-    run_t = start + min(0.5, block_len - ref_s)
-    corr = _block_correlation(run_pcm, ref_pcm, run_t, offset, ref_s=ref_s)
+    run_t, probe_end = dai_probe_window(start, end)
+    ref_s = round(probe_end - run_t, 6)  # float noise must not drop a template sample
+    prepared = _prepare_template(run_pcm, run_t, ref_s)
+    corr, best_offset = None, None
+    for offset in offsets:
+        c = _block_correlation(run_pcm, ref_pcm, run_t, offset, ref_s=ref_s,
+                               prepared=prepared)
+        if c is not None and (corr is None or c > corr):
+            corr, best_offset = c, offset
     if corr is None:
         return 'unknown', None
     if corr < XCORR_MIN_CORR and allow_retry:
-        retry = _block_correlation(run_pcm, ref_pcm, run_t, offset,
-                                   ref_s=ref_s, search_s=XCORR_SEARCH_S * 2)
-        if retry is not None:
-            corr = max(corr, retry)
+        retry = _block_correlation(run_pcm, ref_pcm, run_t, best_offset, ref_s=ref_s,
+                                   search_s=XCORR_SEARCH_S * 2, prepared=prepared)
+        if retry is not None and retry > corr:
+            corr = retry
+    if len(offsets) > 1 and logger.isEnabledFor(logging.DEBUG):
+        logger.debug('Unmatched block %.1f-%.1fs: best offset %+.2fs of %s, '
+                     'corr %.3f', start, end, best_offset,
+                     [round(o, 2) for o in offsets], corr)
     kind = 'identical' if corr >= XCORR_MIN_CORR else 'differential'
     return kind, corr
 
@@ -284,20 +311,16 @@ def _align_and_diff_pcm(run_pcm: np.ndarray, ref_pcm: np.ndarray,
     carries a measured corr: 'identical' and 'differential' from the peak
     NCC of the block's own probe, 'unknown' (corr None) when the block
     could not be measured. Unmatched blocks (no duration-matched refetch
-    counterpart -- typically DAI fills of differing length) are probed at
-    the nearest matched block's offset; with ``anchor_pairs`` (2.76.0) they
-    are probed at the cue-anchored interpolated offset instead, so an
-    inherited offset staler than the search window no longer needs the
-    doubled-window drift retry to score identical audio identical.
-    Chain-matched blocks keep their own exact offsets either way.
+    counterpart, typically DAI fills of differing length) are probed at the
+    cue-anchored offset (when ``anchor_pairs`` is given) and at both
+    neighbouring matched blocks' offsets, keeping the best corr: an ad
+    inserted only in the refetch steps the offset between neighbours.
+    Chain-matched blocks keep their own exact offsets.
     """
     pairs = _chain_marks(run_marks, ref_marks)
     offsets = {i: ref_marks[j] - run_marks[i] for i, j in pairs}
     n_blocks = len(run_marks) - 1
 
-    # Nearest matched offset for unmatched blocks: prefer the previous
-    # matched block (same piecewise-constant offset segment), fall back to
-    # the next one at the file head.
     next_offset = [None] * n_blocks
     upcoming = None
     for i in range(n_blocks - 1, -1, -1):
@@ -305,21 +328,28 @@ def _align_and_diff_pcm(run_pcm: np.ndarray, ref_pcm: np.ndarray,
             upcoming = offsets[i]
         next_offset[i] = upcoming
 
+    # Both fetches usually share their first and last sample, so edge blocks
+    # also try the file-start and file-end alignments.
+    end_offset = (len(ref_pcm) - len(run_pcm)) / PCM_RATE
     blocks = []
     last_offset = None
     for i in range(n_blocks):
         start, end = run_marks[i], run_marks[i + 1]
         if i in offsets:
             last_offset = offsets[i]
-            offset = last_offset
-        elif anchor_pairs:
-            offset = _anchor_offset(anchor_pairs, start)
+            candidates = [last_offset]
         else:
-            offset = last_offset if last_offset is not None else next_offset[i]
-        if offset is None:
+            anchor = _anchor_offset(anchor_pairs, start) if anchor_pairs else None
+            edge = (0.0 if i == 0 else None, end_offset if i == n_blocks - 1 else None)
+            candidates = []
+            for c in (anchor, last_offset, next_offset[i], *edge):
+                if c is not None and all(abs(c - k) > XCORR_SEARCH_S
+                                         for k in candidates):
+                    candidates.append(c)
+        if not candidates:
             kind, corr = 'unknown', None
         else:
-            kind, corr = _probe_block(run_pcm, ref_pcm, start, end, offset,
+            kind, corr = _probe_block(run_pcm, ref_pcm, start, end, candidates,
                                       allow_retry=i not in offsets)
         blocks.append({'start_s': start, 'end_s': end,
                        'kind': kind, 'corr': corr})
@@ -552,3 +582,27 @@ def differential_region_overlapping(dai_differential, start: float, end: float,
         except (KeyError, TypeError, ValueError):
             continue
     return None
+
+
+def identical_coverage(dai_differential, start: float, end: float) -> float:
+    """Fraction of [start, end) in measured identical regions; 0.0 if a differential one overlaps."""
+    regions = (dai_differential or {}).get('regions') or []
+    span = float(end) - float(start)
+    if span <= 0:
+        return 0.0
+    covered = []
+    for region in regions:
+        try:
+            lo, hi = max(float(region['start_s']), start), min(float(region['end_s']), end)
+        except (KeyError, TypeError, ValueError):
+            continue
+        if hi <= lo:
+            continue
+        if region.get('kind') == 'differential':
+            return 0.0
+        corr = region.get('corr')
+        if (region.get('kind') == 'identical' and isinstance(corr, (int, float))
+                and not isinstance(corr, bool) and corr >= XCORR_MIN_CORR):
+            covered.append((lo, hi))
+    # Overlapping regions from a hand-built or legacy payload must not count twice.
+    return sum(hi - lo for lo, hi in merge_runs(covered)) / span

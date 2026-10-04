@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect, type ReactNode } from 'react';
 import { useLocalStorageState, readStoredValue } from '../hooks/useLocalStorageState';
-import { useSettingsSearch } from '../context/SettingsSearchContext';
+import { useInSettingsSearchRegion, useSettingsSearch } from '../context/SettingsSearchContext';
 import { useSettingsBulkCollapse } from '../context/SettingsBulkCollapseContext';
 import { focusRing } from './fieldStyles';
 import ChevronCaret from './ChevronCaret';
@@ -74,16 +74,19 @@ function CollapsibleSection({
   const contentRef = useRef<HTMLDivElement>(null);
   const [maxHeight, setMaxHeight] = useState<string>(openState ? 'none' : '0px');
 
-  // Settings search: the Settings page publishes the set of matching section
-  // keys via context (null = no search); data-search-key on the card lets its
-  // scan find this section. Inert outside Settings (default null).
+  // Matching section keys (data-search-key on the card), null when no search is
+  // active or outside a page that provides the context.
   const matchKeys = useSettingsSearch();
   const searching = matchKeys !== null;
+  // A searchable region keeps collapsed children mounted (hidden) so the search can read their text.
+  const keepMounted = useInSettingsSearchRegion();
   const matchesSearch = searching && matchKeys.has(resolvedKey);
   const hiddenBySearch = searching && !matchesSearch;
   const expanded = searching ? matchesSearch : openState;
   let contentMaxHeight = maxHeight;
   if (searching) contentMaxHeight = matchesSearch ? 'none' : '0px';
+  // 'none' is fully open, '0px' collapsed, a pixel height mid-animation.
+  const animating = contentMaxHeight !== 'none' && contentMaxHeight !== '0px';
 
   // Settings bulk expand/collapse: Expand all / Collapse all bump `seq` on
   // each click, telling every section to snap to `open`. Goes through the
@@ -182,14 +185,15 @@ function CollapsibleSection({
         </div>
       </div>
 
+      {/* Clip only while collapsed or animating, so an open body does not cut off a focus ring. */}
       <div
         ref={contentRef}
         inert={!expanded}
         style={{ maxHeight: contentMaxHeight }}
-        className={`overflow-hidden ${!searching && maxHeight !== 'none' && maxHeight !== '0px' ? 'transition-[max-height] duration-300 ease-in-out' : ''}`}
+        className={`${contentMaxHeight !== 'none' ? 'overflow-hidden' : ''} ${animating ? 'transition-[max-height] duration-300 ease-in-out' : ''}`}
       >
         <div className="px-4 pb-4 sm:px-6 sm:pb-6">
-          {(!unmountWhenClosed || openState || matchesSearch) && children}
+          {(!unmountWhenClosed || keepMounted || openState || matchesSearch) && children}
         </div>
       </div>
     </div>

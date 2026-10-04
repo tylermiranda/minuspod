@@ -38,10 +38,8 @@ _test_data_dir = bootstrap(
 
 import main_app.processing as processing
 from audio_processor import AudioProcessor
-from config import SEGMENT_CATEGORIES, DEFAULT_SEGMENT_ACTION
-
-ALL_REMOVE = {cat: DEFAULT_SEGMENT_ACTION for cat in SEGMENT_CATEGORIES}
-
+from config import DEFAULT_SEGMENT_ACTION
+from tests.unit.recut_test_utils import ALL_REMOVE
 
 class TestPartitionCutActions:
     """Direct unit tests of the partition helper: no ffmpeg, no pipeline."""
@@ -121,7 +119,7 @@ def _cross_promo_ad():
            'confidence': 0.95, 'detection_stage': 'llm'}
 
 
-def _run_pipeline(first_pass_ads, segment_actions):
+def _run_pipeline(first_pass_ads, segment_actions, feed_actions=None):
     """Drive process_episode's full pass-1 flow with every stage but the
     cut partition itself mocked out (mirrors test_keep_bypass.py's
     harness). Returns the recorded mocks so tests can inspect what the
@@ -130,7 +128,7 @@ def _run_pipeline(first_pass_ads, segment_actions):
     podcast_row = {'id': 1, 'slug': 'cut-feed', 'description': None,
                    'tags': None, 'dai_platform': None,
                    'passthrough_enabled': None, 'skip_ad_detection': None,
-                   'detection_mode': None}
+                   'detection_mode': None, 'segment_category_actions': feed_actions}
 
     def _fake_refine_and_validate(slug, episode_id, all_ads, *a, **k):
         for ad in all_ads:
@@ -184,7 +182,7 @@ def _run_pipeline(first_pass_ads, segment_actions):
         audio_processor_mod.get_audio_duration.return_value = 100.0
         local_ap = local_ap_cls.return_value
         local_ap.process_episode.side_effect = (
-            lambda audio_path, segs, cut_barriers=None: ('/tmp/cutpart-cut.mp3', list(segs)))
+            lambda audio_path, segs, cut_barriers=None, hard_barriers=None: ('/tmp/cutpart-cut.mp3', list(segs)))
         local_ap.get_audio_duration.return_value = 100.0
         storage.get_episode_path.return_value = '/tmp/cutpart-final.mp3'
 
@@ -231,6 +229,19 @@ class TestProcessEpisodePartitionIntegration:
         assert all(s['beep'] is False for s in audio_segments)
         saved = m['storage'].save_combined_ads.call_args.args[2]
         assert all(a['action_applied'] == 'remove' for a in saved)
+
+
+    def test_resolved_action_map_is_logged_once_with_feed_overrides(self, caplog):
+        actions = dict(ALL_REMOVE, self_promo='keep')
+
+        with caplog.at_level('INFO', logger='podcast.audio'):
+            _run_pipeline([_sponsor_ad()], actions, feed_actions='{"self_promo": "keep"}')
+
+        lines = [r.getMessage() for r in caplog.records
+                 if 'Segment action map' in r.getMessage()]
+        assert len(lines) == 1
+        assert 'self_promo=keep' in lines[0] and 'sponsor=remove' in lines[0]
+        assert lines[0].endswith('feed overrides: self_promo')
 
 
 @pytest.mark.skipif(shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None,
@@ -378,7 +389,7 @@ class TestRecutPreservesBeepAction:
             storage = p(processing, 'storage')
             p(processing, 'status_service')
             p(processing, '_build_recut_ad_list',
-              return_value=([marker], [marker]))
+              return_value=([marker], [marker], [], []))
             p(processing, '_generate_assets')
             p(processing, '_finalize_episode')
 

@@ -83,10 +83,10 @@ export function useDetectionCorrections({ stopAudition, onSettled }: Options) {
   });
 
   // Confirming a detection that was left in the audio has to cut it, so the
-  // recut needs the retained original.
-  const approve = (d: ReviewDetection) => mutation.mutate({
+  // recut needs the retained original. The modal's sponsor names the learned pattern (#804).
+  const approve = (d: ReviewDetection, sponsor?: string) => mutation.mutate({
     d,
-    correction: { type: 'confirm', original_ad: originalAdOf(d) },
+    correction: { type: 'confirm', original_ad: originalAdOf(d), sponsor },
   });
 
   // Rejecting one that was cut has to put the audio back, which also needs the

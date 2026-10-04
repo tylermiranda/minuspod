@@ -1,16 +1,122 @@
 """Unit tests for AdValidator class."""
+import json
+import logging
 import pytest
 import sys
 import os
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'src'))
 
-from ad_validator import AdValidator, Decision, ValidationResult
+from ad_validator import AdValidator, Decision, ValidationResult, user_trimmed_keep_ranges
+from audio_processor import AudioProcessor
+from sponsor_service import SponsorService
+from utils.markers import carve_fragment, learning_bounds, mark_distinct_merge
+from utils.text import word_boundary_re
+from tests.unit.marker_test_utils import RegistryStub, registry_confirms
 from config import (
     HOLD_REASON_MAX_DURATION, HOLD_REASON_NO_CUE,
     HOLD_REASON_UNCORROBORATED_TAIL,
+    HOLD_REASON_ESTIMATED_PATTERN,
     HOLD_REASON_CUE_TEMPLATE_UNPROVEN, HOLD_REASON_CUE_LOW_CONFIDENCE,
 )
+
+
+def test_newer_confirmation_supersedes_only_reviewed_trim_audio():
+    corrections = [
+        {'start': 100.5, 'end': 101.2},
+        {'start': 100.0, 'end': 160.0,
+         'confirmed_span': {'start': 101.7, 'end': 160.0}},
+    ]
+    assert user_trimmed_keep_ranges(corrections) == [
+        {'start': 100.0, 'end': 100.5},
+        {'start': 101.2, 'end': 101.7},
+    ]
+    assert user_trimmed_keep_ranges(corrections[1:]) == [
+        {'start': 100.0, 'end': 101.7},
+    ]
+    extended = [
+        {'start': 101.4, 'end': 102.0,
+         'confirmed_span': {'start': 100.4, 'end': 102.0}},
+        corrections[1],
+    ]
+    assert user_trimmed_keep_ranges(extended) == [
+        {'start': 100.0, 'end': 100.4},
+    ]
+    later_approved = [
+        {'start': 100.0, 'end': 101.7}, corrections[1],
+    ]
+    result = AdValidator(
+        episode_duration=600.0, confirmed_corrections=later_approved,
+    ).validate([{
+        'start': 100.0, 'end': 101.7, 'confidence': 0.2,
+        'reason': 'A newly approved sponsor read',
+        '_user_kept_by_trim': True,
+    }])
+    assert result.ads[0]['validation']['decision'] == Decision.ACCEPT.value
+
+
+def test_auto_filed_confirm_neither_protects_nor_releases_audio():
+    user_trim = {'start': 100.0, 'end': 160.0,
+                 'confirmed_span': {'start': 110.0, 'end': 160.0}}
+    auto = {'start': 90.0, 'end': 160.0, 'auto_filed': True,
+            'confirmed_span': {'start': 105.0, 'end': 160.0}}
+
+    assert user_trimmed_keep_ranges([auto]) == []
+    assert user_trimmed_keep_ranges([auto, user_trim]) == [
+        {'start': 100.0, 'end': 110.0}]
+
+
+def test_auto_filed_confirm_holds_what_it_trims_off_a_fresh_detection():
+    auto = {'start': 3492.9, 'end': 3680.7, 'auto_filed': True,
+            'hold_reason': HOLD_REASON_ESTIMATED_PATTERN, 'correction_type': 'confirm',
+            'confirmed_span': {'start': 3544.2, 'end': 3573.2}}
+    detected = {'start': 3492.9, 'end': 3680.7, 'confidence': 0.95,
+                'reason': 'Acme sponsor read', 'detection_stage': 'claude'}
+
+    ads = AdValidator(episode_duration=4000.0,
+                      confirmed_corrections=[auto]).validate([detected]).ads
+
+    held = [(a['start'], a['end']) for a in ads if a.get('held_for_review')]
+    assert held == [(3492.9, 3544.2), (3573.2, 3680.7)]
+    assert all(a['hold_reason'] == HOLD_REASON_ESTIMATED_PATTERN
+               and a['pass2_hold_remainder'] for a in ads if a.get('held_for_review'))
+    assert [(a['start'], a['end']) for a in ads
+            if a['validation']['decision'] == Decision.ACCEPT.value] == [(3544.2, 3573.2)]
+
+
+def test_saved_trim_blocks_subsecond_render_merge():
+    ranges = user_trimmed_keep_ranges([{
+        'start': 100.0, 'end': 160.0,
+        'confirmed_span': {'start': 100.0, 'end': 159.7},
+    }])
+    cuts = AudioProcessor().compute_applied_cuts(
+        [{'start': 100.0, 'end': 159.7},
+         {'start': 160.0, 'end': 190.0}],
+        600.0, cut_barriers=ranges)
+    assert [(cut['start'], cut['end']) for cut in cuts] == [
+        (100.0, 159.7), (160.0, 190.0),
+    ]
+
+
+def _confirm_scans_for_far_ad(trims):
+    corrections = [{'start': lo, 'end': lo + 60.0, 'confirmed_span': {'start': lo + 10.0, 'end': lo + 60.0}}
+                   for lo in (100.0, 200.0, 400.0)[:trims]]
+    validator = AdValidator(episode_duration=1000.0, confirmed_corrections=corrections)
+    scans = []
+    real = validator._matching_confirmed
+    validator._matching_confirmed = lambda start, end, **kw: (
+        scans.append((start, end)) or real(start, end, **kw))
+    result = validator.validate([
+        {'start': 105.0, 'end': 130.0, 'confidence': 0.95, 'reason': 'Acme sponsor read'},
+        {'start': 600.0, 'end': 630.0, 'confidence': 0.95, 'reason': 'Acme sponsor read'}])
+    return scans.count((600.0, 630.0)), [(a['start'], a['end']) for a in result.ads]
+
+
+def test_trim_split_scans_confirms_only_for_ads_the_trim_overlaps():
+    one_count, one_ads = _confirm_scans_for_far_ad(1)
+    three_count, three_ads = _confirm_scans_for_far_ad(3)
+    assert one_count == three_count
+    assert one_ads == three_ads
 
 
 class TestAdValidatorDuration:
@@ -555,6 +661,42 @@ class TestNotAdPatternsRegex:
 
         assert result.rejected == 1
 
+    def test_word_ending_in_no_not_matched(self):
+        """Regression: 'Casino ad' must NOT read as 'no ad'."""
+        validator = AdValidator(episode_duration=600.0, segments=[])
+
+        for reason in ('Hard Rock Bet Casino ad followed by an audiobook promo',
+                       'Mid-roll break including Hard Rock Bet Casino advertisement',
+                       'Hard Rock Bet Casino sponsorship and audiobook promo'):
+            ad = {
+                'start': 100.0,
+                'end': 200.0,
+                'confidence': 0.99,
+                'reason': reason,
+            }
+
+            result = validator.validate([ad])
+
+            assert result.rejected == 0, f"{reason!r} should not be rejected"
+            assert not any('not an ad' in f for f in result.ads[0]['validation']['flags'])
+
+    def test_no_ad_still_matched(self):
+        """'no ad' / 'no sponsor' as whole words MUST still trigger rejection."""
+        validator = AdValidator(episode_duration=600.0, segments=[])
+
+        for reason in ('There is no ad in this window',
+                       'No sponsor read here, just the host'):
+            ad = {
+                'start': 100.0,
+                'end': 200.0,
+                'confidence': 0.80,
+                'reason': reason,
+            }
+
+            result = validator.validate([ad])
+
+            assert result.rejected == 1, f"{reason!r} should be rejected"
+
     def test_not_an_ad_still_matched(self):
         """'not an ad' MUST still trigger rejection."""
         validator = AdValidator(episode_duration=600.0, segments=[])
@@ -615,6 +757,58 @@ class TestConfirmedCorrections:
         assert result.ads[0]['validation']['adjusted_confidence'] == 1.0
         assert result.ads[0]['validation']['user_confirmed'] is True
 
+    def test_confirmed_span_survives_small_redetection_drift_and_splice_veto(self):
+        validator = AdValidator(
+            episode_duration=12000.0,
+            segments=[],
+            confirmed_corrections=[{'start': 100.4, 'end': 290.4}],
+            splice_veto_enabled=True,
+            veto_min_cut_seconds=60.0,
+        )
+        ad = {
+            'start': 100.38,
+            'end': 290.36,
+            'confidence': 0.97,
+            'reason': 'Confirmed sponsor segment',
+            'detection_stage': 'claude',
+        }
+
+        result = validator.validate([ad], audio_analysis={
+            'splice_evidence': {'calibration': {'status': 'calibrated'}, 'events': []},
+        })
+
+        assert result.accepted == 1
+        assert result.ads[0]['validation']['user_confirmed'] is True
+        assert result.ads[0]['start'] == 100.4
+        assert result.ads[0]['end'] == 290.36
+        assert result.ads[0]['validation']['confirmed_span'] == {
+            'start': 100.4, 'end': 290.36}
+        assert not result.ads[0].get('held_for_review')
+
+    def test_plain_confirm_clamps_boundary_drift_beyond_rounding(self):
+        validator = AdValidator(
+            episode_duration=12000.0,
+            segments=[],
+            confirmed_corrections=[{'start': 100.4, 'end': 290.4}],
+            splice_veto_enabled=True,
+            veto_min_cut_seconds=60.0,
+        )
+        ad = {
+            'start': 100.34,
+            'end': 290.4,
+            'confidence': 0.97,
+            'reason': 'Confirmed sponsor segment',
+            'detection_stage': 'claude',
+        }
+
+        result = validator.validate([ad], audio_analysis={
+            'splice_evidence': {'calibration': {'status': 'calibrated'}, 'events': []},
+        })
+
+        assert result.ads[0]['validation']['decision'] == Decision.ACCEPT.value
+        assert result.ads[0]['validation']['user_confirmed'] is True
+        assert (result.ads[0]['start'], result.ads[0]['end']) == (100.4, 290.4)
+
     def test_plain_confirm_does_not_authorize_restored_dai_edges(self):
         validator = AdValidator(
             episode_duration=300.0,
@@ -632,11 +826,10 @@ class TestConfirmedCorrections:
 
         result = validator.validate([narrowed_ad])
 
-        assert result.ads[0]['start'] == 100.0
-        assert result.ads[0]['end'] == 160.0
-        assert 'user_confirmed' not in result.ads[0]['validation']
-        assert 'INFO: User confirmation covers only part of segment' in (
-            result.ads[0]['validation']['flags'])
+        assert (result.ads[0]['start'], result.ads[0]['end']) == (120.0, 140.0)
+        assert result.ads[0]['dai_core_spans'] == [
+            {'start': 120.0, 'end': 140.0}]
+        assert result.ads[0]['validation']['user_confirmed'] is True
         assert '_pre_dai_restore_confirmed_correction' not in result.ads[0]
 
     def test_trimmed_confirm_remains_authoritative_after_dai_core_restoration(self):
@@ -667,7 +860,7 @@ class TestConfirmedCorrections:
             {'start': 120.0, 'end': 140.0}]
         assert result.ads[0]['validation']['user_confirmed'] is True
 
-    def test_confirm_is_not_preserved_across_unrelated_tail_extension(self):
+    def test_plain_confirm_blocks_unrelated_tail_extension(self):
         validator = AdValidator(
             episode_duration=200.0,
             segments=[],
@@ -682,10 +875,9 @@ class TestConfirmedCorrections:
 
         result = validator.validate([ad])
 
-        assert result.accepted == 0
-        assert result.ads[0]['end'] == 200.0
-        assert 'INFO: User confirmed as ad' not in (
-            result.ads[0]['validation']['flags'])
+        assert result.accepted == 1
+        assert result.ads[0]['end'] == 170.0
+        assert result.ads[0]['validation']['user_confirmed'] is True
 
     def test_trimmed_confirm_survives_trailing_extension(self):
         validator = AdValidator(
@@ -1030,8 +1222,7 @@ class TestConfirmedCorrections:
         assert 'end_extended_by_content' not in out
         assert 'tail_splice_snap' not in out
 
-    def test_plain_confirm_does_not_clamp(self):
-        """A confirm without confirmed_span accepts the ad at its own bounds."""
+    def test_plain_confirm_clamps_outside_audio(self):
         confirmed = [{'start': 100.0, 'end': 200.0}]
 
         validator = AdValidator(
@@ -1044,10 +1235,12 @@ class TestConfirmedCorrections:
         result = validator.validate([ad])
 
         assert result.accepted == 1
-        assert result.ads[0]['start'] == 98.0
-        assert result.ads[0]['end'] == 202.0
+        assert result.ads[0]['start'] == 100.0
+        assert result.ads[0]['end'] == 200.0
+        assert result.ads[0]['validation']['confirmed_span'] == {
+            'start': 100.0, 'end': 200.0}
 
-    def test_plain_confirm_partly_covering_low_confidence_ad_requires_review(self):
+    def test_plain_confirm_preserves_unapproved_low_confidence_audio(self):
         validator = AdValidator(
             episode_duration=600.0,
             segments=[],
@@ -1060,12 +1253,13 @@ class TestConfirmedCorrections:
             'reason': 'Wider low-confidence re-detection',
         }
 
-        out = validator.validate([ad]).ads[0]
+        result = validator.validate([ad])
 
-        assert out['validation']['decision'] == Decision.REVIEW.value
-        assert 'user_confirmed' not in out['validation']
-        assert 'INFO: User confirmation covers only part of segment' in (
-            out['validation']['flags'])
+        assert [(a['start'], a['end']) for a in result.ads] == [
+            (100.0, 130.0), (130.0, 160.0)]
+        assert result.ads[0]['validation']['user_confirmed'] is True
+        assert result.ads[1]['validation']['decision'] != Decision.ACCEPT.value
+        assert not result.ads[1]['validation'].get('user_confirmed')
 
     def test_no_intersection_with_confirmed_span_is_not_auto_accepted(self):
         """A re-detection entirely inside user-kept content must not be
@@ -1154,15 +1348,15 @@ class TestConfirmedCorrections:
              'reason': 'New adjacent candidate'},
         ]
 
-        out = validator.validate(ads).ads[0]
+        approved, adjacent = validator.validate(ads).ads
 
-        assert out['start'] == 100.0
-        assert out['end'] == 160.0
-        assert out['merged_distinct_ads'] is True
-        assert out['validation']['decision'] == Decision.ACCEPT.value
-        assert 'user_confirmed' not in out['validation']
+        assert (approved['start'], approved['end']) == (100.0, 130.0)
+        assert approved['validation']['user_confirmed'] is True
+        assert (adjacent['start'], adjacent['end']) == (132.0, 160.0)
+        assert adjacent['validation']['decision'] == Decision.ACCEPT.value
+        assert not adjacent['validation'].get('user_confirmed')
 
-    def test_partial_confirm_does_not_authorize_wider_unmerged_detection(self):
+    def test_partial_confirm_validates_wider_unmerged_detection_separately(self):
         validator = AdValidator(
             episode_duration=600.0,
             segments=[],
@@ -1175,12 +1369,13 @@ class TestConfirmedCorrections:
             'reason': 'Wider re-detection without merge metadata',
         }
 
-        out = validator.validate([ad]).ads[0]
+        approved, outside = validator.validate([ad]).ads
 
-        assert out['validation']['decision'] == Decision.ACCEPT.value
-        assert 'user_confirmed' not in out['validation']
-        assert 'INFO: User confirmation covers only part of segment' in (
-            out['validation']['flags'])
+        assert (approved['start'], approved['end']) == (100.0, 130.0)
+        assert approved['validation']['user_confirmed'] is True
+        assert (outside['start'], outside['end']) == (130.0, 160.0)
+        assert not outside['validation'].get('user_confirmed')
+        assert outside['_skip_pattern_learning'] is True
 
     def test_newer_trimmed_confirm_preferred_over_older_plain(self):
         """The newest correction is authoritative for the same range."""
@@ -1251,7 +1446,7 @@ class TestConfirmedCorrections:
 class TestAdValidatorVadGapVerification:
     """Tests for vad_gap-specific transcript verification.
 
-    Regression: MacBreak Weekly 1021 (5ef2df166c8e) produced 8 vad_gap
+    Regression: one episode (b2c3d4e5f6a1) produced 8 vad_gap
     markers carrying 'WARN: No ad signals in transcript' that were ACCEPTed
     at adjusted confidence 0.80. Validator must not auto-cut a vad_gap
     marker that has no corroborating sponsor or ad-signal pattern in range.
@@ -1753,7 +1948,7 @@ class TestAudioCorroborationSource:
 
 
 class TestVadGapClampBypass:
-    """TWiT 1091 regression (this-week-in-tech-audio/b37bf6df81a5): a DAI
+    """Regression (example-podcast/a1b2c3d4e5f6): a DAI
     post-roll played ~15 dB quieter, Whisper VAD dropped it, and the vad_gap
     marker covering it (0.75 + 0.05 POST_ROLL boost = 0.80) was clamped to
     0.79 because untranscribed audio can never show ad signals in transcript.
@@ -1850,7 +2045,7 @@ class TestVadGapClampBypass:
 class TestUncorroboratedTailHold:
     """Spec 1.3: a vad_gap marker at the episode tail (end within 5s of EOF)
     that stays REVIEW and uncorroborated is held for review, so it lands in
-    the pending-review UI instead of shipping silently (TWiT 1091 shipped
+    the pending-review UI instead of shipping silently (one episode shipped
     with pendingReviewCount=0).
     """
 
@@ -2116,14 +2311,6 @@ def test_merge_preserves_vad_adjacency_extension_limit():
     assert merged[1]['start'] == 202.0
 
 
-def _all_offsets(text, needle):
-    """Every start offset of `needle` in `text`."""
-    pos = text.find(needle)
-    while pos != -1:
-        yield pos
-        pos = text.find(needle, pos + 1)
-
-
 class TestRegistryConfirmsLongAds:
     """A real multi-sponsor break was rejected on length alone.
 
@@ -2149,42 +2336,35 @@ class TestRegistryConfirmsLongAds:
         return {'start': 1692.8, 'end': 2066.3, 'confidence': 0.8,
                 'reason': 'Wayfair, Warby Parker: ad break', 'detection_stage': 'claude'}
 
-    class _Registry:
-        """Stands in for the seeded registry: both brands in ADS_TEXT are
-        seed sponsors, and 'warbyparker.com' matches the spaced name too."""
-
-        VARIANTS = {'Wayfair': ('wayfair',),
-                    'Warby Parker': ('warby parker', 'warbyparker')}
-
-        def brand_mention_offsets(self, text):
-            low = (text or '').lower()
-            found = {}
-            for name, variants in self.VARIANTS.items():
-                offsets = sorted(
-                    pos for variant in variants
-                    for pos in _all_offsets(low, variant))
-                if offsets:
-                    found[name] = offsets
-            return found
+    # Both brands in ADS_TEXT are seed sponsors; 'warbyparker.com' matches the spaced name too.
+    _REGISTRY = RegistryStub({'Wayfair': ('wayfair',),
+                              'Warby Parker': ('warby parker', 'warbyparker')})
 
     def test_long_break_is_held_without_the_registry(self):
         v = AdValidator(3700.0, self._segments(), episode_description='',
                         min_cut_confidence=0.80)
-        ad = v.validate([self._ad()]).ads[0]
+        ad = v.validate([dict(self._ad(), reason='ad break')]).ads[0]
         assert ad['validation']['decision'] == 'REVIEW'
         assert ad.get('held_for_review')
 
     def test_the_registry_confirms_it_and_it_is_accepted(self):
         v = AdValidator(3700.0, self._segments(), episode_description='',
-                        min_cut_confidence=0.80, sponsor_service=self._Registry())
-        result = v.validate([self._ad()])
+                        min_cut_confidence=0.80, sponsor_service=self._REGISTRY)
+        ad = dict(self._ad(), reason='ad break')
+        assert v._sponsor_confirmation_source(ad) == 'registry'
+        result = v.validate([ad])
         assert result.ads[0]['validation']['decision'] == 'ACCEPT'
+
+    def test_a_reason_named_sponsor_needs_spoken_framing(self):
+        v = AdValidator(3700.0, self._segments(), episode_description='',
+                        min_cut_confidence=0.80)
+        assert v._sponsor_confirmation_source(self._ad()) is None
 
     def test_a_break_naming_no_known_sponsor_is_not_cut(self):
         segs = self._segments()
         segs[1]['text'] = 'just a very long stretch of ordinary conversation ' * 12
         v = AdValidator(3700.0, segs, episode_description='',
-                        min_cut_confidence=0.80, sponsor_service=self._Registry())
+                        min_cut_confidence=0.80, sponsor_service=self._REGISTRY)
         ad = v.validate([self._ad()]).ads[0]
         assert ad['validation']['decision'] != 'ACCEPT'
 
@@ -2194,8 +2374,8 @@ class TestRegistryConfirmsLongAds:
         segs = self._segments()
         segs[1]['text'] = 'ordinary conversation with no brand named at all ' * 12
         v = AdValidator(3700.0, segs, episode_description='',
-                        min_cut_confidence=0.80, sponsor_service=self._Registry())
-        assert v._is_sponsor_confirmed(self._ad()) is False
+                        min_cut_confidence=0.80, sponsor_service=self._REGISTRY)
+        assert v._sponsor_confirmation_source(self._ad()) is None
 
     def test_a_registry_failure_does_not_break_validation(self):
         class Boom:
@@ -2204,7 +2384,8 @@ class TestRegistryConfirmsLongAds:
 
         v = AdValidator(3700.0, self._segments(), episode_description='',
                         min_cut_confidence=0.80, sponsor_service=Boom())
-        assert v.validate([self._ad()]).ads[0]['validation']['decision'] != 'ACCEPT'
+        ad = dict(self._ad(), reason='ad break')
+        assert v.validate([ad]).ads[0]['validation']['decision'] != 'ACCEPT'
 
 
 class TestConfigurableDurationCeilings:
@@ -2312,44 +2493,668 @@ class TestRegistryNeedsMoreThanOneMention:
     """A misdetected span of several minutes will often contain one organic
     brand mention; that is not a sponsor read."""
 
-    class _Registry:
-        def brand_mention_offsets(self, text):
-            offsets = list(_all_offsets((text or '').lower(), 'acme'))
-            return {'Acme': offsets} if offsets else {}
+    _REGISTRY = RegistryStub({'Acme': ('acme',)})
 
     def _validator(self, ad_text):
         segments = [{'start': 0.0, 'end': 400.0, 'text': ad_text}]
         return AdValidator(3600.0, segments, episode_description='',
                            min_cut_confidence=0.80,
-                           sponsor_service=self._Registry())
+                           sponsor_service=self._REGISTRY)
 
     def test_a_single_passing_mention_does_not_confirm(self):
         v = self._validator('we talked about Acme once today and then moved on')
-        assert v._registry_confirms({'start': 0.0, 'end': 400.0}) is False
+        assert registry_confirms(v, {'start': 0.0, 'end': 400.0}) is False
 
     def test_a_repeated_mention_confirms(self):
         v = self._validator('Acme protects you. Go to Acme dot com slash pod '
                             'for twenty percent off your first order')
-        assert v._registry_confirms({'start': 0.0, 'end': 400.0}) is True
+        assert registry_confirms(v, {'start': 0.0, 'end': 400.0}) is True
 
     def test_one_mention_each_of_two_brands_does_not_confirm(self):
         """Summed across brands, two name-drops in a long span read as a
         sponsor read. One brand has to be named twice."""
-        class _TwoBrands:
-            def brand_mention_offsets(self, text):
-                found = {}
-                for name in ('Slack', 'Zoom'):
-                    offsets = list(_all_offsets((text or '').lower(), name.lower()))
-                    if offsets:
-                        found[name] = offsets
-                return found
-
         segments = [{'start': 0.0, 'end': 400.0,
                      'text': 'we moved the Slack thread into a Zoom call'}]
         v = AdValidator(3600.0, segments, episode_description='',
-                        min_cut_confidence=0.80, sponsor_service=_TwoBrands())
+                        min_cut_confidence=0.80, sponsor_service=RegistryStub({'Slack': ('slack',), 'Zoom': ('zoom',)}))
 
-        assert v._registry_confirms({'start': 0.0, 'end': 400.0}) is False
+        assert registry_confirms(v, {'start': 0.0, 'end': 400.0}) is False
+
+
+def test_registry_confirmation_names_expected_advertiser_in_commercial_text(temp_db):
+    temp_db.create_known_sponsor('Example Cloud')
+    temp_db.create_known_sponsor('Widget Labs')
+    registry = SponsorService(temp_db)
+    segments = [
+        {'start': 100.0, 'end': 120.0,
+         'text': 'Widget Labs launched a product. Widget Labs issued a recall.'},
+        {'start': 120.0, 'end': 140.0,
+         'text': 'The Widget Labs report says visit example.com for details.'},
+    ]
+    validator = AdValidator(3600.0, segments, episode_description='',
+                            sponsor_service=registry)
+    candidate = {'start': 100.0, 'end': 140.0, 'sponsor': 'Example Cloud'}
+    assert registry_confirms(validator, candidate) is False
+
+    segments[0]['text'] = ('Example Cloud makes support simpler. '
+                           'Visit examplecloud.com for a free trial.')
+    segments[1]['text'] = 'Use code PODCAST at Example Cloud to save.'
+    assert registry_confirms(validator, candidate) is True
+
+    segments[0]['text'] = ('Example Cloud announced a filing. '
+                           'Example Cloud shares rose on the news.')
+    segments[1]['text'] = 'The hosts discuss the report and its impact.'
+    assert registry_confirms(validator, candidate) is False
+
+    segments[1]['text'] = 'See the link in our show notes for the report.'
+    assert registry_confirms(validator, candidate) is False
+
+    segments[1]['text'] = 'This next break is sponsored by Widget Labs.'
+    assert registry_confirms(validator, candidate) is False
+
+    segments[1]['text'] = 'Widget Labs offers a free trial this week.'
+    assert registry_confirms(validator, candidate) is False
+
+
+def test_description_confirmation_requires_expected_brand_and_local_pitch(temp_db):
+    temp_db.create_known_sponsor('Example Cloud', aliases=['EC Support'])
+    temp_db.create_known_sponsor('Widget Labs')
+    segments = [
+        {'start': 100.0, 'end': 120.0,
+         'text': 'Example Cloud helps teams. Visit examplecloud.com today.'},
+        {'start': 120.0, 'end': 140.0,
+         'text': 'Widget Labs announced results. Widget Labs shares rose.'},
+    ]
+    validator = AdValidator(3600.0, segments, episode_description='',
+                            sponsor_service=SponsorService(temp_db))
+    validator._description_sponsor_re = word_boundary_re(('Example Cloud',))
+
+    assert validator._sponsor_confirmation_source({
+        'start': 100.0, 'end': 140.0, 'sponsor': 'Widget Labs',
+        'reason': 'Sponsor read'}) is None
+    assert validator._sponsor_confirmation_source({
+        'start': 100.0, 'end': 120.0, 'sponsor': 'EC Support',
+        'reason': 'Sponsor read'}) == 'transcript'
+
+    segments[0]['text'] = ('Example Cloud announced results. '
+                           'Example Cloud shares rose.')
+    assert validator._sponsor_confirmation_source({
+        'start': 100.0, 'end': 120.0, 'sponsor': 'EC Support',
+        'reason': 'Sponsor read'}) is None
+
+
+def test_commercial_signal_before_partial_segment_is_not_confirmation(temp_db):
+    temp_db.create_known_sponsor('Example Cloud')
+    text = ('Visit examplecloud.com today. Example Cloud announced results. '
+            'Example Cloud shares rose.')
+    words = [
+        {'start': 100.0 + index if index < 3 else 120.0 + index - 3,
+         'end': 100.5 + index if index < 3 else 120.5 + index - 3,
+         'word': token}
+        for index, token in enumerate(text.split())
+    ]
+    segments = [{'start': 100.0, 'end': 140.0, 'text': text, 'words': words}]
+    validator = AdValidator(3600.0, segments, episode_description='',
+                            sponsor_service=SponsorService(temp_db))
+    validator._description_sponsor_re = word_boundary_re(('Example Cloud',))
+    candidate = {'start': 115.0, 'end': 140.0, 'sponsor': 'Example Cloud',
+                 'reason': 'Sponsor read'}
+
+    assert registry_confirms(validator, candidate) is False
+    assert validator._sponsor_confirmation_source(candidate) is None
+
+    segments[0].pop('words')
+    assert registry_confirms(validator, candidate) is False
+
+
+def test_brand_mentions_before_partial_segment_do_not_confirm(temp_db):
+    temp_db.create_known_sponsor('Example Cloud')
+    text = ('Example Cloud announced results. Example Cloud helps teams. '
+            'Use code PODCAST for a free trial.')
+    words = [
+        {'start': 100.0 + index if index < 4 else 120.0 + index - 4,
+         'end': 100.5 + index if index < 4 else 120.5 + index - 4,
+         'word': token}
+        for index, token in enumerate(text.split())
+    ]
+    segments = [{'start': 100.0, 'end': 140.0, 'text': text, 'words': words}]
+    validator = AdValidator(3600.0, segments, episode_description='',
+                            sponsor_service=SponsorService(temp_db))
+    candidate = {'start': 115.0, 'end': 140.0, 'sponsor': 'Example Cloud',
+                 'reason': 'Sponsor read'}
+    assert registry_confirms(validator, candidate) is False
+
+    text = 'Example Cloud announced results. Visit widgetlabs.com for details.'
+    segments[0]['text'] = text
+    segments[0]['words'] = [
+        {'start': 100.0 + index if index < 4 else 120.0 + index - 4,
+         'end': 100.5 + index if index < 4 else 120.5 + index - 4,
+         'word': token}
+        for index, token in enumerate(text.split())
+    ]
+    validator._description_sponsor_re = word_boundary_re(('Example Cloud',))
+    assert validator._sponsor_confirmation_source(candidate) is None
+
+def _spans(result):
+    return [(ad['start'], ad['end']) for ad in result.ads]
+
+
+def test_auto_pattern_estimated_tail_is_held_without_full_independent_bounds():
+    validator = AdValidator(3600.0, [], splice_veto_enabled=False)
+    ad = {'start': 0.0, 'end': 175.0, 'confidence': 1.0,
+          'reason': 'Acme sponsor read', 'sponsor': 'Acme',
+          'detection_stage': 'fingerprint',
+          'fingerprint_match_start': 0.0, 'fingerprint_match_end': 60.0,
+          'has_estimated_pattern_member': True,
+          'merged_distinct_ads': True,
+          'merged_protected_start': 0.0, 'merged_protected_end': 90.0,
+          'merged_member_spans': [
+              {'start': 0.0, 'end': 60.0, 'stage': 'fingerprint',
+               'fingerprint_match_start': 0.0, 'fingerprint_match_end': 60.0},
+              {'start': 60.0, 'end': 90.0, 'stage': 'text_pattern',
+               'span_estimated': True},
+          ]}
+
+    result = validator.validate([ad])
+    assert _spans(result) == [(0.0, 90.0), (90.0, 175.0)]
+    cut, held = result.ads
+    assert cut['validation']['decision'] == Decision.ACCEPT.value
+    assert not cut.get('held_for_review')
+    assert held['validation']['decision'] == Decision.REVIEW.value
+    assert held['hold_reason'] == HOLD_REASON_ESTIMATED_PATTERN
+
+    # The fingerprint member counts only its match span, not the wider member.
+    wider_fingerprint = {**ad, 'merged_member_spans': [
+        {'start': 0.0, 'end': 175.0, 'stage': 'fingerprint',
+         'fingerprint_match_start': 0.0, 'fingerprint_match_end': 60.0},
+        ad['merged_member_spans'][1]]}
+    result = validator.validate([wider_fingerprint])
+    assert _spans(result) == [(0.0, 90.0), (90.0, 175.0)]
+    assert result.ads[1]['hold_reason'] == HOLD_REASON_ESTIMATED_PATTERN
+
+
+def test_validator_merge_preserves_estimated_pattern_risk():
+    validator = AdValidator(3600.0, [], splice_veto_enabled=False)
+    markers = [
+        {'start': 0.0, 'end': 60.0, 'confidence': 1.0,
+         'reason': 'Acme sponsor read', 'detection_stage': 'fingerprint',
+         'fingerprint_match_start': 0.0, 'fingerprint_match_end': 60.0},
+        {'start': 60.0, 'end': 117.0, 'confidence': 1.0,
+         'reason': 'Acme intro phrase', 'detection_stage': 'text_pattern',
+         'span_estimated': True, 'text_start': 60.0, 'text_end': 90.0,
+         'has_estimated_pattern_member': True},
+    ]
+
+    result = validator.validate(markers)
+    assert _spans(result) == [(0.0, 90.0), (90.0, 117.0)]
+    assert result.ads[0]['validation']['decision'] == Decision.ACCEPT.value
+    assert result.ads[1]['hold_reason'] == HOLD_REASON_ESTIMATED_PATTERN
+
+
+def _claude_then_estimate(claude_confidence=0.96, estimated_end=3680.7):
+    """A claude read merged with an auto pattern whose outro went unmatched."""
+    ad = {'start': 3492.9, 'end': 3544.2, 'confidence': claude_confidence,
+          'reason': 'Acme sponsor read', 'sponsor': 'Acme',
+          'detection_stage': 'claude'}
+    mark_distinct_merge(ad, {
+        'start': 3544.56, 'end': estimated_end, 'confidence': 0.95,
+        'detection_stage': 'text_pattern', 'span_estimated': True,
+        'text_start': 3544.56, 'text_end': 3573.2,
+        'has_estimated_pattern_member': True})
+    ad['end'] = estimated_end
+    ad['confidence'] = max(claude_confidence, 0.95)
+    return [ad]
+
+
+def test_estimated_tail_split_at_measured_claude_end():
+    validator = AdValidator(3800.0, [], splice_veto_enabled=False)
+
+    result = validator.validate(_claude_then_estimate())
+
+    assert _spans(result) == [(3492.9, 3573.2), (3573.2, 3680.7)]
+    cut, held = result.ads
+    assert cut['validation']['decision'] == Decision.ACCEPT.value
+    assert not cut.get('has_estimated_pattern_member')
+    assert not cut.get('span_estimated')
+    assert not cut.get('_skip_pattern_learning')
+    assert held['validation']['decision'] == Decision.REVIEW.value
+    assert held['held_for_review'] is True
+    assert held['hold_reason'] == HOLD_REASON_ESTIMATED_PATTERN
+    assert held['_skip_pattern_learning'] is True and held['_estimated_remainder'] is True
+    assert held['reason'].endswith(' (estimated pattern remainder)')
+
+
+def test_estimated_tail_split_logs_one_info_line(caplog):
+    validator = AdValidator(3800.0, [], splice_veto_enabled=False)
+
+    with caplog.at_level(logging.INFO, logger='ad_validator'):
+        validator.validate(_claude_then_estimate())
+
+    split_lines = [r.message for r in caplog.records
+                   if r.message.startswith('Split estimated pattern span')]
+    assert split_lines == [
+        'Split estimated pattern span 3492.9s-3680.7s: '
+        'cut 3492.9s-3573.2s, held 3573.2s-3680.7s']
+
+
+def test_estimated_split_log_says_none_when_remainders_are_short(caplog):
+    ad = {'start': 100.0, 'end': 160.0, 'confidence': 0.95,
+          'reason': 'Acme sponsor read', 'detection_stage': 'text_pattern',
+          'span_estimated': True, 'text_start': 100.0, 'text_end': 104.0,
+          'merged_protected_start': 103.0, 'merged_protected_end': 157.0,
+          'merged_member_spans': [
+              {'start': 103.0, 'end': 157.0, 'stage': 'claude',
+               'confidence': 0.95}]}
+
+    with caplog.at_level(logging.INFO, logger='ad_validator'):
+        AdValidator(3600.0, [], splice_veto_enabled=False).validate([ad])
+
+    assert [r.message for r in caplog.records
+            if r.message.startswith('Split estimated pattern span')] == [
+        'Split estimated pattern span 100.0s-160.0s: '
+        'cut 103.0s-157.0s, held none']
+
+
+def test_estimated_remainder_hold_log_gets_remainder_suffix(caplog):
+    validator = AdValidator(3800.0, [], splice_veto_enabled=False)
+
+    with caplog.at_level(logging.INFO, logger='ad_validator'):
+        validator.validate(_claude_then_estimate())
+
+    hold_lines = [r.message for r in caplog.records
+                  if r.message.startswith('Holding ad 3573.2s')]
+    assert hold_lines == [
+        'Holding ad 3573.2s-3680.7s for review: '
+        'estimated_pattern_bounds (remainder)']
+
+
+def test_estimate_inside_measured_span_not_held():
+    validator = AdValidator(3600.0, [], splice_veto_enabled=False)
+    ad = {'start': 100.0, 'end': 200.0, 'confidence': 0.95,
+          'reason': 'Acme sponsor read', 'detection_stage': 'claude',
+          'has_estimated_pattern_member': True,
+          'merged_distinct_ads': True,
+          'merged_protected_start': 100.0, 'merged_protected_end': 200.0,
+          'merged_member_spans': [
+              {'start': 100.0, 'end': 200.0, 'stage': 'claude',
+               'confidence': 0.95},
+              {'start': 150.0, 'end': 160.0, 'stage': 'text_pattern',
+               'span_estimated': True},
+          ]}
+
+    result = validator.validate([ad])
+
+    assert _spans(result) == [(100.0, 200.0)]
+    only = result.ads[0]
+    assert only['validation']['decision'] == Decision.ACCEPT.value
+    assert not only.get('has_estimated_pattern_member')
+    assert not only.get('span_estimated')
+
+
+def test_low_conf_claude_member_not_measured():
+    validator = AdValidator(3800.0, [], splice_veto_enabled=False)
+
+    result = validator.validate(_claude_then_estimate(claude_confidence=0.6))
+
+    assert _spans(result) == [(3492.9, 3680.7)]
+    assert result.ads[0]['hold_reason'] == HOLD_REASON_ESTIMATED_PATTERN
+
+
+def test_split_skipped_for_user_confirmed():
+    validator = AdValidator(
+        3800.0, [], splice_veto_enabled=False,
+        confirmed_corrections=[{'start': 3492.9, 'end': 3680.7,
+                                'correction_type': 'confirm'}])
+
+    result = validator.validate(_claude_then_estimate())
+
+    assert _spans(result) == [(3492.9, 3680.7)]
+    assert result.ads[0]['validation']['decision'] == Decision.ACCEPT.value
+    assert not result.ads[0].get('held_for_review')
+
+
+def test_rejected_tail_does_not_reject_measured_cut():
+    validator = AdValidator(
+        3800.0, [], splice_veto_enabled=False,
+        false_positive_corrections=[{'start': 3573.2, 'end': 3680.7}])
+
+    result = validator.validate(_claude_then_estimate())
+
+    assert _spans(result) == [(3492.9, 3573.2), (3573.2, 3680.7)]
+    decisions = [ad['validation']['decision'] for ad in result.ads]
+    assert decisions == [Decision.ACCEPT.value, Decision.REJECT.value]
+
+
+@pytest.mark.parametrize('gap_text,expected', [
+    pytest.param('', [(100.0, 200.0), (200.0, 260.0)], id='silent_gap_bridged'),
+    pytest.param('host chat', [(100.0, 140.0), (140.0, 260.0)], id='speech_gap_stops'),
+])
+def test_measured_cover_bridges_only_mergeable_gaps(gap_text, expected):
+    segments = [{'start': 100.0, 'end': 140.0, 'text': 'sponsor read'},
+                {'start': 140.0, 'end': 160.0, 'text': gap_text},
+                {'start': 160.0, 'end': 260.0, 'text': 'sponsor read'}]
+    validator = AdValidator(3600.0, segments, splice_veto_enabled=False)
+    ad = {'start': 100.0, 'end': 140.0, 'confidence': 0.95,
+          'reason': 'Acme sponsor read', 'detection_stage': 'claude'}
+    mark_distinct_merge(ad, {'start': 160.0, 'end': 200.0, 'confidence': 0.95,
+                             'detection_stage': 'claude'})
+    mark_distinct_merge(ad, {'start': 180.0, 'end': 260.0,
+                             'detection_stage': 'text_pattern',
+                             'span_estimated': True, 'text_start': 180.0,
+                             'text_end': 190.0})
+    ad['end'] = 260.0
+    ad['has_estimated_pattern_member'] = True
+
+    assert _spans(validator.validate([ad])) == expected
+
+
+def test_tail_approval_then_reprocess_cuts_measured_read():
+    validator = AdValidator(
+        3800.0, [], splice_veto_enabled=False,
+        confirmed_corrections=[{'start': 3573.2, 'end': 3680.7,
+                                'correction_type': 'confirm'}])
+
+    result = validator.validate(_claude_then_estimate())
+
+    by_span = {(ad['start'], ad['end']): ad for ad in result.ads}
+    assert set(by_span) == {(3492.9, 3573.2), (3573.2, 3680.7)}
+    tail = by_span[(3573.2, 3680.7)]
+    assert tail['validation']['decision'] == Decision.ACCEPT.value
+    assert tail['validation']['user_confirmed'] is True
+    measured = by_span[(3492.9, 3573.2)]
+    assert measured['validation']['decision'] == Decision.ACCEPT.value
+    assert not measured.get('held_for_review')
+
+
+def test_leading_estimated_remainder_is_held():
+    validator = AdValidator(3600.0, [], splice_veto_enabled=False)
+    ad = {'start': 100.0, 'end': 200.0, 'confidence': 0.95,
+          'reason': 'Acme (pattern #7, outro)', 'sponsor': 'Acme',
+          'detection_stage': 'text_pattern', 'span_estimated': True,
+          'text_start': 170.0, 'text_end': 200.0,
+          'has_estimated_pattern_member': True}
+    mark_distinct_merge(ad, {'start': 170.0, 'end': 230.0, 'confidence': 0.95,
+                             'detection_stage': 'claude'})
+    ad['end'] = 230.0
+
+    result = validator.validate([ad])
+
+    assert _spans(result) == [(100.0, 170.0), (170.0, 230.0)]
+    lead, cut = result.ads
+    assert lead['hold_reason'] == HOLD_REASON_ESTIMATED_PATTERN
+    assert cut['validation']['decision'] == Decision.ACCEPT.value
+    assert not cut.get('held_for_review')
+
+
+def test_short_estimated_remainder_dropped_not_held():
+    validator = AdValidator(3800.0, [], splice_veto_enabled=False)
+
+    result = validator.validate(_claude_then_estimate(estimated_end=3578.2))
+
+    assert _spans(result) == [(3492.9, 3573.2)]
+    assert result.ads[0]['validation']['decision'] == Decision.ACCEPT.value
+    assert not result.ads[0].get('held_for_review')
+
+
+def test_estimated_pattern_requires_contiguous_dai_coverage():
+    validator = AdValidator(3600.0, [], splice_veto_enabled=False)
+    ad = {'start': 100.0, 'end': 200.0, 'confidence': 0.95,
+          'reason': 'Acme read', 'detection_stage': 'text_pattern',
+          'span_estimated': True, 'text_start': 100.0, 'text_end': 130.0,
+          'dai_core_spans': [
+              {'start': 100.0, 'end': 145.0},
+              {'start': 155.0, 'end': 200.0},
+          ]}
+    held = validator.validate([ad]).ads[0]
+    assert held['hold_reason'] == HOLD_REASON_ESTIMATED_PATTERN
+
+    ad['dai_core_spans'] = [{'start': 100.0, 'end': 200.0}]
+    accepted = validator.validate([ad]).ads[0]
+    assert accepted['validation']['decision'] == Decision.ACCEPT.value
+
+def _outro_estimate(start=792.6, end=1002.8):
+    """An outro-only pattern match whose estimated span absorbed a measured claude read."""
+    ad = {'start': start, 'end': end, 'confidence': 0.95,
+          'reason': 'Acme (pattern #7, outro)', 'sponsor': 'Acme',
+          'detection_stage': 'text_pattern', 'span_estimated': True,
+          'text_start': 985.0, 'text_end': 995.1,
+          'has_estimated_pattern_member': True}
+    mark_distinct_merge(ad, {'start': 815.6, 'end': 995.1, 'confidence': 0.96,
+                             'detection_stage': 'claude'})
+    ad['end'] = end
+    return ad
+
+
+_GAP_SEGMENTS = [{'start': 760.0, 'end': 792.6, 'text': 'and that is it for this part'},
+                 {'start': 815.6, 'end': 995.1, 'text': 'brought to you by Acme'},
+                 {'start': 1002.8, 'end': 1030.0, 'text': 'okay welcome back to the show'}]
+
+
+def _silence(*spans, signals=()):
+    return {'silence_spans': [{'start': a, 'end': b, 'duration': b - a} for a, b in spans],
+            'signals': list(signals)}
+
+
+# The lead's 0.4 s non-silent gap still leaves it over 95% silent.
+_BOTH_SILENT = _silence((792.7, 803.0), (803.4, 815.5), (995.2, 1002.7))
+
+
+def test_silent_estimated_remainders_cut_with_the_ad(caplog):
+    validator = AdValidator(3600.0, _GAP_SEGMENTS, splice_veto_enabled=False)
+
+    with caplog.at_level(logging.INFO, logger='ad_validator'):
+        result = validator.validate([_outro_estimate()], audio_analysis=_BOTH_SILENT)
+
+    assert _spans(result) == [(792.6, 1002.8)]
+    only = result.ads[0]
+    assert only['validation']['decision'] == Decision.ACCEPT.value
+    assert not only.get('held_for_review')
+    assert learning_bounds(only) == (815.6, 995.1)
+    assert not [k for k in json.loads(json.dumps(only)) if k.startswith('_')]
+    flags = only['validation']['flags']
+    assert 'INFO: Silent estimated remainder cut with the ad (23.0s)' in flags
+    assert 'INFO: Silent estimated remainder cut with the ad (7.7s)' in flags
+    messages = [r.message for r in caplog.records]
+    assert 'Cut silent estimated remainder 792.6s-815.6s with ad 815.6s-995.1s' in messages
+    assert 'Cut silent estimated remainder 995.1s-1002.8s with ad 815.6s-995.1s' in messages
+    assert not any(m.startswith('Holding ad') for m in messages)
+
+
+def test_show_intro_cue_keeps_leading_remainder_held():
+    intro = {'signal_type': 'audio_cue', 'start': 795.0, 'end': 810.0, 'confidence': 0.9,
+             'details': {'role': 'non_ad', 'cue_type': 'show_intro', 'template_id': 3}}
+    analysis = {**_BOTH_SILENT, 'signals': [intro]}
+    validator = AdValidator(3600.0, _GAP_SEGMENTS, splice_veto_enabled=False)
+
+    result = validator.validate([_outro_estimate()], audio_analysis=analysis)
+
+    assert _spans(result) == [(792.6, 815.6), (815.6, 1002.8)]
+    lead, cut = result.ads
+    assert lead['hold_reason'] == HOLD_REASON_ESTIMATED_PATTERN
+    assert lead['_estimated_remainder'] is True
+    assert cut['validation']['decision'] == Decision.ACCEPT.value
+    assert not cut.get('held_for_review')
+    assert learning_bounds(cut) == (815.6, 995.1)
+
+
+def test_partly_silent_remainder_is_held():
+    analysis = _silence((792.7, 806.5), (995.2, 1002.7))
+    validator = AdValidator(3600.0, _GAP_SEGMENTS, splice_veto_enabled=False)
+
+    result = validator.validate([_outro_estimate()], audio_analysis=analysis)
+
+    assert _spans(result) == [(792.6, 815.6), (815.6, 1002.8)]
+    assert result.ads[0]['hold_reason'] == HOLD_REASON_ESTIMATED_PATTERN
+
+
+def _remainder_with_silences(spans):
+    ad = {'start': 90.0, 'end': 160.0, 'confidence': 0.95, 'reason': 'Acme read',
+          'detection_stage': 'claude'}
+    mark_distinct_merge(ad, {'start': 100.0, 'end': 160.0, 'confidence': 0.95,
+                             'detection_stage': 'text_pattern', 'span_estimated': True,
+                             'text_start': 100.0, 'text_end': 110.0,
+                             'has_estimated_pattern_member': True})
+    ad['start'], ad['end'] = 90.0, 170.0
+    return AdValidator(3600.0, [{'start': 90.0, 'end': 160.0, 'text': 'Acme read'}],
+                       splice_veto_enabled=False).validate(
+        [ad], audio_analysis=_silence(*spans))
+
+
+def test_sparse_silence_is_not_a_silent_remainder():
+    # 0.3 s of silence every 0.8 s across the 10 s remainder, about 39%.
+    spans = [(160.0 + i * 0.8, 160.3 + i * 0.8) for i in range(13)]
+    assert _spans(_remainder_with_silences(spans)) == [(90.0, 160.0), (160.0, 170.0)]
+
+
+def test_near_continuous_silence_is_a_silent_remainder():
+    assert _spans(_remainder_with_silences([(160.0, 164.9), (165.1, 170.0)])) == [
+        (90.0, 170.0)]
+
+
+def _measured_with_estimate(lo, hi, confidence, reason, est_lo, est_hi, **kwargs):
+    """A measured claude read merged with an auto pattern estimate reaching est_lo-est_hi."""
+    ad = {'start': lo, 'end': hi, 'confidence': confidence, 'reason': reason,
+          'detection_stage': 'claude'}
+    text_lo = max(lo, est_lo)
+    mark_distinct_merge(ad, {'start': est_lo, 'end': est_hi, 'confidence': 0.95,
+                             'detection_stage': 'text_pattern', 'span_estimated': True,
+                             'text_start': text_lo, 'text_end': text_lo + 10.0,
+                             'has_estimated_pattern_member': True})
+    ad['start'], ad['end'] = min(lo, est_lo), max(hi, est_hi)
+    validator = AdValidator(3600.0, [{'start': lo, 'end': hi, 'text': 'a read'}],
+                            splice_veto_enabled=False, **kwargs)
+    return validator, ad
+
+
+def test_absorbing_a_leading_silence_keeps_the_measured_decision():
+    # At 545 s the position boost lifts 0.82 to 0.92, over the long-ad override; at 525 s
+    # it gives 0.87 and a 475 s span would be held for max_duration.
+    validator, ad = _measured_with_estimate(545.0, 1000.0, 0.82, 'Paid read',
+                                            525.0, 1000.0)
+    validator.segments = [{'start': 545.0, 'end': 1000.0,
+                           'text': 'this episode is brought to you by Acme use promo code SHOW'}]
+
+    result = validator.validate([ad], audio_analysis=_silence((525.0, 545.0)))
+
+    assert _spans(result) == [(525.0, 1000.0)]
+    assert result.ads[0]['validation']['decision'] == Decision.ACCEPT.value
+    assert learning_bounds(result.ads[0]) == (545.0, 1000.0)
+
+
+def test_silence_is_absorbed_past_the_confirmed_limit():
+    validator, ad = _measured_with_estimate(1000.0, 1850.0, 0.95, 'Acme sponsor read',
+                                            1840.0, 1950.0)
+
+    result = validator.validate([ad], audio_analysis=_silence((1850.0, 1950.0)))
+
+    assert _spans(result) == [(1000.0, 1950.0)]
+    assert result.ads[0]['validation']['decision'] == Decision.ACCEPT.value
+    assert not result.ads[0].get('held_for_review')
+    assert result.ads[0]['silent_absorbed_spans'] == [{'start': 1850.0, 'end': 1950.0}]
+
+
+def test_revalidated_absorbed_silence_does_not_count_toward_duration():
+    validator, ad = _measured_with_estimate(1000.0, 1850.0, 0.95, 'Acme sponsor read',
+                                            1840.0, 1950.0)
+    cut = validator.validate([ad], audio_analysis=_silence((1850.0, 1950.0))).ads[0]
+    saved = json.loads(json.dumps({k: v for k, v in cut.items() if k != 'validation'}))
+
+    again = validator.validate([saved]).ads[0]
+
+    assert (again['start'], again['end']) == (1000.0, 1950.0)
+    assert again['validation']['decision'] == Decision.ACCEPT.value
+    # Duration checks see the 850 s measured read, not the 950 s cut.
+    assert not any('950.0s' in f for f in again['validation']['flags'])
+    assert again.get('hold_reason') is None
+
+
+def test_absorbed_silence_is_clipped_with_a_carved_fragment():
+    marker = {'start': 1000.0, 'end': 1950.0,
+              'silent_absorbed_spans': [{'start': 1850.0, 'end': 1950.0}]}
+    assert carve_fragment(marker, 1000.0, 1900.0)['silent_absorbed_spans'] == [
+        {'start': 1850.0, 'end': 1900.0}]
+    assert 'silent_absorbed_spans' not in carve_fragment(marker, 1000.0, 1800.0)
+
+
+def test_silence_is_absorbed_past_the_base_limit_after_a_vague_reason():
+    validator, ad = _measured_with_estimate(1500.0, 1790.0, 0.92, 'possible ad',
+                                            1780.0, 1805.0)
+
+    result = validator.validate([ad], audio_analysis=_silence((1790.0, 1805.0)))
+
+    assert _spans(result) == [(1500.0, 1805.0)]
+    assert result.ads[0]['validation']['decision'] == Decision.ACCEPT.value
+
+
+def test_override_does_not_block_absorption():
+    validator = AdValidator(3600.0, _GAP_SEGMENTS, splice_veto_enabled=False,
+                            max_ad_duration_override=200.0)
+
+    result = validator.validate([_outro_estimate()], audio_analysis=_BOTH_SILENT)
+
+    assert _spans(result) == [(792.6, 1002.8)]
+    assert result.ads[0]['validation']['decision'] == Decision.ACCEPT.value
+    assert not result.ads[0].get('held_for_review')
+
+
+def test_silent_remainders_are_held_when_the_measured_cut_is_not_accepted(caplog):
+    # A vague reason drops 0.85 below the 0.80 cut threshold, so the measured cut is REVIEW.
+    validator, ad = _measured_with_estimate(545.0, 1000.0, 0.85, 'possible ad',
+                                            525.0, 1020.0)
+
+    with caplog.at_level(logging.INFO, logger='ad_validator'):
+        result = validator.validate(
+            [ad], audio_analysis=_silence((525.0, 545.0), (1000.0, 1020.0)))
+
+    assert _spans(result) == [(525.0, 545.0), (545.0, 1000.0), (1000.0, 1020.0)]
+    lead, cut, tail = result.ads
+    assert cut['validation']['decision'] == Decision.REVIEW.value
+    assert lead['hold_reason'] == tail['hold_reason'] == HOLD_REASON_ESTIMATED_PATTERN
+    assert 'silent_absorbed_spans' not in cut
+    assert not any(r.message.startswith('Cut silent') for r in caplog.records)
+
+
+def test_silent_remainder_flags_do_not_return_on_revalidation():
+    validator = AdValidator(3600.0, _GAP_SEGMENTS, splice_veto_enabled=False)
+    cut = validator.validate([_outro_estimate()], audio_analysis=_BOTH_SILENT).ads[0]
+    assert learning_bounds(cut) == (815.6, 995.1)
+    saved = json.loads(json.dumps({k: v for k, v in cut.items() if k != 'validation'}))
+
+    again = AdValidator(3600.0, _GAP_SEGMENTS, splice_veto_enabled=False).validate(
+        [saved], audio_analysis=_BOTH_SILENT).ads[0]
+
+    assert not any('Silent estimated remainder' in f for f in again['validation']['flags'])
+
+
+def test_long_silent_remainder_is_cut():
+    validator = AdValidator(3600.0, _GAP_SEGMENTS, splice_veto_enabled=False)
+
+    result = validator.validate([_outro_estimate(start=770.6)],
+                                audio_analysis=_silence((770.6, 815.6), (995.1, 1002.8)))
+
+    assert _spans(result) == [(770.6, 1002.8)]
+    assert result.ads[0]['validation']['decision'] == Decision.ACCEPT.value
+    assert 'INFO: Silent estimated remainder cut with the ad (45.0s)' in (
+        result.ads[0]['validation']['flags'])
+
+
+def test_untranscribed_remainder_without_audio_analysis_is_held():
+    validator = AdValidator(3600.0, _GAP_SEGMENTS, splice_veto_enabled=False)
+
+    result = validator.validate([_outro_estimate()])
+
+    assert _spans(result) == [(792.6, 815.6), (815.6, 995.1), (995.1, 1002.8)]
+
+
+def test_silent_remainder_over_user_rejection_is_held():
+    validator = AdValidator(3600.0, _GAP_SEGMENTS, splice_veto_enabled=False,
+                            false_positive_corrections=[{'start': 790.0, 'end': 800.0}])
+
+    result = validator.validate([_outro_estimate()], audio_analysis=_BOTH_SILENT)
+
+    assert _spans(result)[0] == (792.6, 815.6)
+    assert result.ads[0]['_estimated_remainder'] is True
+    assert _spans(result)[-1] == (815.6, 1002.8)
 
 
 class TestAdjustmentClampWithoutBypass:
@@ -2473,8 +3278,7 @@ class TestClampResidueValidatesSeparately:
 
 
 class TestPlainConfirmMultiFragment:
-    """A plain confirmation (no confirmed_span) names no exact sub-span, so
-    every fragment matching it auto-accepts; there is nothing to dedup."""
+    """A plain confirmation accepts distinct supported pieces once."""
 
     def test_both_fragments_of_a_plain_confirm_auto_accept(self):
         validator = AdValidator(
@@ -2495,6 +3299,85 @@ class TestPlainConfirmMultiFragment:
         assert all(ad['validation']['user_confirmed'] is True
                    for ad in result.ads)
 
+    @pytest.mark.parametrize('reverse', [False, True])
+    def test_overlapping_redetections_share_approval_once(self, reverse):
+        validator = AdValidator(
+            episode_duration=600.0, segments=[],
+            confirmed_corrections=[{'start': 100.0, 'end': 180.0}],
+        )
+        candidates = [
+            {'start': 99.55, 'end': 150.0, 'confidence': 0.95,
+             'reason': 'First ad proposal'},
+            {'start': 140.0, 'end': 190.0, 'confidence': 0.95,
+             'reason': 'Overlapping ad proposal'},
+        ]
+        result = validator.validate(list(reversed(candidates)) if reverse
+                                    else candidates)
+
+        approved = [ad for ad in result.ads
+                    if ad['validation'].get('user_confirmed')]
+        assert [(ad['start'], ad['end']) for ad in approved] == [
+            (100.0, 150.0), (150.0, 180.0)]
+        assert any(ad['validation']['decision'] == Decision.REJECT.value
+                   for ad in result.ads)
+
+    @pytest.mark.parametrize('reverse', [False, True])
+    def test_overlapping_redetections_preserve_approved_union(self, reverse):
+        validator = AdValidator(
+            episode_duration=600.0, segments=[],
+            confirmed_corrections=[{'start': 100.0, 'end': 200.0}],
+        )
+        candidates = [
+            {'start': 95.0, 'end': 150.0, 'confidence': 0.95,
+             'reason': 'First ad proposal'},
+            {'start': 140.0, 'end': 205.0, 'confidence': 0.95,
+             'reason': 'Second ad proposal'},
+        ]
+        result = validator.validate(list(reversed(candidates)) if reverse
+                                    else candidates)
+
+        approved = [ad for ad in result.ads
+                    if ad['validation'].get('user_confirmed')]
+        assert [(ad['start'], ad['end']) for ad in approved] == [
+            (100.0, 150.0), (150.0, 200.0)]
+
+    def test_short_approved_continuation_is_not_lost(self):
+        validator = AdValidator(
+            episode_duration=600.0, segments=[],
+            confirmed_corrections=[{'start': 100.0, 'end': 200.0}],
+        )
+        result = validator.validate([
+            {'start': 95.0, 'end': 195.0, 'confidence': 0.95,
+             'reason': 'First ad proposal'},
+            {'start': 190.0, 'end': 205.0, 'confidence': 0.95,
+             'reason': 'Second ad proposal'},
+        ])
+
+        approved = [ad for ad in result.ads
+                    if ad['validation'].get('user_confirmed')]
+        assert [(ad['start'], ad['end']) for ad in approved] == [
+            (100.0, 195.0), (195.0, 200.0)]
+
+    @pytest.mark.parametrize('reverse', [False, True])
+    def test_disjoint_redetections_keep_unseen_gap(self, reverse):
+        validator = AdValidator(
+            episode_duration=600.0, segments=[],
+            confirmed_corrections=[{'start': 100.0, 'end': 180.0}],
+        )
+        candidates = [
+            {'start': 99.55, 'end': 130.0, 'confidence': 0.95,
+             'reason': 'First ad fragment'},
+            {'start': 150.0, 'end': 190.0, 'confidence': 0.95,
+             'reason': 'Second ad fragment'},
+        ]
+        result = validator.validate(list(reversed(candidates)) if reverse
+                                    else candidates)
+
+        approved = [ad for ad in result.ads
+                    if ad['validation'].get('user_confirmed')]
+        assert [(ad['start'], ad['end']) for ad in approved] == [
+            (100.0, 130.0), (150.0, 180.0)]
+
 
 class TestSponsorConfirmedIsEvidenceNotProse:
     """The duration allowance takes any confirmation, including the detection
@@ -2506,8 +3389,7 @@ class TestSponsorConfirmedIsEvidenceNotProse:
         from utils.text import word_boundary_re
         segments = [{'start': 0.0, 'end': 60.0, 'text': transcript}]
         v = AdValidator(3600.0, segments, episode_description='')
-        v.description_sponsors = {'acme'}
-        v._description_sponsor_re = word_boundary_re(v.description_sponsors)
+        v._description_sponsor_re = word_boundary_re({'acme'})
         return v
 
     def _ad(self, reason):
@@ -2518,7 +3400,6 @@ class TestSponsorConfirmedIsEvidenceNotProse:
         ad = self._ad('Acme read, host delivered')
 
         assert v._sponsor_confirmation_source(ad) == 'reason'
-        assert v._is_sponsor_confirmed(ad) is True
 
     def test_a_reason_only_match_is_not_stored_as_confirmed(self):
         v = self._validator('nothing promotional in this stretch at all')
@@ -2531,3 +3412,64 @@ class TestSponsorConfirmedIsEvidenceNotProse:
         ad = v._validate_ad(self._ad('sponsor read'))
 
         assert ad['validation']['sponsor_confirmed'] is True
+
+
+def _reviewer_reject(start=300.0, end=330.0, was_cut=True):
+    return {'start': start, 'end': end, 'confidence': 0.97, 'reason': 'Acme sponsor read',
+            'detection_stage': 'claude', 'was_cut': was_cut, 'source': 'reviewer',
+            'reviewer_verdict': 'reject'}
+
+
+def test_validator_preserves_standing_reviewer_reject():
+    result = AdValidator(episode_duration=3600.0).validate([_reviewer_reject()])
+
+    ad = result.ads[0]
+    assert ad['validation']['decision'] == Decision.REJECT.value
+    assert 'reviewer_reject_preserved' in ad['validation']['flags']
+    assert not ad.get('held_for_review')
+    assert ad['_reviewer_rejected'] is True
+    assert result.rejected == 1
+
+
+def test_validator_user_confirm_lifts_reviewer_reject():
+    confirmed = [{'start': 300.0, 'end': 330.0, 'correction_type': 'confirm'}]
+    ad = AdValidator(episode_duration=3600.0, confirmed_corrections=confirmed).validate(
+        [_reviewer_reject()]).ads[0]
+
+    assert ad['validation']['decision'] == Decision.ACCEPT.value
+    assert ad['validation']['user_confirmed'] is True
+    assert '_reviewer_rejected' not in ad
+
+
+def test_validator_auto_filed_confirm_does_not_lift_reviewer_reject():
+    confirmed = [{'start': 300.0, 'end': 330.0, 'correction_type': 'confirm',
+                  'auto_filed': True}]
+    ad = AdValidator(episode_duration=3600.0, confirmed_corrections=confirmed).validate(
+        [_reviewer_reject()]).ads[0]
+
+    assert ad['validation']['decision'] == Decision.REJECT.value
+    assert not ad['validation'].get('user_confirmed')
+    assert 'reviewer_reject_preserved' in ad['validation']['flags']
+
+
+def test_reviewer_reject_does_not_merge_with_neighbor_cut():
+    neighbor = {'start': 270.0, 'end': 298.0, 'confidence': 0.95,
+                'reason': 'Acme promo', 'detection_stage': 'claude', 'was_cut': True}
+    ads = AdValidator(episode_duration=3600.0).validate(
+        [neighbor, _reviewer_reject(start=300.0)]).ads
+
+    assert [(a['start'], a['end']) for a in ads] == [(270.0, 298.0), (300.0, 330.0)]
+    assert ads[1]['validation']['decision'] == Decision.REJECT.value
+
+
+def test_fresh_detections_never_stamped():
+    fresh = [
+        {'start': 100.0, 'end': 160.0, 'confidence': 0.95, 'reason': 'Acme sponsor read',
+         'detection_stage': 'claude'},
+        {'start': 400.0, 'end': 430.0, 'confidence': 0.4, 'reason': 'possible promo',
+         'detection_stage': 'claude'},
+    ]
+    ads = AdValidator(episode_duration=3600.0).validate(fresh).ads
+
+    assert all('_reviewer_rejected' not in a for a in ads)
+    assert all('reviewer_reject_preserved' not in a['validation']['flags'] for a in ads)

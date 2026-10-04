@@ -27,6 +27,9 @@ _SEARCH_CHANGE_TRIGGER_NAMES = (
 )
 _SEARCH_CHANGE_TRIGGER_MARKER = 'search_change_triggers_v1'
 
+# The hold reason inside the snippet _file_corroborated_hold_approvals writes.
+_AUTO_FILED_REASON_RE = re.compile(r'\s*corroborated (\S+) hold')
+
 
 # SQL DDL constants live in tables.py - re-exported for backward compat
 from database.schema.tables import SCHEMA_SQL, TABLE_DDL
@@ -36,8 +39,14 @@ from database.search import (
     SEARCH_INDEX_DDL,
 )
 from community_export import find_foreign_sponsors, declared_sponsor_names_lower
-from config import count_pending_review
+from config import (
+    CORRECTION_ORIGIN_AUTO_PASS2, CORRECTION_ORIGIN_USER, HOLD_REASON_DIFFERENTIAL_UNCORROBORATED,
+    PASS2_AUTOAPPROVE_SNIPPET_PREFIX, count_pending_review,
+)
 from utils.markers import collapse_duplicate_markers
+
+# 2.63.2-2.67.0 snippets named the differential hold by its short form.
+_LEGACY_SNIPPET_REASONS = {'differential': HOLD_REASON_DIFFERENTIAL_UNCORROBORATED}
 
 
 @contextmanager
@@ -376,6 +385,8 @@ class SchemaMixin:
             # served chapters JSON was generated against; the recut chapter
             # remap loads it instead of reconstructing from was_cut markers.
             ('applied_cuts_json', 'TEXT'),
+            # Transcript holes re-transcribed without speech, skipped on reprocess.
+            ('repair_holes_json', 'TEXT'),
         ]
         for col, definition in details_migrations:
             self._add_column_if_missing(conn, 'episode_details', col, definition, det_cols)
@@ -534,6 +545,9 @@ class SchemaMixin:
             ('podcast_id', 'INTEGER REFERENCES podcasts(id) ON DELETE SET NULL'),
             ('source_hold_reason', 'TEXT'),
             ('fp_suppressed', 'INTEGER DEFAULT 0'),
+            ('origin', "TEXT NOT NULL DEFAULT 'user'"),
+            # 2.97.34: the hold an auto-filed confirm released; older rows group by bounds.
+            ('hold_id', 'TEXT'),
         ]
         for col, definition in pcorr_migrations:
             self._add_column_if_missing(conn, 'pattern_corrections', col, definition, pcorr_cols)
@@ -1526,6 +1540,12 @@ class SchemaMixin:
         # 2.95.2: one-shot fold of duplicate pass-1/pass-2 markers for the same span
         # (they used to double-count pending_review_count); write path no longer produces them.
         self._collapse_duplicate_ad_markers(conn)
+
+        # 2.97.32: tag pass-2 auto-filed confirms by origin; runs after the
+        # sponsor FK rebuild so the column exists in its final table.
+        self._backfill_correction_origin(conn)
+        # 2.97.37: the backfill above once stored 'differential' for 2.63.2-2.67.0 snippets.
+        self._repair_differential_source_hold_reason(conn)
 
         # 2.5.7: retire kitchen-sink ad_patterns that name multiple foreign
         # sponsors in their text_template. The merge guard prevents new ones
@@ -2647,7 +2667,7 @@ class SchemaMixin:
         ``processing.py:_detect_ads_first_pass:340``, not the
         post-reviewer CUTS that the buggy 2.5.27 writer captured. v1
         only matched episodes where the reviewer rejected zero ads, so
-        episodes like macbreak-weekly-audio:2d9ccd57b93b (firstpass
+        episodes like example-podcast:a1b2c3d4e5f6 (firstpass
         detection=10, reviewer kept 6, verification=2, total cuts=8)
         stayed at the wrong history value of 6.
 
@@ -3511,6 +3531,66 @@ class SchemaMixin:
             conn.rollback()
             logger.warning(f"Migration: duplicate ad-marker collapse failed: {e}")
 
+    def _backfill_correction_origin(self, conn):
+        """One-shot: set origin and source_hold_reason on confirms filed with the pass-2 snippet."""
+        gate = 'backfill_correction_origin_once'
+        if conn.execute(
+            "SELECT 1 FROM schema_migrations WHERE name = ?", (gate,)
+        ).fetchone():
+            return
+        try:
+            rows = conn.execute(
+                "SELECT id, text_snippet FROM pattern_corrections "
+                "WHERE correction_type = 'confirm' AND origin = ? "
+                "AND text_snippet LIKE ?",
+                (CORRECTION_ORIGIN_USER, PASS2_AUTOAPPROVE_SNIPPET_PREFIX + '%')
+            ).fetchall()
+            tagged = 0
+            for row in rows:
+                snippet = row['text_snippet']
+                # LIKE is case-insensitive; the writer's prefix is exact.
+                if not snippet.startswith(PASS2_AUTOAPPROVE_SNIPPET_PREFIX):
+                    continue
+                reason = _AUTO_FILED_REASON_RE.match(
+                    snippet[len(PASS2_AUTOAPPROVE_SNIPPET_PREFIX):])
+                reason = reason and _LEGACY_SNIPPET_REASONS.get(reason.group(1), reason.group(1))
+                conn.execute(
+                    "UPDATE pattern_corrections SET origin = ?, "
+                    "source_hold_reason = COALESCE(source_hold_reason, ?) WHERE id = ?",
+                    (CORRECTION_ORIGIN_AUTO_PASS2, reason, row['id'])
+                )
+                tagged += 1
+            conn.execute("INSERT OR IGNORE INTO schema_migrations (name) VALUES (?)", (gate,))
+            conn.commit()
+            if tagged:
+                logger.info(f"Migration: tagged {tagged} auto-filed confirm correction(s) with origin")
+        except Exception as e:
+            # Gate stays unset, so this retries on the next boot.
+            conn.rollback()
+            logger.warning(f"Migration: correction origin backfill failed: {e}")
+
+    def _repair_differential_source_hold_reason(self, conn):
+        """One-shot: fix the short 'differential' reason the first origin backfill stored."""
+        gate = 'repair_differential_source_hold_reason_once'
+        if conn.execute(
+            "SELECT 1 FROM schema_migrations WHERE name = ?", (gate,)
+        ).fetchone():
+            return
+        try:
+            repaired = conn.execute(
+                "UPDATE pattern_corrections SET source_hold_reason = ? "
+                "WHERE source_hold_reason = 'differential'",
+                (HOLD_REASON_DIFFERENTIAL_UNCORROBORATED,)
+            ).rowcount
+            conn.execute("INSERT OR IGNORE INTO schema_migrations (name) VALUES (?)", (gate,))
+            conn.commit()
+            if repaired:
+                logger.info(f"Migration: repaired {repaired} correction hold reason(s)")
+        except Exception as e:
+            # Gate stays unset, so this retries on the next boot.
+            conn.rollback()
+            logger.warning(f"Migration: correction hold reason repair failed: {e}")
+
     def _migrate_fingerprint_cascade(self, conn):
         """2.88.2: give audio_fingerprints.pattern_id an FK with ON DELETE CASCADE.
 
@@ -3832,7 +3912,9 @@ class SchemaMixin:
                     created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
                     sponsor_id INTEGER REFERENCES known_sponsors(id),
                     source_hold_reason TEXT,
-                    fp_suppressed INTEGER DEFAULT 0
+                    fp_suppressed INTEGER DEFAULT 0,
+                    origin TEXT NOT NULL DEFAULT 'user',
+                    hold_id TEXT
                 )
             """)
             new_pc_cols = [

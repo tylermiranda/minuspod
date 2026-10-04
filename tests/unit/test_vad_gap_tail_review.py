@@ -21,6 +21,7 @@ from config import (
     HOLD_REASON_UNCORROBORATED_TAIL, count_pending_review, is_pending_review,
 )
 from main_app import processing
+from tests.unit.pass2_test_utils import _user_corrections
 
 
 @pytest.fixture(autouse=True)
@@ -57,6 +58,7 @@ def test_refine_and_validate_passes_audio_analysis_to_validator(monkeypatch):
         [{'start': 1.0, 'end': 40.0, 'confidence': 0.9, 'reason': 'sponsor read'}],
         [], 'unused.mp3', '', 3600.0, 0.80, 'Pod',
         audio_analysis=analysis,
+        corrections=([], [])
     )
     assert captured['audio_analysis'] is analysis
 
@@ -85,7 +87,8 @@ def test_build_recut_ad_list_passes_stored_audio_analysis(monkeypatch):
     monkeypatch.setattr(ad_validator.AdValidator, 'validate', fake_validate)
 
     processing._build_recut_ad_list('slug', 'ep', [], 3600.0, '', 0.80,
-                                    podcast_id=1)
+                                    podcast_id=1,
+                                    corrections=_user_corrections('slug', 'ep'))
     assert captured['audio_analysis'] == stored
 
 
@@ -130,7 +133,7 @@ def _tail_transition_analysis():
 
 
 def test_uncorroborated_tail_marker_lands_in_pending_review():
-    # TWiT 1091 shipped silently with pendingReviewCount=0. The full path
+    # One episode shipped silently with pendingReviewCount=0. The full path
     # (validator -> confidence gate -> pending-review bucket) must now keep
     # the marker in audio AND surface it to the review queue.
     validator = AdValidator(episode_duration=10600.0, segments=TAIL_SEGMENTS)
@@ -176,7 +179,7 @@ _EARLY_SEGMENTS = [
 def test_uncorroborated_accept_tail_held_for_review():
     """Finding 2 runtime repro: segments end before marker start, empty ad_text,
     no clamping -> confidence 0.80 -> ACCEPT. Without the fix, Rule 4 only fired
-    on REVIEW; the marker shipped silently (TWiT-class DAI post-roll)."""
+    on REVIEW; the marker shipped silently (quiet DAI post-roll)."""
     validator = AdValidator(episode_duration=10600.0, segments=_EARLY_SEGMENTS)
     result = validator.validate([_tail_marker()])
     ad = result.ads[0]

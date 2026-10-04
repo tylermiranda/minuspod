@@ -24,6 +24,8 @@ from main_app.processing import (
     _validate_verification_ads,
 )
 import main_app.processing as processing_mod
+import main_app.verification_reconciliation as vr
+from tests.unit.pass2_test_utils import _approval_db, _user_corrections
 
 
 def _seg(start, end, text='spoken content here'):
@@ -206,7 +208,7 @@ def test_recut_carries_kept_tail_to_applied_cut_computation():
         '/tmp/nonexistent-pass2.mp3',
         [{'start': 100.0, 'end': 140.0, 'action_applied': 'remove',
           'beep': False}],
-        cut_barriers=barriers,
+        cut_barriers=barriers, hard_barriers=None,
     )
 
 
@@ -279,7 +281,7 @@ def test_held_pass2_ad_diverts_to_v_ads_held():
     proc = [_held_proc(100.0, 160.0)]
     orig = [_orig(1100.0, 1160.0, 'held')]
 
-    v_ads_to_cut, v_ads_for_ui, v_ads_held, _n = _gate_verification_ads_by_confidence(
+    v_ads_to_cut, v_ads_for_ui, v_ads_held, _n, _rel = _gate_verification_ads_by_confidence(
         proc, orig, min_cut_confidence=0.8,
     )
 
@@ -302,7 +304,7 @@ def test_non_held_pass2_ad_behavior_unchanged():
     proc = [_plain_proc(100.0, 160.0)]
     orig = [_orig(1100.0, 1160.0, 'plain')]
 
-    v_ads_to_cut, v_ads_for_ui, v_ads_held, _n = _gate_verification_ads_by_confidence(
+    v_ads_to_cut, v_ads_for_ui, v_ads_held, _n, _rel = _gate_verification_ads_by_confidence(
         proc, orig, min_cut_confidence=0.8,
     )
 
@@ -319,7 +321,7 @@ def test_held_not_in_v_ads_for_ui():
     proc = [_held_proc(100.0, 160.0), _plain_proc(300.0, 360.0)]
     orig = [_orig(1100.0, 1160.0, 'held'), _orig(1300.0, 1360.0, 'plain')]
 
-    _v_ads_to_cut, v_ads_for_ui, v_ads_held, _n = _gate_verification_ads_by_confidence(
+    _v_ads_to_cut, v_ads_for_ui, v_ads_held, _n, _rel = _gate_verification_ads_by_confidence(
         proc, orig, min_cut_confidence=0.8,
     )
 
@@ -335,7 +337,7 @@ def test_held_was_cut_is_false():
     proc = [_held_proc(200.0, 280.0, confidence=0.95, hold_reason='no_cue_evidence')]
     orig = [_orig(1200.0, 1280.0, 'nocue')]
 
-    _, _, v_ads_held, _n = _gate_verification_ads_by_confidence(
+    _, _, v_ads_held, _n, _rel = _gate_verification_ads_by_confidence(
         proc, orig, min_cut_confidence=0.8,
     )
 
@@ -354,7 +356,7 @@ def test_below_threshold_non_held_not_in_v_ads_held():
     }]
     orig = [_orig(1100.0, 1160.0, 'lowconf')]
 
-    v_ads_to_cut, v_ads_for_ui, v_ads_held, _n = _gate_verification_ads_by_confidence(
+    v_ads_to_cut, v_ads_for_ui, v_ads_held, _n, _rel = _gate_verification_ads_by_confidence(
         proc, orig, min_cut_confidence=0.8,
     )
 
@@ -374,7 +376,7 @@ def test_pass2_cut_inside_pass1_held_span_is_dropped():
     orig = [_orig(120.0, 250.0, 'inside')]  # original coords overlap held 100-500
     pass1_held = [_held_marker(100.0, 500.0)]
 
-    v_ads_to_cut, v_ads_for_ui, v_ads_held, _n = _gate_verification_ads_by_confidence(
+    v_ads_to_cut, v_ads_for_ui, v_ads_held, _n, _rel = _gate_verification_ads_by_confidence(
         proc, orig, min_cut_confidence=0.8, pass1_held_markers=pass1_held,
     )
 
@@ -390,7 +392,7 @@ def test_pass2_cut_outside_pass1_held_span_still_cut():
     orig = [_orig(600.0, 660.0, 'outside')]
     pass1_held = [_held_marker(100.0, 500.0)]
 
-    v_ads_to_cut, v_ads_for_ui, _v_ads_held, _n = _gate_verification_ads_by_confidence(
+    v_ads_to_cut, v_ads_for_ui, _v_ads_held, _n, _rel = _gate_verification_ads_by_confidence(
         proc, orig, min_cut_confidence=0.8, pass1_held_markers=pass1_held,
     )
 
@@ -414,7 +416,7 @@ def test_corroborating_ad_stamps_hold_and_is_still_dropped():
     orig = [_orig(4875.8, 5024.8, 'diff')]
     hold = _diff_hold(4875.8, 5025.8)
 
-    v_ads_to_cut, v_ads_for_ui, v_ads_held, n = _gate_verification_ads_by_confidence(
+    v_ads_to_cut, v_ads_for_ui, v_ads_held, n, _rel = _gate_verification_ads_by_confidence(
         proc, orig, min_cut_confidence=0.8, pass1_held_markers=[hold],
     )
 
@@ -436,7 +438,7 @@ def test_short_ad_in_long_hold_does_not_stamp():
     orig = [_orig(1100.0, 1115.0, 'short')]
     hold = _diff_hold(1000.0, 1300.0)
 
-    _cut, _ui, _held, n = _gate_verification_ads_by_confidence(
+    _cut, _ui, _held, n, _rel = _gate_verification_ads_by_confidence(
         proc, orig, min_cut_confidence=0.8, pass1_held_markers=[hold],
     )
 
@@ -449,7 +451,7 @@ def test_graze_does_not_stamp():
     orig = [_orig(4400.0, 4500.0, 'graze')]
     hold = _diff_hold(4480.0, 4600.0)  # 20s of the 100s ad inside
 
-    _cut, _ui, _held, n = _gate_verification_ads_by_confidence(
+    _cut, _ui, _held, n, _rel = _gate_verification_ads_by_confidence(
         proc, orig, min_cut_confidence=0.8, pass1_held_markers=[hold],
     )
 
@@ -462,7 +464,7 @@ def test_low_confidence_does_not_stamp():
     orig = [_orig(990.0, 1150.0, 'lowconf')]
     hold = _diff_hold(990.0, 1150.0)
 
-    _cut, _ui, _held, n = _gate_verification_ads_by_confidence(
+    _cut, _ui, _held, n, _rel = _gate_verification_ads_by_confidence(
         proc, orig, min_cut_confidence=0.8, pass1_held_markers=[hold],
     )
 
@@ -478,13 +480,113 @@ def test_non_releasable_hold_never_stamped():
     orig = [_orig(990.0, 1150.0, 'nocue')]
     hold = _held_marker(990.0, 1150.0, hold_reason='no_cue_evidence')
 
-    v_ads_to_cut, _ui, _held, n = _gate_verification_ads_by_confidence(
+    v_ads_to_cut, _ui, _held, n, _rel = _gate_verification_ads_by_confidence(
         proc, orig, min_cut_confidence=0.8, pass1_held_markers=[hold],
     )
 
     assert v_ads_to_cut == []
     assert n == 0
     assert 'pass2_corroborated' not in hold
+
+
+def test_pass2_corroborates_estimated_tail():
+    """Pass 2 re-detecting the held remainder is corroboration: stamp and clip to it."""
+    proc = [_plain_proc(3575.0, 3678.0)]
+    orig = [_orig(3575.0, 3678.0, 'estimated')]
+    hold = _held_marker(3573.2, 3680.7, hold_reason='estimated_pattern_bounds')
+
+    v_ads_to_cut, _ui, _held, n, _rel = _gate_verification_ads_by_confidence(
+        proc, orig, min_cut_confidence=0.8, pass1_held_markers=[hold],
+    )
+
+    assert v_ads_to_cut == []
+    assert n == 1
+    assert hold['pass2_corroborated'] is True
+    assert hold['pass2_corroborated_span'] == {'start': 3575.0, 'end': 3678.0}
+
+
+def test_pass2_low_confidence_does_not_corroborate_estimated_tail():
+    """Pass-2 confidence below min_cut_confidence: no corroboration, hold stays open."""
+    proc = [_plain_proc(3575.0, 3678.0, confidence=0.5)]
+    orig = [_orig(3575.0, 3678.0, 'estimated')]
+    hold = _held_marker(3573.2, 3680.7, hold_reason='estimated_pattern_bounds')
+
+    _cut, _ui, _held, n, _rel = _gate_verification_ads_by_confidence(
+        proc, orig, min_cut_confidence=0.8, pass1_held_markers=[hold],
+    )
+
+    assert n == 0
+    assert 'pass2_corroborated' not in hold
+
+
+def test_pass2_ad_inside_estimated_hold_approves_measured_part():
+    """A confident pass-2 ad inside an estimated hold approves only its own span."""
+    proc = [_plain_proc(2485.2, 2545.1, confidence=0.98)]
+    orig = [_orig(2485.2, 2545.1, 'estimated')]
+    hold = _held_marker(2457.8, 2545.3, hold_reason='estimated_pattern_bounds')
+
+    v_ads_to_cut, _ui, _held, n, _rel = _gate_verification_ads_by_confidence(
+        proc, orig, min_cut_confidence=0.8, pass1_held_markers=[hold],
+    )
+
+    assert v_ads_to_cut == []
+    assert n == 1
+    assert hold['pass2_corroborated'] is True
+    assert hold['pass2_corroborated_span'] == {'start': 2485.2, 'end': 2545.1}
+
+
+def test_low_confidence_pass2_ad_inside_estimated_hold_does_not_approve():
+    proc = [_plain_proc(2485.2, 2545.1, confidence=0.5)]
+    orig = [_orig(2485.2, 2545.1, 'estimated')]
+    hold = _held_marker(2457.8, 2545.3, hold_reason='estimated_pattern_bounds')
+
+    _cut, _ui, _held, n, _rel = _gate_verification_ads_by_confidence(
+        proc, orig, min_cut_confidence=0.8, pass1_held_markers=[hold],
+    )
+
+    assert n == 0
+    assert 'pass2_corroborated' not in hold
+
+
+def test_pass2_ad_reaching_past_estimated_hold_does_not_approve():
+    """20 s outside the hold leaves the ad under 90% inside it."""
+    proc = [_plain_proc(2485.2, 2565.3, confidence=0.98)]
+    orig = [_orig(2485.2, 2565.3, 'estimated')]
+    hold = _held_marker(2457.8, 2545.3, hold_reason='estimated_pattern_bounds')
+    overlaps = []
+
+    cut, ui, held, n, candidates = _gate_verification_ads_by_confidence(
+        proc, orig, min_cut_confidence=0.8, pass1_held_markers=[hold], hold_overlaps=overlaps,
+    )
+
+    assert (cut, ui, held, n) == ([], [], [], 0)
+    assert 'pass2_corroborated' not in hold
+    # The part inside the hold goes to review; the part past it to the hold split.
+    [(candidate, candidate_hold)] = candidates
+    assert (candidate['start'], candidate['end']) == (2485.2, 2545.3)
+    assert candidate_hold is hold
+    assert [(p['start'], p['end'], o['marker']) for p, o in overlaps] == [
+        (2485.2, 2565.3, 'estimated')]
+
+
+def test_partial_coverage_still_blocks_differential_hold_approval():
+    """The coverage exemption is for estimated holds only."""
+    proc = [_plain_proc(2485.2, 2545.1, confidence=0.98)]
+    orig = [_orig(2485.2, 2545.1, 'diff')]
+    hold = _held_marker(2457.8, 2545.3, hold_reason='differential_uncorroborated')
+    overlaps = []
+
+    cut, ui, held, n, candidates = _gate_verification_ads_by_confidence(
+        proc, orig, min_cut_confidence=0.8, pass1_held_markers=[hold], hold_overlaps=overlaps,
+    )
+
+    assert (cut, ui, held, n) == ([], [], [], 0)
+    assert 'pass2_corroborated' not in hold
+    # Not approved on coverage: the supported span goes to review instead.
+    [(candidate, candidate_hold)] = candidates
+    assert (candidate['start'], candidate['end']) == (2485.2, 2545.3)
+    assert candidate_hold is hold
+    assert overlaps == []
 
 
 def test_boundary_conflict_hold_is_stamped_by_a_corroborating_pass2_ad():
@@ -494,7 +596,7 @@ def test_boundary_conflict_hold_is_stamped_by_a_corroborating_pass2_ad():
     orig = [_orig(990.0, 1150.0, 'bconflict')]
     hold = _held_marker(990.0, 1150.0, hold_reason='reviewer_boundary_conflict')
 
-    v_ads_to_cut, _ui, _held, n = _gate_verification_ads_by_confidence(
+    v_ads_to_cut, _ui, _held, n, _rel = _gate_verification_ads_by_confidence(
         proc, orig, min_cut_confidence=0.8, pass1_held_markers=[hold],
     )
 
@@ -513,7 +615,7 @@ def test_boundary_conflict_hold_is_not_stamped_by_the_rejected_trim():
     hold['reviewer_proposed_start'] = 990.0
     hold['reviewer_proposed_end'] = 1060.0
 
-    v_ads_to_cut, _ui, _held, n = _gate_verification_ads_by_confidence(
+    v_ads_to_cut, _ui, _held, n, _rel = _gate_verification_ads_by_confidence(
         proc, orig, min_cut_confidence=0.8, pass1_held_markers=[hold],
     )
 
@@ -528,7 +630,7 @@ def test_ad_overlapping_two_pending_markers_does_not_stamp():
     hold = _diff_hold(1000.0, 1150.0)
     other = _held_marker(1140.0, 1200.0, hold_reason='no_cue_evidence')
 
-    _cut, _ui, _held, n = _gate_verification_ads_by_confidence(
+    _cut, _ui, _held, n, _rel = _gate_verification_ads_by_confidence(
         proc, orig, min_cut_confidence=0.8, pass1_held_markers=[hold, other],
     )
 
@@ -541,7 +643,7 @@ def test_two_corroborating_ads_stamp_once():
     orig = [_orig(1000.0, 1140.0, 'a'), _orig(1000.0, 1145.0, 'b')]
     hold = _diff_hold(1000.0, 1150.0)
 
-    _cut, _ui, _held, n = _gate_verification_ads_by_confidence(
+    _cut, _ui, _held, n, _rel = _gate_verification_ads_by_confidence(
         proc, orig, min_cut_confidence=0.8, pass1_held_markers=[hold],
     )
 
@@ -554,7 +656,7 @@ def test_held_pass2_ad_still_diverts_never_stamps():
     orig = [_orig(990.0, 1150.0, 'heldover')]
     hold = _diff_hold(990.0, 1150.0)
 
-    v_ads_to_cut, _ui, v_ads_held, n = _gate_verification_ads_by_confidence(
+    v_ads_to_cut, _ui, v_ads_held, n, _rel = _gate_verification_ads_by_confidence(
         proc, orig, min_cut_confidence=0.8, pass1_held_markers=[hold],
     )
 
@@ -580,7 +682,8 @@ def test_auto_approve_files_correction(monkeypatch):
     cut_marker = {'start': 0.0, 'end': 29.0, 'was_cut': True}
 
     n = processing_mod._file_corroborated_hold_approvals(
-        's', 'ep1', [cut_marker, other_pending, hold])
+        's', 'ep1', [cut_marker, other_pending, hold],
+        corrections=_user_corrections('s', 'ep1'))
 
     assert n == 1
     kwargs = db.create_pattern_correction.call_args.kwargs
@@ -594,7 +697,8 @@ def test_auto_approve_noop_without_stamped_holds(monkeypatch):
     monkeypatch.setattr(processing_mod, 'db', db)
 
     n = processing_mod._file_corroborated_hold_approvals(
-        's', 'ep1', [_diff_hold(1.0, 50.0), _held_marker(100.0, 160.0)])
+        's', 'ep1', [_diff_hold(1.0, 50.0), _held_marker(100.0, 160.0)],
+        corrections=_user_corrections('s', 'ep1'))
 
     assert n == 0
     db.create_pattern_correction.assert_not_called()
@@ -614,7 +718,7 @@ def test_auto_approve_swallows_filing_failure(monkeypatch):
     hold = _diff_hold(4875.8, 5025.8)
     hold['pass2_corroborated'] = True
 
-    n = processing_mod._file_corroborated_hold_approvals('s', 'ep1', [hold])
+    n = processing_mod._file_corroborated_hold_approvals('s', 'ep1', [hold], corrections=_user_corrections('s', 'ep1'))
 
     assert n == 0
     assert hold['held_for_review'] is True
@@ -636,7 +740,8 @@ def test_auto_approve_dedupes_existing_confirm(monkeypatch):
     hold['pass2_corroborated'] = True
 
     n = processing_mod._file_corroborated_hold_approvals(
-        's', 'ep1', [hold])
+        's', 'ep1', [hold],
+        corrections=_user_corrections('s', 'ep1'))
 
     assert n == 1
     db.create_pattern_correction.assert_not_called()
@@ -647,7 +752,7 @@ def test_auto_approve_files_confirm_despite_grazing_stale_confirm(monkeypatch):
     reprocess fetched a copy with a shifted DAI timeline -- covers too
     little of the span to force-accept it at recut time. Treating the graze
     as an equivalent confirm skips filing, the caller's recut re-holds the
-    marker, and the approval silently does nothing (DTNS 5313 reprocess).
+    marker, and the approval silently does nothing (seen on a reprocess).
     Only a confirm covering at least half the hold counts as on file."""
     db = MagicMock()
     db.get_false_positive_corrections.return_value = []
@@ -663,7 +768,8 @@ def test_auto_approve_files_confirm_despite_grazing_stale_confirm(monkeypatch):
     hold['pass2_corroborated'] = True
 
     n = processing_mod._file_corroborated_hold_approvals(
-        's', 'ep1', [hold])
+        's', 'ep1', [hold],
+        corrections=_user_corrections('s', 'ep1'))
 
     assert n == 1
     kwargs = db.create_pattern_correction.call_args.kwargs
@@ -687,7 +793,8 @@ def test_auto_approve_dedupes_confirm_covering_most_of_hold(monkeypatch):
     hold['pass2_corroborated'] = True
 
     n = processing_mod._file_corroborated_hold_approvals(
-        's', 'ep1', [hold])
+        's', 'ep1', [hold],
+        corrections=_user_corrections('s', 'ep1'))
 
     assert n == 1
     db.create_pattern_correction.assert_not_called()
@@ -722,16 +829,16 @@ def test_no_cue_hold_is_never_corroborated():
 
 
 def test_padded_hold_tail_still_corroborates_and_records_span():
-    """tosh-show 6e9f8a115e24: a 239.9s hold with a 24.3s alignment-padding
-    tail scored 0.899 coverage and missed the old 0.9 bar; the ZocDoc break
+    """example-podcast a1b2c3d4e5f6: a 239.9s hold with a 24.3s alignment-padding
+    tail scored 0.899 coverage and missed the old 0.9 bar; the Acme break
     shipped audible. Under the 0.75 bar it stamps, and the corroborated
     sub-span (what pass 2 actually attested, clamped into the hold) is
     recorded for the trimmed auto-approve confirm."""
     proc = [_plain_proc(100.0, 317.9)]
-    orig = [_orig(835.1, 1053.0, 'pestease')]
+    orig = [_orig(835.1, 1053.0, 'acme')]
     hold = _diff_hold(837.4, 1077.3)
 
-    _cut, _ui, _held, n = _gate_verification_ads_by_confidence(
+    _cut, _ui, _held, n, _rel = _gate_verification_ads_by_confidence(
         proc, orig, min_cut_confidence=0.8, pass1_held_markers=[hold],
     )
 
@@ -750,13 +857,13 @@ def _contradiction_hold(start, end, p_start, p_end):
 
 
 def test_proposed_span_agreement_corroborates_despite_low_coverage():
-    # tosh-show 6e9f8a115e24 Lincoln Tech: hold 3872.9-3933.3, reviewer
+    # example-podcast a1b2c3d4e5f6 Acme: hold 3872.9-3933.3, reviewer
     # proposed 3895.8-3929.9, pass 2 found the same span. Coverage of the
     # padded hold is 56 percent, but the two sub-spans agree exactly.
     proc = [_plain_proc(100.0, 134.1)]
-    orig = [_orig(3895.8, 3929.9, 'lincoln')]
+    orig = [_orig(3895.8, 3929.9, 'acme')]
     hold = _contradiction_hold(3872.9, 3933.3, 3895.8, 3929.9)
-    _cut, _ui, _held, n = _gate_verification_ads_by_confidence(
+    _cut, _ui, _held, n, _rel = _gate_verification_ads_by_confidence(
         proc, orig, min_cut_confidence=0.8, pass1_held_markers=[hold])
     assert n == 1
     assert hold['pass2_corroborated'] is True
@@ -769,24 +876,10 @@ def test_proposed_span_disagreement_does_not_corroborate():
     proc = [_plain_proc(100.0, 120.0)]
     orig = [_orig(3873.0, 3893.0, 'other')]
     hold = _contradiction_hold(3872.9, 3933.3, 3895.8, 3929.9)
-    _cut, _ui, _held, n = _gate_verification_ads_by_confidence(
+    _cut, _ui, _held, n, _rel = _gate_verification_ads_by_confidence(
         proc, orig, min_cut_confidence=0.8, pass1_held_markers=[hold])
     assert n == 0
     assert 'pass2_corroborated' not in hold
-
-
-def _auto_approve_env(monkeypatch):
-    """Swap the IO seams _file_corroborated_hold_approvals touches, following
-    the file's MagicMock pattern; returns the db mock for filing asserts."""
-    db = MagicMock()
-    db.get_original_segments.return_value = [{'start': 0.0}]
-    storage = MagicMock()
-    storage.get_original_path.return_value.exists.return_value = True
-    monkeypatch.setattr(processing_mod, 'db', db)
-    monkeypatch.setattr(processing_mod, 'storage', storage)
-    monkeypatch.setattr(processing_mod, '_load_user_corrections',
-                        lambda s, e, d: ([], []))
-    return db
 
 
 def test_auto_approve_files_trimmed_confirm(monkeypatch):
@@ -796,10 +889,11 @@ def test_auto_approve_files_trimmed_confirm(monkeypatch):
     hold = _diff_hold(837.4, 1077.3)
     hold['pass2_corroborated'] = True
     hold['pass2_corroborated_span'] = {'start': 837.4, 'end': 1053.0}
-    db = _auto_approve_env(monkeypatch)
+    db = _approval_db(monkeypatch)
 
     approved = processing_mod._file_corroborated_hold_approvals(
-        'slug', 'ep', [hold])
+        'slug', 'ep', [hold],
+        corrections=_user_corrections('slug', 'ep'))
 
     assert approved == 1
     kwargs = db.create_pattern_correction.call_args.kwargs
@@ -813,13 +907,94 @@ def test_auto_approve_full_coverage_files_untrimmed_confirm(monkeypatch):
     hold = _diff_hold(4875.8, 5025.8)
     hold['pass2_corroborated'] = True
     hold['pass2_corroborated_span'] = {'start': 4875.9, 'end': 5025.8}
-    db = _auto_approve_env(monkeypatch)
+    db = _approval_db(monkeypatch)
 
     approved = processing_mod._file_corroborated_hold_approvals(
-        'slug', 'ep', [hold])
+        'slug', 'ep', [hold],
+        corrections=_user_corrections('slug', 'ep'))
 
     assert approved == 1
     assert db.create_pattern_correction.call_args.kwargs['corrected_bounds'] is None
+
+
+def test_auto_approve_files_one_confirm_for_duplicate_holds(monkeypatch):
+    """Duplicate holds attested by one pass-2 span file a single confirm."""
+    holds = []
+    for _ in range(2):
+        hold = _diff_hold(100.0, 200.0)
+        hold['pass2_corroborated'] = True
+        hold['pass2_corroborated_span'] = {'start': 120.0, 'end': 200.0}
+        holds.append(hold)
+    db = _approval_db(monkeypatch)
+
+    assert processing_mod._file_corroborated_hold_approvals(
+        'slug', 'ep', holds,
+        corrections=_user_corrections('slug', 'ep')) == 2
+    assert db.create_pattern_correction.call_count == 1
+
+
+def test_auto_approve_files_one_confirm_for_repeated_hold_object(monkeypatch):
+    """The same hold dict listed twice files once."""
+    hold = _diff_hold(100.0, 200.0)
+    hold['pass2_corroborated'] = True
+    db = _approval_db(monkeypatch)
+
+    processing_mod._file_corroborated_hold_approvals('slug', 'ep', [hold, hold], corrections=_user_corrections('slug', 'ep'))
+    assert db.create_pattern_correction.call_count == 1
+
+
+@pytest.mark.parametrize('order', [(0, 1), (1, 0)])
+def test_auto_approve_files_reason_matched_confirm_per_hold_reason(monkeypatch, order):
+    """Overlapping holds with different reasons each file their own confirm."""
+    diff = _diff_hold(100.0, 200.0)
+    rev = _diff_hold(105.0, 200.0)
+    rev['hold_reason'] = 'reviewer_contradiction'
+    pair = [diff, rev]
+    for hold in pair:
+        hold['pass2_corroborated'] = True
+    db = _approval_db(monkeypatch)
+
+    assert processing_mod._file_corroborated_hold_approvals(
+        'slug', 'ep', [pair[i] for i in order],
+        corrections=_user_corrections('slug', 'ep')) == 2
+    reasons = sorted(c.kwargs['source_hold_reason']
+                     for c in db.create_pattern_correction.call_args_list)
+    assert reasons == ['differential_uncorroborated', 'reviewer_contradiction']
+
+
+def test_auto_approve_files_for_reviewer_hold_despite_other_reason_auto_confirm(monkeypatch):
+    """An auto confirm on file for another reason does not cover a reviewer hold."""
+    rev = _diff_hold(100.0, 200.0)
+    rev['hold_reason'] = 'reviewer_contradiction'
+    rev['pass2_corroborated'] = True
+    db = _approval_db(monkeypatch)
+    on_file = [{'start': 100.0, 'end': 200.0, 'auto_filed': True,
+                'hold_reason': 'differential_uncorroborated'}]
+    monkeypatch.setattr(processing_mod, '_load_user_corrections',
+                        lambda s, e, d: ([], on_file))
+
+    processing_mod._file_corroborated_hold_approvals('slug', 'ep', [rev], corrections=_user_corrections('slug', 'ep'))
+    assert db.create_pattern_correction.call_count == 1
+
+    on_file[0]['hold_reason'] = 'reviewer_contradiction'
+    db.create_pattern_correction.reset_mock()
+    processing_mod._file_corroborated_hold_approvals('slug', 'ep', [rev], corrections=_user_corrections('slug', 'ep'))
+    db.create_pattern_correction.assert_not_called()
+
+
+def test_auto_approve_files_both_for_disjoint_holds(monkeypatch):
+    """Disjoint corroborated holds each get their own confirm."""
+    holds = []
+    for start, end in ((100.0, 200.0), (500.0, 600.0)):
+        hold = _diff_hold(start, end)
+        hold['pass2_corroborated'] = True
+        holds.append(hold)
+    db = _approval_db(monkeypatch)
+
+    assert processing_mod._file_corroborated_hold_approvals(
+        'slug', 'ep', holds,
+        corrections=_user_corrections('slug', 'ep')) == 2
+    assert db.create_pattern_correction.call_count == 2
 
 
 def test_proposed_span_outside_hold_does_not_corroborate():
@@ -829,7 +1004,7 @@ def test_proposed_span_outside_hold_does_not_corroborate():
     proc = [_plain_proc(100.0, 130.0)]
     orig = [_orig(160.0, 190.0, 'outside')]
     hold = _contradiction_hold(100.0, 160.0, 161.0, 190.0)
-    _cut, _ui, _held, n = _gate_verification_ads_by_confidence(
+    _cut, _ui, _held, n, _rel = _gate_verification_ads_by_confidence(
         proc, orig, min_cut_confidence=0.8, pass1_held_markers=[hold])
     assert n == 0
     assert 'pass2_corroborated' not in hold
@@ -844,10 +1019,11 @@ def test_approved_holds_are_cut_by_the_run_not_a_second_completion(monkeypatch):
     monkeypatch.setattr(processing_mod, '_recut_episode', recut)
     hold = _diff_hold(100.0, 200.0)
     hold['pass2_corroborated'] = True
-    _auto_approve_env(monkeypatch)
+    _approval_db(monkeypatch)
 
     assert processing_mod._file_corroborated_hold_approvals(
-        'slug', 'ep', [hold]) == 1
+        'slug', 'ep', [hold],
+        corrections=_user_corrections('slug', 'ep')) == 1
     recut.assert_not_called()
 
 
@@ -906,7 +1082,8 @@ def test_pass1_validator_receives_podcast_id(monkeypatch):
     with pytest.raises(_CapturedBuild):
         processing_mod._refine_and_validate(
             'show', 'ep1', ads, _segments(), None, None, 600.0, 0.8, 'Show',
-            podcast_id=7)
+            podcast_id=7,
+            corrections=([], []))
 
     assert seen.get('podcast_id') == 7
 
@@ -937,7 +1114,8 @@ def test_recut_validator_receives_podcast_id(monkeypatch):
 
     with pytest.raises(_CapturedBuild):
         processing_mod._build_recut_ad_list(
-            'show', 'ep1', _segments(), 600.0, None, 0.8, podcast_id=7)
+            'show', 'ep1', _segments(), 600.0, None, 0.8, podcast_id=7,
+            corrections=_user_corrections('show', 'ep1'))
 
     assert seen.get('podcast_id') == 7
 
@@ -959,6 +1137,23 @@ def test_drop_uncovered_handles_twinless_cut():
 
     assert v_ads_to_cut == [covered]
     assert filtered['was_cut'] is False
+
+
+def test_drop_uncovered_maps_twinless_cuts_with_one_timestamp_map(monkeypatch):
+    builds = []
+    real = vr._build_timestamp_map
+    monkeypatch.setattr(vr, '_build_timestamp_map', lambda cuts: builds.append(cuts) or real(cuts))
+    filtered = [{'start': 300.0, 'end': 305.0}, {'start': 400.0, 'end': 405.0}]
+    ledger = vr.Pass2Ledger()
+
+    _drop_uncovered_pass2_ads(
+        's', 'e', list(filtered), [], [], [], [], total_duration=600.0,
+        pass1_cuts=[{'start': 50.0, 'end': 80.0}], ledger=ledger)
+
+    assert len(builds) == 1
+    beep = processing_mod.get_replacement_duration()
+    assert [(e[1], e[2]) for e in ledger._entries.values()] == [
+        (300.0 + 30.0 - beep, 305.0 + 30.0 - beep), (400.0 + 30.0 - beep, 405.0 + 30.0 - beep)]
 
 
 def test_drop_uncovered_removes_split_cut_ui_twin():
@@ -994,7 +1189,7 @@ def test_filing_respects_human_reject(monkeypatch):
     hold = _diff_hold(4875.8, 5025.8)
     hold['pass2_corroborated'] = True
 
-    n = processing_mod._file_corroborated_hold_approvals('s', 'ep1', [hold])
+    n = processing_mod._file_corroborated_hold_approvals('s', 'ep1', [hold], corrections=_user_corrections('s', 'ep1'))
 
     assert n == 0
     db.create_pattern_correction.assert_not_called()
@@ -1012,7 +1207,7 @@ def test_filing_skips_without_retained_original(monkeypatch):
     hold = _diff_hold(4875.8, 5025.8)
     hold['pass2_corroborated'] = True
 
-    n = processing_mod._file_corroborated_hold_approvals('s', 'ep1', [hold])
+    n = processing_mod._file_corroborated_hold_approvals('s', 'ep1', [hold], corrections=_user_corrections('s', 'ep1'))
 
     assert n == 0
     db.create_pattern_correction.assert_not_called()
@@ -1079,7 +1274,7 @@ def _run_fold_branch(recut_result=True, recut_mutates=False):
         audio_processor_mod.get_audio_duration.return_value = 30.0
         ap = ap_cls.return_value
         ap.process_episode.side_effect = (
-            lambda audio_path, segs, cut_barriers=None: ('/tmp/fold-cut.mp3', list(segs)))
+            lambda audio_path, segs, cut_barriers=None, hard_barriers=None: ('/tmp/fold-cut.mp3', list(segs)))
         ap.get_audio_duration.return_value = 30.0
         storage.get_episode_path.return_value = '/tmp/fold-final.mp3'
 
@@ -1142,3 +1337,90 @@ def test_the_pipeline_hands_pass1_the_feeds_id():
     m = _run_fold_branch()
 
     assert m['refine'].call_args.kwargs['podcast_id'] == 1
+
+
+def _reviewer_reject(start, end):
+    return {'start': start, 'end': end, 'was_cut': False, 'source': 'reviewer',
+            'reviewer_verdict': 'reject'}
+
+
+def test_auto_approve_skips_hold_overlapping_reviewer_reject(monkeypatch):
+    db = _approval_db(monkeypatch)
+    hold = dict(_diff_hold(4875.8, 5025.8), pass2_corroborated=True)
+
+    n = processing_mod._file_corroborated_hold_approvals(
+        's', 'ep1', [hold, _reviewer_reject(5000.0, 5030.0)],
+        corrections=_user_corrections('s', 'ep1'))
+
+    assert n == 0
+    db.create_pattern_correction.assert_not_called()
+
+
+def test_reviewed_release_over_a_reviewer_reject_is_not_filed(monkeypatch):
+    db = _approval_db(monkeypatch)
+    release = {'start': 1040.0, 'end': 1060.0}
+    hold = {'start': 1000.0, 'end': 1100.0, 'held_for_review': True, 'was_cut': False,
+            'hold_reason': 'reviewer_inconclusive_bounds', 'pass2_corroborated': True,
+            'pass2_reviewed_release': dict(release), 'pass2_corroborated_span': dict(release)}
+
+    n = processing_mod._file_corroborated_hold_approvals(
+        's', 'ep1', [hold, _reviewer_reject(1050.0, 1058.0)],
+        corrections=_user_corrections('s', 'ep1'))
+
+    assert n == 0
+    db.create_pattern_correction.assert_not_called()
+
+
+def test_auto_approve_trimmed_span_clear_of_reviewer_reject_files(monkeypatch):
+    db = _approval_db(monkeypatch)
+    hold = _diff_hold(4875.8, 5025.8)
+    hold['pass2_corroborated'] = True
+    hold['pass2_corroborated_span'] = {'start': 4875.8, 'end': 4990.0}
+
+    n = processing_mod._file_corroborated_hold_approvals(
+        's', 'ep1', [hold, _reviewer_reject(5000.0, 5030.0)],
+        corrections=_user_corrections('s', 'ep1'))
+
+    assert n == 1
+    assert db.create_pattern_correction.call_args.kwargs['corrected_bounds'] == {
+        'start': 4875.8, 'end': 4990.0}
+
+
+def test_auto_approve_span_touching_a_reviewer_reject_files(monkeypatch):
+    db = _approval_db(monkeypatch)
+    hold = _diff_hold(4875.8, 5025.8)
+    hold['pass2_corroborated'] = True
+    hold['pass2_corroborated_span'] = {'start': 4875.8, 'end': 5000.0}
+
+    n = processing_mod._file_corroborated_hold_approvals(
+        's', 'ep1', [hold, _reviewer_reject(5000.0, 5030.0)],
+        corrections=_user_corrections('s', 'ep1'))
+
+    assert n == 1
+    db.create_pattern_correction.assert_called_once()
+    assert db.create_pattern_correction.call_args.kwargs['corrected_bounds'] == {
+        'start': 4875.8, 'end': 5000.0}
+
+
+def test_pass2_validation_uses_the_run_fp_snapshot_not_the_db():
+    db = _db()
+    db.get_false_positive_corrections.side_effect = AssertionError('read FPs from the DB')
+    processed = [{'start': 100.0, 'end': 160.0, 'confidence': 0.9}]
+    original = [{'start': 100.0, 'end': 160.0}]
+
+    kept_proc, kept_orig = _validate_verification_ads(
+        'show', 'ep1', processed, original, _segments(), ads_to_remove=[],
+        episode_description=None, min_cut_confidence=0.8, db=db, processed_duration=600.0,
+        false_positive_corrections=[{'start': 100.0, 'end': 160.0}])
+
+    assert kept_proc == [] and kept_orig == []
+
+
+def test_auto_approve_failure_after_filing_reports_the_filed_count(monkeypatch):
+    db = _approval_db(monkeypatch)
+    db.create_pattern_correction.side_effect = [None, RuntimeError('db locked')]
+    holds = [dict(_diff_hold(100.0, 200.0), pass2_corroborated=True),
+             dict(_diff_hold(400.0, 500.0), pass2_corroborated=True)]
+
+    assert processing_mod._file_corroborated_hold_approvals('s', 'ep1', holds, corrections=_user_corrections('s', 'ep1')) == 1
+    assert db.create_pattern_correction.call_count == 2

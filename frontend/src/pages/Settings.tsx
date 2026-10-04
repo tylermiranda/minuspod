@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react';
+import { useState, useEffect } from 'react';
 import { useSyncFromQuery } from '../hooks/useSyncFromQuery';
 import { useLocation } from 'react-router';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
@@ -16,6 +16,7 @@ import { LLM_PROVIDERS, SLOT_PRIMARY, SLOT_SECONDARY } from '../api/types';
 import SystemStatusSection from './settings/SystemStatusSection';
 import StorageRetentionSection from './settings/StorageRetentionSection';
 import DataManagementSection from './settings/DataManagementSection';
+import TroubleshootingSection from './settings/TroubleshootingSection';
 import DatabaseStatsSection from './settings/DatabaseStatsSection';
 import NotificationsSection from './settings/NotificationsSection';
 import AuthenticatedFeedsSection from './settings/AuthenticatedFeedsSection';
@@ -56,9 +57,8 @@ import PositionalPriorSection from './settings/PositionalPriorSection';
 import CommunityPatternsSection from './settings/CommunityPatternsSection';
 import DatabaseBackupSection from './settings/DatabaseBackupSection';
 import OutboundRequestsSection from './settings/OutboundRequestsSection';
-import { Search, X } from 'lucide-react';
-import { SettingsSearchContext, useSettingsSearch } from '../context/SettingsSearchContext';
-import { SettingsBulkCollapseProvider, type SettingsBulkCollapseSignal } from '../context/SettingsBulkCollapseContext';
+import SearchableSectionGroup from '../components/SearchableSectionGroup';
+import { useSettingsSearch } from '../context/SettingsSearchContext';
 import { reconcileStageSlotsForSecondaryToggle } from './settings/settingsUtils';
 import { btnPrimary } from '../components/buttonStyles';
 import { focusRing } from '../components/fieldStyles';
@@ -176,71 +176,6 @@ function Settings() {
     silenceSnapMaxDistanceSeconds: 2,
   });
   const [positionalPriorEnabled, setPositionalPriorEnabled] = useState(false);
-  const [settingsQuery, setSettingsQuery] = useState('');
-  // null = no active search; otherwise the set of matching section keys.
-  // Computed in the event handler (the lint forbids ref reads in render and
-  // setState in effects); hidden sections keep their textContent, so each
-  // keystroke can rescan every section.
-  const [settingsMatchKeys, setSettingsMatchKeys] = useState<Set<string> | null>(null);
-  const searchRegionRef = useRef<HTMLDivElement>(null);
-  // Expand all / Collapse all: bumps `seq` on each click so every
-  // CollapsibleSection under the provider snaps to `open`, even on a repeated
-  // click with the same value. Disabled while a search is active since search
-  // already overrides expansion.
-  const [bulkCollapseSignal, setBulkCollapseSignal] = useState<SettingsBulkCollapseSignal | null>(null);
-  const triggerBulkCollapse = (open: boolean) => {
-    setBulkCollapseSignal((prev) => ({ seq: (prev?.seq ?? 0) + 1, open }));
-  };
-  const runSettingsSearch = (q: string) => {
-    setSettingsQuery(q);
-    const norm = q.trim().toLowerCase();
-    if (!norm) {
-      setSettingsMatchKeys(null);
-      return;
-    }
-    // Scope the scan to the searchable region so the two sections above the
-    // search box (System Status, Processing Queue) don't count toward matches.
-    const matches = new Set<string>();
-    searchRegionRef.current?.querySelectorAll<HTMLElement>('[data-search-key]').forEach((el) => {
-      if ((el.textContent ?? '').toLowerCase().includes(norm)) {
-        const key = el.getAttribute('data-search-key');
-        if (key) matches.add(key);
-      }
-    });
-    setSettingsMatchKeys(matches);
-  };
-  // Paint the matched query text yellow within the searchable region as the user
-  // types -- CSS Custom Highlight API, so no DOM mutation and React stays in
-  // charge of the tree. Runs after the filter commit so ranges point at the
-  // freshly expanded sections; no-op where the API is unavailable (filtering
-  // still works). offsetParent skips text in display:none (non-matching) cards.
-  useEffect(() => {
-    if (typeof CSS === 'undefined' || !('highlights' in CSS)) return;
-    const norm = settingsQuery.trim().toLowerCase();
-    const region = searchRegionRef.current;
-    if (!norm || !region) {
-      CSS.highlights.delete('settings-search');
-      return;
-    }
-    const ranges: Range[] = [];
-    const walker = document.createTreeWalker(region, NodeFilter.SHOW_TEXT, {
-      acceptNode: (n) =>
-        n.nodeValue && n.parentElement?.offsetParent
-          ? NodeFilter.FILTER_ACCEPT
-          : NodeFilter.FILTER_REJECT,
-    });
-    for (let n = walker.nextNode(); n; n = walker.nextNode()) {
-      const hay = n.nodeValue!.toLowerCase();
-      for (let i = hay.indexOf(norm); i !== -1; i = hay.indexOf(norm, i + norm.length)) {
-        const r = document.createRange();
-        r.setStart(n, i);
-        r.setEnd(n, i + norm.length);
-        ranges.push(r);
-      }
-    }
-    CSS.highlights.set('settings-search', new Highlight(...ranges));
-    return () => { CSS.highlights.delete('settings-search'); };
-  }, [settingsQuery, settingsMatchKeys]);
   const [selectedModel, setSelectedModel] = useState('');
   const [verificationModel, setVerificationModel] = useState('');
   // Per-phase provider overrides; '' inherits (see AIModelsSection's
@@ -290,6 +225,7 @@ function Settings() {
   const [differentialMeasuredCorrMax, setDifferentialMeasuredCorrMax] = useState(0.6);
   const [differentialHoldMinSeconds, setDifferentialHoldMinSeconds] = useState(10);
   const [daiDifferentialOverridesKeep, setDaiDifferentialOverridesKeep] = useState(true);
+  const [spliceVetoEnabled, setSpliceVetoEnabled] = useState(true);
   // Neutral placeholder (cast); replaced by hydration before the form renders.
   const [llmProvider, setLlmProvider] = useState<LlmProvider>('' as LlmProvider);
   const [openaiBaseUrl, setOpenaiBaseUrl] = useState('');
@@ -707,6 +643,7 @@ function Settings() {
     { key: 'differentialMeasuredCorrMax', kind: 'val', useDefault: true, literal: 0.6, value: differentialMeasuredCorrMax, set: setDifferentialMeasuredCorrMax },
     { key: 'differentialHoldMinSeconds', kind: 'val', useDefault: true, literal: 10, value: differentialHoldMinSeconds, set: setDifferentialHoldMinSeconds },
     { key: 'daiDifferentialOverridesKeep', kind: 'val', useDefault: true, literal: true, value: daiDifferentialOverridesKeep, set: setDaiDifferentialOverridesKeep },
+    { key: 'spliceVetoEnabled', kind: 'val', useDefault: true, literal: true, value: spliceVetoEnabled, set: setSpliceVetoEnabled },
     // Audio cue detection (nested `audioCue` state)
     { key: 'audioCueDetectionEnabled', kind: 'val', useDefault: true, value: audioCue.enabled, obj: 'audioCue', prop: 'enabled' },
     { key: 'audioCueFreqMinHz', kind: 'val', useDefault: true, value: audioCue.freqMinHz, obj: 'audioCue', prop: 'freqMinHz' },
@@ -1029,56 +966,11 @@ function Settings() {
 
       {/* Settings search: filters the configurable sections below by matching a
           section's title or any of its setting labels (client-side, no backend). */}
-      <div className="relative">
-        <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground pointer-events-none" />
-        <input
-          type="text"
-          value={settingsQuery}
-          onChange={(e) => runSettingsSearch(e.target.value)}
-          placeholder="Search settings..."
-          aria-label="Search settings"
-          className="w-full rounded-lg border border-input bg-background text-foreground placeholder:text-muted-foreground pl-9 pr-9 py-2 focus:outline-hidden focus:ring-2 focus:ring-ring"
-        />
-        {settingsQuery && (
-          <button
-            type="button"
-            onClick={() => runSettingsSearch('')}
-            aria-label="Clear settings search"
-            className={`absolute right-2 top-1/2 -translate-y-1/2 p-1 rounded text-muted-foreground hover:text-foreground touch-manipulation ${focusRing}`}
-          >
-            <X className="w-4 h-4" />
-          </button>
-        )}
-      </div>
-
-      <div className="flex justify-end gap-3">
-        <button
-          type="button"
-          onClick={() => triggerBulkCollapse(true)}
-          disabled={settingsMatchKeys !== null}
-          className={`text-sm text-primary hover:underline ${settingsMatchKeys !== null ? 'opacity-50 pointer-events-none' : ''} ${focusRing}`}
-        >
-          Expand all
-        </button>
-        <button
-          type="button"
-          onClick={() => triggerBulkCollapse(false)}
-          disabled={settingsMatchKeys !== null}
-          className={`text-sm text-primary hover:underline ${settingsMatchKeys !== null ? 'opacity-50 pointer-events-none' : ''} ${focusRing}`}
-        >
-          Collapse all
-        </button>
-      </div>
-
-      <SettingsBulkCollapseProvider value={bulkCollapseSignal}>
-      <SettingsSearchContext.Provider value={settingsMatchKeys}>
-      <div ref={searchRegionRef} className="space-y-4">
-
-      {settingsMatchKeys !== null && settingsMatchKeys.size === 0 && (
-        <p className="text-sm text-muted-foreground px-1">
-          No settings match "{settingsQuery.trim()}".
-        </p>
-      )}
+      <SearchableSectionGroup
+        placeholder="Search settings..."
+        ariaLabel="Search settings"
+        clearLabel="Clear settings search"
+      >
 
       <SettingsGroupHeader title="Appearance" />
 
@@ -1321,6 +1213,8 @@ function Settings() {
         differentialHoldMinSeconds={differentialHoldMinSeconds}
         daiDifferentialOverridesKeep={daiDifferentialOverridesKeep}
         onDaiDifferentialOverridesKeepChange={setDaiDifferentialOverridesKeep}
+        spliceVetoEnabled={spliceVetoEnabled}
+        onSpliceVetoEnabledChange={setSpliceVetoEnabled}
         onDifferentialHoldMinSecondsChange={setDifferentialHoldMinSeconds}
       />
 
@@ -1486,6 +1380,8 @@ function Settings() {
         onMaxRssBytesChange={setMaxRssBytes}
       />
 
+      <TroubleshootingSection />
+
       <DatabaseStatsSection database={status?.database} />
 
       <DatabaseBackupSection />
@@ -1502,9 +1398,7 @@ function Settings() {
         plaintextSecretsCount={status?.security?.plaintextSecretsCount ?? 0}
       />
 
-      </div>
-      </SettingsSearchContext.Provider>
-      </SettingsBulkCollapseProvider>
+      </SearchableSectionGroup>
 
       {/* Error display */}
       {(updateMutation.error || resetMutation.error || resetPromptsMutation.error || resetPromptMutation.error) && (

@@ -3,14 +3,17 @@
 Provides shared audio file operations used across multiple modules.
 """
 
+import json
 import logging
 import os
+import re
 import subprocess
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import ClassVar
 
-from config import FFPROBE_TIMEOUT
+from config import FFMPEG_SHORT_TIMEOUT, FFPROBE_TIMEOUT
 from storage import _detect_image_mime
 from utils.subprocess_registry import tracked_run
 from utils.ffmpeg_run import SAFE_MEDIA_INPUT_ARGS, SAFE_MEDIA_PROBE_ARGS
@@ -38,6 +41,46 @@ def get_audio_codec(audio_path: str) -> str | None:
     except Exception as e:
         logger.warning(f"Codec query failed for {audio_path}: {e}")
     return None
+
+
+@dataclass(frozen=True)
+class RenderInput:
+    """What a render needs from its input file, read by one ffprobe call."""
+    duration: float | None
+    audio_format: tuple[int, int, str] | None  # (sample_rate, channels, channel_layout)
+    chapters: list[dict]  # raw ffprobe chapter entries
+
+
+def probe_render_input(audio_path: str) -> RenderInput | None:
+    """Duration, first audio stream format and chapters of a file, or None when ffprobe fails."""
+    cmd = [
+        'ffprobe', *SAFE_MEDIA_PROBE_ARGS, '-v', 'error',
+        '-select_streams', 'a:0',
+        '-show_entries', 'format=duration:stream=sample_rate,channels,channel_layout',
+        '-show_chapters', '-of', 'json',
+        audio_path
+    ]
+    try:
+        result = tracked_run(cmd, capture_output=True, timeout=FFPROBE_TIMEOUT)
+        if result.returncode != 0:
+            logger.warning(f"ffprobe failed for {audio_path}: "
+                           f"{result.stderr.decode('utf-8', errors='replace') or 'no output'}")
+            return None
+        info = json.loads(result.stdout.decode('utf-8', errors='replace'))
+    except Exception as e:
+        logger.warning(f"Render input probe failed for {audio_path}: {e}")
+        return None
+    try:
+        duration = float(info['format']['duration'])
+    except (KeyError, TypeError, ValueError):
+        duration = None
+    try:
+        stream = info['streams'][0]
+        audio_format = (int(stream['sample_rate']), int(stream['channels']),
+                        stream.get('channel_layout') or '')
+    except (KeyError, IndexError, TypeError, ValueError):
+        audio_format = None
+    return RenderInput(duration, audio_format, info.get('chapters') or [])
 
 
 def get_audio_duration(audio_path: str) -> float | None:
@@ -72,6 +115,30 @@ def get_audio_duration(audio_path: str) -> float | None:
     except Exception as e:
         logger.warning(f"Duration query failed for {audio_path}: {e}")
     return None
+
+
+_MEAN_VOLUME_RE = re.compile(r'mean_volume:\s*(-?[\d.]+|-inf) dB')
+
+
+def mean_volume_db(audio_path: str, start: float | None = None,
+                   duration: float | None = None) -> float | None:
+    """Mean volume in dB from ffmpeg volumedetect over an optional range, or None when unreadable."""
+    seek = ['-ss', str(start)] if start is not None else []
+    span = ['-t', str(duration)] if duration is not None else []
+    cmd = [
+        'ffmpeg', *SAFE_MEDIA_INPUT_ARGS, '-hide_banner', '-nostats',
+        *seek, '-i', audio_path, *span, '-vn', '-af', 'volumedetect', '-f', 'null', '-',
+    ]
+    try:
+        result = tracked_run(cmd, capture_output=True, text=True,
+                             timeout=FFMPEG_SHORT_TIMEOUT)
+    except Exception as e:
+        logger.warning(f"Volume probe failed for {audio_path}: {e}")
+        return None
+    match = _MEAN_VOLUME_RE.search(result.stderr or '')
+    if not match:
+        return None
+    return float(match.group(1))
 
 
 def extract_embedded_artwork(audio_path: str) -> tuple[bytes, str] | None:

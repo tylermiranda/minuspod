@@ -4,6 +4,9 @@ from unittest.mock import MagicMock
 import pytest
 
 from ad_detector import AdDetector
+from ad_validator import AdValidator
+from utils.markers import mark_distinct_merge
+from utils.text import pattern_offsets, word_boundary_re
 
 
 @pytest.fixture
@@ -18,8 +21,16 @@ def detector():
     det.sponsor_service = MagicMock()
     det.sponsor_service.get_sponsors = MagicMock(return_value=[])
     det.sponsor_service.find_sponsor_in_text = MagicMock(return_value=False)
+    det.sponsor_service.brand_mention_offsets = MagicMock(return_value={})
     det.audio_fingerprinter = None
     return det
+
+
+def _registry(detector, *names):
+    """Make the mocked sponsor registry know `names` and count their mentions like the real one."""
+    patterns = {name: word_boundary_re([name]) for name in names}
+    detector.sponsor_service.brand_mention_offsets.side_effect = (
+        lambda text: pattern_offsets(text, patterns))
 
 
 def _segments():
@@ -89,3 +100,264 @@ class TestGateBShortSponsor:
         call = detector.text_pattern_matcher.create_patterns_from_ad.call_args
         assert call is not None
         assert call.kwargs["sponsor"] == "Xero"
+
+
+def test_learning_skips_silent_remainder_cut_with_the_ad(detector):
+    read = {"start": 100.0, "end": 160.0, "text": "brought to you by LongerName use promo code show"}
+    silence = {"silence_spans": [{"start": 160.0, "end": 200.0, "duration": 40.0}]}
+    ad = {"start": 100.0, "end": 160.0, "confidence": 0.95, "sponsor": "LongerName",
+          "reason": "LongerName sponsor read", "detection_stage": "claude"}
+    mark_distinct_merge(ad, {"start": 150.0, "end": 200.0, "confidence": 0.95,
+                             "detection_stage": "text_pattern", "span_estimated": True,
+                             "text_start": 150.0, "text_end": 160.0,
+                             "has_estimated_pattern_member": True})
+    ad["end"] = 200.0
+
+    cut = AdValidator(3600.0, [read], splice_veto_enabled=False).validate(
+        [ad], audio_analysis=silence).ads
+    assert [(a["start"], a["end"]) for a in cut] == [(100.0, 200.0)]
+    cut[0]["was_cut"] = True
+
+    detector.learn_from_detections(cut, [read], podcast_id="podA", episode_id="ep1")
+
+    call = detector.text_pattern_matcher.create_patterns_from_ad.call_args
+    assert (call.kwargs["start"], call.kwargs["end"]) == (100.0, 160.0)
+
+
+def _dai_marker(members):
+    return {"start": 731.1, "end": 939.9, "was_cut": True, "confidence": 0.9,
+            "detection_stage": "dai_differential", "category": "sponsor",
+            "reason": "Dynamically inserted: audio differs across fetches",
+            "merged_distinct_ads": True, "merged_member_spans": members}
+
+
+def _claude_member(confidence=0.97, sponsor="LongerName", start=731.1, end=937.8):
+    return {"start": start, "end": end, "stage": "claude", "confidence": confidence,
+            "sponsor": sponsor}
+
+
+def test_claude_member_of_a_dai_marker_is_learned_on_its_own_span(detector, caplog):
+    member = _claude_member()
+    with caplog.at_level("INFO", logger="podcast.claude"):
+        detector.learn_from_detections(
+            [_dai_marker([member, {"start": 731.1, "end": 939.9, "stage": "dai_differential"}])],
+            _segments(), podcast_id="podA", episode_id="ep1")
+    call = detector.text_pattern_matcher.create_patterns_from_ad.call_args
+    assert call is not None
+    assert (call.kwargs["start"], call.kwargs["end"]) == (731.1, 937.8)
+    assert call.kwargs["sponsor"] == "LongerName"
+    # The splitter sees the member candidate, not the merged marker.
+    assert call.kwargs["ad"]["detection_stage"] == "claude"
+    assert "Learning from claude member 731.1s-937.8s" in caplog.text
+
+
+def test_member_span_is_clipped_to_the_marker_bounds(detector):
+    marker = _dai_marker([_claude_member(start=700.0, end=950.0)])
+    marker["end"] = 930.0  # a reviewer trim
+    detector.learn_from_detections([marker], _segments(), podcast_id="podA", episode_id="ep1")
+    call = detector.text_pattern_matcher.create_patterns_from_ad.call_args
+    assert (call.kwargs["start"], call.kwargs["end"]) == (731.1, 930.0)
+
+
+def test_no_learning_when_a_pattern_explains_the_whole_member(detector, caplog):
+    marker = _dai_marker([_claude_member(start=760.0, end=800.0),
+                          {"start": 750.0, "end": 810.0, "stage": "text_pattern", "pattern_id": 4},
+                          {"start": 731.1, "end": 939.9, "stage": "dai_differential"}])
+    with caplog.at_level("DEBUG", logger="podcast.claude"):
+        detector.learn_from_detections([marker], _segments(), podcast_id="podA", episode_id="ep1")
+    detector.text_pattern_matcher.create_patterns_from_ad.assert_not_called()
+    assert "Skipping pattern learning for dai_differential marker" in caplog.text
+
+
+def _pieces(marker, min_piece_s=15.0):
+    return [(c["start"], c["end"]) for c in AdDetector._learning_candidates(marker, min_piece_s)]
+
+
+def test_mid_roll_member_learns_around_the_known_reads(caplog):
+    marker = _dai_marker([
+        _claude_member(),
+        {"start": 760.0, "end": 799.9, "stage": "text_pattern", "pattern_id": 4},
+        {"start": 783.8, "end": 829.4, "stage": "text_pattern", "pattern_id": 5},
+    ])
+    with caplog.at_level("INFO", logger="podcast.claude"):
+        assert _pieces(marker) == [(731.1, 760.0), (829.4, 937.8)]
+    assert "Learning 2 piece(s) of claude member 731.1s-937.8s" in caplog.text
+
+
+def test_pre_roll_member_learns_only_the_unknown_stretch():
+    marker = dict(_dai_marker([
+        _claude_member(start=0.0, end=26.7), _claude_member(start=28.0, end=146.7),
+        {"start": 0.0, "end": 26.7, "stage": "text_pattern", "pattern_id": 1},
+        {"start": 28.0, "end": 64.8, "stage": "fingerprint", "pattern_id": 2},
+        {"start": 87.0, "end": 146.7, "stage": "text_pattern", "pattern_id": 3},
+    ]), start=0.0, end=150.5)
+    assert _pieces(marker) == [(64.8, 87.0)]
+
+
+def test_a_piece_shorter_than_the_minimum_is_dropped():
+    marker = _dai_marker([
+        _claude_member(),
+        {"start": 741.1, "end": 937.8, "stage": "fingerprint", "pattern_id": 2},
+    ])
+    assert _pieces(marker) == []
+
+
+def test_a_cut_down_piece_takes_its_sponsor_from_its_own_text(detector):
+    _registry(detector, "Xero", "KnownBrand")
+    marker = _dai_marker([
+        _claude_member(sponsor="KnownBrand"),
+        {"start": 800.0, "end": 937.8, "stage": "fingerprint", "pattern_id": 2},
+    ])
+    segments = [{"start": 731.1, "end": 800.0,
+                 "text": "Xero is the accounting platform. Try Xero today."}]
+    detector.learn_from_detections([marker], segments, podcast_id="podA", episode_id="ep1")
+    call = detector.text_pattern_matcher.create_patterns_from_ad.call_args
+    assert (call.kwargs["start"], call.kwargs["end"]) == (731.1, 800.0)
+    assert call.kwargs["sponsor"] == "Xero"
+
+
+def test_a_claude_member_below_the_floor_is_not_learned(detector):
+    detector.learn_from_detections(
+        [_dai_marker([_claude_member(confidence=0.5)])], _segments(),
+        podcast_id="podA", episode_id="ep1")
+    detector.text_pattern_matcher.create_patterns_from_ad.assert_not_called()
+
+
+def test_a_marker_without_members_logs_nothing(detector, caplog):
+    marker = _dai_marker([])
+    del marker["merged_member_spans"]
+    with caplog.at_level("DEBUG", logger="podcast.claude"):
+        detector.learn_from_detections([marker], _segments(), podcast_id="podA", episode_id="ep1")
+    assert "Skipping pattern learning" not in caplog.text
+
+
+def test_member_sponsor_is_not_taken_from_the_parent_reason(detector):
+    detector.sponsor_service.find_sponsor_in_text.side_effect = (
+        lambda text: "Acme Tools" if "Acme" in text else None)
+    marker = _dai_marker([_claude_member(sponsor="NewBrand")])
+    marker["reason"] = "Acme Tools sponsor read followed by another read"
+    detector.learn_from_detections([marker], _segments(), podcast_id="podA", episode_id="ep1")
+    call = detector.text_pattern_matcher.create_patterns_from_ad.call_args
+    assert call.kwargs["sponsor"] == "NewBrand"
+
+
+def test_member_candidate_carries_the_parent_dai_cores_clipped(detector):
+    marker = _dai_marker([_claude_member()])
+    marker["dai_core_spans"] = [{"start": 731.1, "end": 833.0}, {"start": 833.3, "end": 939.9}]
+    marker["dai_probe_spans"] = [{"start": 731.6, "end": 735.6}]
+    marker["pattern_id"] = 12
+    marker["cue_snap"] = {"end": {"source": "template", "cue_start": 940.0, "cue_end": 941.0}}
+    detector.learn_from_detections([marker], _segments(), podcast_id="podA", episode_id="ep1")
+    candidate = detector.text_pattern_matcher.create_patterns_from_ad.call_args.kwargs["ad"]
+    assert candidate["dai_core_spans"] == [{"start": 731.1, "end": 833.0},
+                                           {"start": 833.3, "end": 937.8}]
+    for key in ("merged_member_spans", "reason", "pattern_id", "cue_snap"):
+        assert key not in candidate
+
+
+def test_member_candidates_still_pass_the_sponsor_gates(detector):
+    detector.learn_from_detections(
+        [_dai_marker([_claude_member(sponsor="Foobr")])], _segments(),
+        podcast_id="podA", episode_id="ep1")
+    detector.text_pattern_matcher.create_patterns_from_ad.assert_not_called()
+
+
+@pytest.mark.parametrize("stage, learned", [("cue_pair", True), ("manual", True),
+                                           ("fingerprint", False)])
+def test_only_pattern_matches_explain_a_claude_member(detector, stage, learned):
+    marker = _dai_marker([_claude_member(), {"start": 731.1, "end": 939.9, "stage": stage}])
+    detector.learn_from_detections([marker], _segments(), podcast_id="podA", episode_id="ep1")
+    assert detector.text_pattern_matcher.create_patterns_from_ad.called is learned
+
+
+def test_a_member_abutting_a_pattern_match_is_learned(detector):
+    marker = _dai_marker([_claude_member(end=800.0),
+                          {"start": 800.0, "end": 860.0, "stage": "fingerprint", "pattern_id": 3}])
+    detector.learn_from_detections([marker], _segments(), podcast_id="podA", episode_id="ep1")
+    call = detector.text_pattern_matcher.create_patterns_from_ad.call_args
+    assert (call.kwargs["start"], call.kwargs["end"]) == (731.1, 800.0)
+
+
+def test_a_claude_marker_with_claude_members_learns_once(detector):
+    marker = dict(_dai_marker([_claude_member(), _claude_member(start=800.0, end=900.0)]),
+                  detection_stage="claude", sponsor="LongerName", confidence=0.99)
+    detector.learn_from_detections([marker], _segments(), podcast_id="podA", episode_id="ep1")
+    assert detector.text_pattern_matcher.create_patterns_from_ad.call_count == 1
+
+
+def _cut_down_marker(sponsor):
+    return _dai_marker([
+        _claude_member(sponsor=sponsor),
+        {"start": 731.1, "end": 800.0, "stage": "fingerprint", "pattern_id": 2},
+    ])
+
+
+def test_the_removed_read_does_not_name_the_new_piece(detector):
+    """The known read's last segment ends exactly at the piece start and names the known brand."""
+    _registry(detector, "KnownBrand")
+    segments = [{"start": 790.0, "end": 800.0, "text": "KnownBrand sale ends soon."},
+                {"start": 800.5, "end": 930.0, "text": "A new read about something else entirely."}]
+    detector.learn_from_detections([_cut_down_marker("KnownBrand")], segments,
+                                   podcast_id="podA", episode_id="ep1")
+    detector.text_pattern_matcher.create_patterns_from_ad.assert_not_called()
+
+
+def test_a_cut_down_piece_keeps_the_member_sponsor_it_names(detector):
+    segments = [{"start": 801.0, "end": 930.0, "text": "This part is brought to you by NewBrand Labs."}]
+    detector.learn_from_detections([_cut_down_marker("NewBrand Labs")], segments,
+                                   podcast_id="podA", episode_id="ep1")
+    call = detector.text_pattern_matcher.create_patterns_from_ad.call_args
+    assert (call.kwargs["start"], call.kwargs["end"]) == (800.0, 937.8)
+    assert call.kwargs["sponsor"] == "NewBrand Labs"
+
+
+def test_a_whole_member_does_not_use_the_transcript_fallback(detector):
+    detector.sponsor_service.find_sponsor_in_text.side_effect = (
+        lambda text: "Globex Foods" if "Globex" in text else None)
+    marker = _dai_marker([_claude_member(sponsor=None)])
+    segments = [{"start": 731.1, "end": 937.8, "text": "Globex Foods makes dinner easy."}]
+    detector.learn_from_detections([marker], segments, podcast_id="podA", episode_id="ep1")
+    detector.text_pattern_matcher.create_patterns_from_ad.assert_not_called()
+
+
+def test_an_untimed_segment_straddling_the_piece_start_adds_nothing(detector):
+    _registry(detector, "KnownBrand")
+    segments = [{"start": 780.0, "end": 830.0, "text": "KnownBrand ends. New read here."}]
+    detector.learn_from_detections([_cut_down_marker("KnownBrand")], segments,
+                                   podcast_id="podA", episode_id="ep1")
+    detector.text_pattern_matcher.create_patterns_from_ad.assert_not_called()
+
+
+def test_a_placeholder_member_label_is_not_a_sponsor(detector):
+    segments = [{"start": 801.0, "end": 930.0, "text": "Try multiple flavors this week."}]
+    detector.learn_from_detections([_cut_down_marker("Multiple")], segments,
+                                   podcast_id="podA", episode_id="ep1")
+    detector.text_pattern_matcher.create_patterns_from_ad.assert_not_called()
+
+
+def _piece_sponsor(detector, text, member_sponsor=None):
+    piece = {"start": 800.0, "end": 937.8, "_cut_down": True, "_member_sponsor": member_sponsor}
+    return detector._cut_down_piece_sponsor(piece, [{"start": 801.0, "end": 930.0, "text": text}])
+
+
+def test_the_most_named_brand_beats_a_passing_registry_noun(detector):
+    _registry(detector, "Headspace", "Acme Wash")
+    text = ("They take up our headspace. Acme Wash is a premium laundry service. "
+            "Acme Wash picks up and delivers. Try Acme Wash today.")
+    assert _piece_sponsor(detector, text) == "Acme Wash"
+
+
+def test_a_single_passing_brand_mention_is_not_a_sponsor(detector):
+    _registry(detector, "Headspace")
+    assert _piece_sponsor(detector, "Free up some headspace this week.") is None
+
+
+def test_a_single_mention_counts_when_it_is_the_member_sponsor(detector):
+    _registry(detector, "Acme Wash")
+    assert _piece_sponsor(detector, "Acme Wash picks up laundry.", "Acme Wash") == "Acme Wash"
+
+
+def test_a_mention_tie_goes_to_the_earliest_brand(detector):
+    _registry(detector, "Globex Foods", "Acme Wash")
+    text = "Acme Wash is great. Globex Foods too. Acme Wash again. Globex Foods again."
+    assert _piece_sponsor(detector, text) == "Acme Wash"

@@ -9,6 +9,385 @@ Alongside the standard sections, a "Breaking" section marks changes
 that require operator action; these are surfaced at the top of stable
 release notes.
 
+## [2.97.45] - 2026-10-01
+
+### Fixed
+- Model-detected spans with no category, or with a reason that only cites audio signals (splice, DAI transition, volume step), are now held for review. They are cut only when the span's transcript names a sponsor or carries a link, promo code or sponsor phrase. Measured audio also allows the cut: a cross-fetch core, fingerprint, cue or cross-fetch difference. (#807)
+- A model reason that only echoes audio signals no longer counts as ad language, and a splice id or dB reading is never taken as a sponsor name.
+
+## [2.97.44] - 2026-10-01
+
+### Fixed
+- A learned pattern piece takes the sponsor that is named most inside it, so a passing mention of another registered brand can no longer relabel or block the read.
+- Learned pieces are split at the transcript boundary where the next read starts and trimmed to the sponsor's own copy, instead of inheriting a neighbouring read's opening or closing sentences.
+
+## [2.97.43] - 2026-10-01
+
+### Fixed
+- Pattern learning on a merged ad block now learns the stretches of the LLM detection that no existing pattern covers, instead of skipping the whole detection when one known read sits inside it. Each piece names its sponsor only from the words spoken inside it.
+
+## [2.97.42] - 2026-10-01
+
+### Fixed
+- Patterns are now learned from the LLM detections inside a merged marker that no existing pattern already covers, so feeds whose ad breaks end up as cross-fetch regions learn patterns too.
+- A reviewer trim can no longer pull an ad edge away from a labelled boundary cue the edge was snapped to.
+- The review modal's sponsor is validated as a string, and frontend and backend regression tests cover it (follow-up to #805, reported in #804).
+- A focused control at the top of a settings section no longer has its focus ring clipped; the section body only clips while it is collapsed, hidden by search, or animating.
+- The Whisper model is unloaded from the GPU after the transcript repair passes and whenever the processing queue is empty, instead of staying resident until the next episode.
+
+## [2.97.41] - 2026-09-30
+
+### Added
+- The podcast settings page has the same search as the Settings page: type to filter the setting groups, matches are highlighted, and the groups that hold them expand. Reported in #803.
+
+### Changed
+- Feed settings are grouped into collapsible sections, so the search and the Expand all and Collapse all buttons work the same way as on the Settings page. The new sections start open.
+
+### Fixed
+- Speech that Whisper's batched decoder skipped inside an episode is re-transcribed without voice detection before detection runs, in both passes. A sponsor read whose opening never reached the transcript is now seen by the detector, the text patterns and the reviewer. The repaired pass-1 transcript is saved, and a hole that held no speech is not tried again on reprocess.
+- The reviewer can no longer move an ad edge across 8 s or more of untranscribed audio inside the ad. This also covers the trim offered on a held ad. Untranscribed audio at the start or end of an ad counts for every ad that contains transcribed speech; gaps between transcribed words count for every ad.
+- The reviewer prompt names every untranscribed stretch between transcribed words inside a candidate instead of showing nothing there. Stretches at the start or end of a candidate are not listed, though the edge rule still applies to them.
+
+## [2.97.40] - 2026-09-30
+
+### Fixed
+- A call-to-action path link ('go to brand-site dot com slash show') counts as commercial language for a sponsor named beside it. The domain need not match the brand and the dot may be spaced, so these reads are no longer held for missing splice evidence.
+- A transcription whose Whisper model fails to load on the GPU is retried instead of being marked permanently failed, in pass 2 as well; an out-of-memory mid-transcription still fails as before.
+- Pass-2 fragments shorter than one second left by a split at a hold edge are dropped before validation.
+
+## [2.97.39] - 2026-09-30
+
+### Added
+- Global splice veto toggle in Settings; the per-feed setting now shows which global value it inherits.
+- Episode detail reports the feed's splice calibration; long LLM cuts record whether audio evidence
+  corroborated them.
+- The LLM benchmark supports Ollama models, starting with gemma4:e4b (#797).
+- `GUNICORN_ACCESS_LOG` and `GUNICORN_ERROR_LOG` select where the server logs go (console, disabled, or
+  a file). Thanks to @tlvince (#799).
+
+### Changed
+- `scrub_description` can take part of `max_length` from the start of a description and the rest from
+  the end, with an ellipsis between. The default still takes it all from the start (#785).
+- The `strip_comments_from_prompt` docstring and tests now cover literal comments: one indented four or
+  more spaces is markdown code and stays in the prompt (#785).
+- The Dockerfiles use BuildKit cache mounts for npm and pip, so local rebuilds reuse downloaded packages
+  such as PyTorch instead of fetching them again (#785).
+
+### Fixed
+- The splice veto no longer holds a long cut when the cross-fetch proved the whole episode identical
+  across downloads (baked-in audio has no splice to find).
+- A sponsor the detection names is confirmed from the span transcript when the span speaks a framing
+  phrase for it and carries a link or offer. First-time sponsors no longer fail the veto. Patrons,
+  listeners and the show's own name never count.
+- A feed whose long cuts rarely show splice evidence is classified host_read and the veto does not apply
+  to it; the status is measured from the last 20 episodes once five carry the new field.
+- A hold review that returns an adjust covering the reviewed span now releases the covered part of the
+  hold and sends the audio outside the hold through pass 2. Before, the whole hold stayed in place.
+- Pending holds shrink to what the rendered cuts leave, so a hold never claims audio that a reviewed or
+  merged cut already removed.
+- The settings API returns the four chapter density tunables, so the Chapter density form shows the
+  stored values after a reload instead of the defaults. Reported in #800.
+
+### Security
+- Bumped urllib3 to 2.8.0 to clear CVE-2026-97687, CVE-2026-97688 and CVE-2026-97689 reported against
+  2.7.0.
+
+## [2.97.38] - 2026-09-30
+
+### Security
+- Bumped pyjwt to 2.15.1 to clear CVE-2026-101917 and CVE-2026-102265 through
+  CVE-2026-102274 reported against 2.13.0. No call-site changes.
+- The CI pip-audit ignores for PYSEC-2025-183 (pyjwt) and PYSEC-2024-277 (joblib) are
+  removed. Neither advisory matches the current pins.
+
+## [2.97.37] - 2026-09-29
+
+### Fixed
+- The replacement audio is now resampled and reformatted to the episode's sample rate and channel layout
+  before it is joined to the episode. The filler branch no longer depends on the conversion ffmpeg would
+  insert on its own. Fixes the libmp3lame "inadequate AVFrame plane padding" failure on ffmpeg 9 (#796)
+  and applies to uploaded replacement audio as well as the shipped clip. The encoder also receives full-size frames, so a short
+  trailing frame cannot trip the check.
+- The local Whisper packages (faster-whisper, ctranslate2) are optional when WHISPER_BACKEND is
+  openai-api. Selecting the local backend without them fails with an actionable error instead of a
+  generic transcription failure, and the system status reports the missing packages (#795).
+- The pass-2 reviewer now receives the same hard protection barriers as pass 1, so an adjustment that
+  reaches into kept audio is clamped instead of held.
+- Pass-2 validation uses the once-per-run false-positive snapshot; the pass-2 failure path records an
+  outcome on held and kept markers.
+- Reviewer rejects are render barriers in the full run as well as on recut.
+- A user confirm inside a reviewer-rejected span is cut on the recut as well as the full run; the rest of
+  the rejected span stays a barrier on both.
+- Cross-fetch probe windows are clamped to the refetch file, and blocks at the file edges are probed at
+  the edge offsets, so a pre-roll or post-roll present in only one fetch is classified correctly.
+- The long-window sponsor gate requires commercial context for description sponsors, as it does for
+  registry brands. The content-extension start walk checks the segment that straddles the ad start. A
+  word-timed end edge is trimmed to the return-to-show cue, like the start edge.
+- The correction origin backfill maps the oldest hold snippet to a valid hold reason and repairs rows
+  written with the invalid value.
+- An estimated pattern remainder the audio analysis measures as silence (dead air between an ad and the
+  show) is now cut with the ad instead of held for review. The pattern match is enough evidence for silence.
+  Absorbed silence does not count toward the ad duration limits or the per-feed cap, and the reviewer does
+  not trim it back.
+
+### Changed
+- Shared helpers replace duplicated interval merging, carving, pass-2 hold handling, end-edge
+  inheritance and sponsor gate rules. Validator registry lookups, pattern outro checks, render probes and
+  the detections listing do less repeated work. Marker fields already returned by the API are now
+  documented.
+- The long-window sponsor gate and the validator share one registry rule: the best-supported brand with
+  at least two mentions and commercial context confirms the sponsor.
+
+## [2.97.36] - 2026-09-29
+
+### Fixed
+
+- A feed body cut inside a CDATA section is now rejected as truncated instead of being accepted as a partial document. The stored episodes are kept and the refresh retries, as it already does for a body that ends mid-element.
+
+### Changed
+
+- The identity retry that follows a gzip decode failure logs the body size and the length and encoding headers it received, so a repeatedly short body can be traced to the transport.
+
+## [2.97.35] - 2026-09-29
+
+### Fixed
+
+- A recut no longer rewrites a split piece to another piece's bounds. A split records the first piece as a boundary adjustment over the original span. Recuts applied it to the longest piece instead, which then stopped being cut. A recut now applies an adjustment to the marker nearest its new bounds. If several markers sit under the old span and none touch the new one, it is skipped. Reported in #794.
+
+## [2.97.34] - 2026-09-28
+
+### Fixed
+
+- When a pass-2 finding overlaps a pass-1 hold, the parts outside the hold are no longer discarded. They go through validation and review like any other pass-2 finding. The hold itself is still decided on the full finding. An outside part can now be cut while an estimated-pattern hold next to it stays pending, so an episode may show a partial cut beside a held marker.
+- A hold with several supported reads inside it can now have each read reviewed and released separately. Before, only one span per hold was reviewed.
+- Ad validation no longer auto-rejects ads whose reason contains a word ending in "no" before "ad" or "sponsor", such as "Casino ad" being read as "no ad". Contributed in #793, fixes #792.
+- Pending holds now block gap merges and the end-of-file extension in the pass-1 render and in recuts. A cut before a pending hold no longer runs through the hold to the end of the file. The held audio stays in until it is reviewed.
+
+### Added
+
+- Every pass-2 span now ends with one logged outcome: cut, held, kept, rejected, covered or dropped, with the reason and its bounds in original time. The stored run stats count each outcome; the API does not return those counts.
+- Confirms filed by pass-2 auto-approval now record the hold they released (`hold_id`). A hold gets its id when first held. Holds saved before this release get one derived from their bounds and reason when loaded, so repeated loads agree. The id survives a recut and other paths that start from stored markers, so releases of one hold stay grouped even if its edges move. A full re-detect creates new holds with new ids. Confirms filed against an earlier hold still group by that hold's id, and older confirms without a hold id group by exact hold bounds.
+- Markers that pass 2 ends with now carry `pass2_outcome` in the API: cut, kept, or held with its reason. Spans pass 2 discarded are still only logged and counted in the stored run stats.
+
+## [2.97.33] - 2026-09-28
+
+### Fixed
+
+- Common host-read closings now count as commercial language when a sponsor is confirmed. They are a call to action before the sponsor's domain ("learn more at acme.com"), a domain read aloud or spelled out ("acme dot com", "A-C-M-E.com"), and a thank-you that names the sponsor ("thanks to Acme for supporting the show"). The domain must match the sponsor. A written domain with no call to action, a plain "thanks to Acme", and "our friends at Acme" do not count, since news and conversation use them too.
+- A span that names its own sponsor in the transcript or the sponsor registry is no longer held for lacking splice evidence. A sponsor named only in the model's reason still holds.
+- The long-window sponsor check now reads the span's transcript, not just the model's reason, so a truncated reason no longer drops a real read. The transcript must name the same sponsor at least twice, and a segment at the edge of the span counts only its words inside the span. A brand known only from the sponsor registry also needs commercial language in the span, as the splice check requires. A brand named twice in conversation does not count.
+
+### Changed
+
+- When a pass-2 hold review leaves the hold in place, the marker now records the span, the verdict and the reason as `pass2_hold_review`. The episode view shows them on their own line under the hold. Pass-1 reviewer reasoning is left as it was.
+
+## [2.97.32] - 2026-09-28
+
+### Fixed
+
+- Pattern learning no longer merges a self-promo intro and the sponsor read after it into one pattern with an inflated duration. Merged markers keep each member's sponsor and category. When the opening and closing reads of a span name different sponsors or categories, the span is split at a divider, and each piece takes its own read's category. With no divider, the span is not learned.
+- Cross-fetch comparison no longer marks show audio as different when the refetched copy has an ad inserted where the processed copy has none. A block with no match is now probed at the offsets on both sides of it, not only at the interpolated one.
+- Pass-2 auto-approval now files one confirm per span, even when two held markers cover the same audio. A reviewer hold still gets its own confirm when the other hold has a different reason, since only a confirm with a matching reason releases it.
+- Deactivating a pattern through the API or by merging patterns now records when it was disabled. Deactivating it again keeps the first time. Reactivating it clears the time and the disabled reason.
+
+### Changed
+
+- Confirms filed by pass-2 auto-approval are now stored with their origin instead of being recognized by a text prefix. Existing rows are migrated at startup. The episode view labels them "Auto-approved", and episode corrections in the API include an `origin` field. These confirms no longer feed the positional prior or the pattern backfill from corrections, so neither learns from the pipeline's own output.
+- A marker the render removed only in part is now split into cut and uncut fragments. Each fragment records the detected span it came from in `carved_from`, which replaces `partial_cut_spans` in the marker schema. An uncut remainder that a later pass cuts in part is split again. Episodes saved with `partial_cut_spans` are split the same way when loaded, except that a marker still pending review stays whole. Carved fragments do not seed learned patterns.
+- Reviewer rejects are now enforced inside validation, so every recut follows one code path. Behavior is unchanged.
+- Recuts now log the resolved category action map, as full runs do.
+- The episode view names the hold reason on every held marker instead of a generic Held chip.
+- DAI markers saved before probe windows were recorded are normalized when loaded. Probe windows are no longer inferred at each use.
+
+### Added
+
+- The ad review list can filter pending detections by hold reason and shows how many are pending for each reason in the selected feed. The detections endpoint accepts a `holdReason` query parameter, returns `holdReason` on each detection, and reports `counts.pendingByHoldReason`.
+
+## [2.97.31] - 2026-09-27
+
+### Fixed
+
+- When a feed keeps a category, a text pattern whose length was estimated now protects only the words it matched. Before, its estimated tail could overlap a precisely timed sponsor read next to it, and that part of the read stayed in the audio.
+- The reviewer prompt no longer lists a coarse transcript edge as measured. An edge with no precise evidence is now shown as unmeasured.
+- A pass-2 finding sent to review inside a held span is now logged as sent to review, not as dropped.
+
+### Changed
+
+- Each run logs its resolved category action map and names the categories set by a feed override.
+- Tests now pin keep-map behavior: a self-promo inside a sponsor read stays in the audio, the reviewer cannot move the read's edge into it, and the replay harness checks the merge under fixed action maps.
+
+## [2.97.30] - 2026-09-27
+
+### Fixed
+
+- A recut no longer cuts audio the reviewer rejected. The recut revalidated a rejected span from scratch, accepted it and saved it as cut, and every later recut kept cutting it. Reviewer rejects now stay in the audio unless the user confirmed or adjusted that span. Pass-2 auto-approval no longer files a confirm over audio the reviewer rejected. Markers already saved in that state are repaired on the next recut.
+- A recut, including the automatic approval recut that follows pass 2, no longer cuts a marker the reviewer held for review. It stays held until the user approves it or pass 2 approves the hold.
+- A defined pattern in a category the feed keeps now resolves to remove in every processing step, as it already did at the cut. Before, close-ad merging, duplicate folding and pattern coverage still treated it as kept. It could block a merge with the sponsor read next to it or fail to cover a detection inside it.
+- Kept audio is no longer cut out of the episode. Keeps only stopped cuts from merging across them or extending over them, so a pass-1 cut, a reviewer adjustment or a recut could still overlap a kept span and remove it. Cuts are now split around kept audio before rendering, and the render clips any cut that still reaches into it. The reviewer can no longer widen an edge into kept audio. A recut no longer re-validates kept markers, so they cannot merge into a neighboring cut.
+- A pass-2 finding that only partly overlaps a kept span is now split around it, and the part outside goes on to validation, review and the cut. Before, the whole finding was held for review, and its part outside the keep stayed in the audio.
+- Pass 2 now treats category-kept audio as a fixed barrier instead of a pending hold, like keeps, user trims and user rejections, and carves kept audio out of its cuts.
+- Audio the user marked as not an ad is now a hard limit for every render. Pass 2 and recuts now clip a cut at it, as pass 1 already did.
+- Segment action controls stay aligned when a feed override is set.
+- A marker now shows as cut only when the rendered audio removed it. Rejected, held and kept markers, and requested cuts the render dropped, are saved as not cut. A marker the render removed only in part is split into cut and uncut fragments (see 2.97.32). Marker state, counts, the saved cut list, the transcript and chapters come from the same rendered cuts.
+- Markers a render only partly removed now show the removed parts in the episode view.
+- A failed or cancelled run, including a recut, no longer leaves new ad markers next to the old published audio. A failed render changes nothing, and markers saved before a later failure are restored. The recut publishes its audio and assets before it saves markers, and a full run saves its final markers after its assets.
+- A failure after an episode's new audio is published, for example while writing history, no longer puts the old ad markers back next to it.
+- A short piece left when a pass-1 cut is split around kept audio now stays cut on a recut. The saved piece lacked the mark that lets a recut keep a short trusted fragment, so the recut put that audio back.
+- A pass-2 finding inside a pass-1 hold now goes to the reviewer at its own span instead of being dropped. Pass 2 narrows it to the span its evidence supports inside the hold. If the reviewer confirms that span, only that span is auto-approved. On a recut or a reprocess, the rest of the hold stays held instead of being left neither cut nor pending. A reject, an abstain, a failed review or a span that crosses other protected audio leaves the whole hold pending. A finding that overlaps a hold can no longer be resurrected into a cut.
+- When an LLM detection with a word-timed end merges with a fingerprint or segment-level text pattern that runs past it, the reviewer can now trim back to that end. Before, the fingerprint's projected pattern length or the pattern's segment end counted as measured. A trim to the spoken end was pushed back out to the merged edge or held as a conflict. Detection and validation still keep the merged edge, and only a reviewer trim can move it inward. A trim into the measured part of a fingerprint is still held. An approved trim also drops fingerprint match bounds and cross-fetch regions outside the new span.
+- A fingerprint match's start still counts as measured even when its projected pattern length reaches past a precise transcript end. A reviewer trim can still move the end inward to the spoken words without the start losing its protection.
+- `GET /api/v1/patterns?scope=all` no longer returns an empty list. The endpoint's `active_only`, `podcast_id`, `network_id` and `source` query params now match the documented spec, and `active` still works as an alias for `active_only`. The default listing, with no query params, now includes inactive patterns as documented.
+- Diagnostic export no longer stops when it reaches an oversized log line. It skips that line and keeps scanning; only reaching the byte budget stops the export.
+- The legacy episode reprocess endpoint now accepts an empty or non-JSON body as a default reprocess instead of failing.
+- Recorded net seconds removed no longer shows as unknown when the output duration probe fails after a render. It is now estimated from the source and replacement seconds already recorded, so the removed-time stat stays consistent with them.
+
+### Changed
+
+- Ads removed now counts cuts in the output audio. Two markers merged into one cut count once, and a marker the render dropped does not count. The second-scan count is the number of cuts that hold a second-scan marker. Run stats add the seconds of source audio cut and the seconds of beeps inserted. Removed time stays net, so beeps count against it.
+- The pipeline separates hard protection, category keeps, user trims and user rejections that no step may cross, from temporary reviewer holds that can later be released. Each run resolves the feed's category action map once and shares it across detection, validation, review and pass 2.
+- The ad reviewer now sees the feed's effective category actions, nearby kept audio and user rejections as hard limits. It also sees where each piece of evidence came from, including which fingerprint spans are projected lengths and which edges were measured. The default review prompt tells the reviewer not to cross protected audio and to prefer the transcript's precise edges over projected fingerprint lengths. Customized review prompts still receive the new per-ad section.
+- Text pattern matching reads the active pattern list once per processing run instead of re-reading it for every match attempt.
+- Merged markers now keep a fingerprint member's pattern id, so the reviewer prompt can name the pattern behind a fingerprint member.
+- User corrections are loaded once per processing run and reused by validation, the reviewer, confirmed-span restore and pass-2 approvals. A correction saved during a run applies on the next run.
+- An opt-in production replay harness runs saved production episodes through the real recut, validator and pass-2 code, with no LLM calls, as a regression check against fixtures kept outside the repo.
+
+## [2.97.29] - 2026-09-27
+
+### Fixed
+
+- When the reviewer ends an ad on a spoken word and the show resumes at least 0.3 s later, that boundary now holds inside the cross-fetch region. It holds even when no transcribed speech lies between it and the region edge. Before, the cut ran on to the region edge and removed show audio after the ad. A fingerprint match, cue pair, probe window or user confirmation in the released span still keeps the region edge.
+- Reviewer boundaries now survive the steps that run after the review. DAI core restore, terminal start snap, tail completion, tail splice snap, trailing-ad extension and end-of-episode cut extension no longer widen an edge the reviewer set with numeric bounds. Close-ad merge and cross-pass cut joining no longer bridge a gap next to a locked edge. Touching or overlapping detections still merge, and the merged marker drops any lock it has moved past. Inward moves and user-approved bounds still apply.
+
+### Changed
+
+- A reviewer boundary inside the cross-fetch region must now fall on a word with its own timing. A transcript segment without word timings no longer supports it, so on feeds without word timestamps the region edge stays.
+- Tail completion no longer extends an end the reviewer set. A spoken call to action after that end stays in the audio.
+- Terminal start snap no longer moves a reviewer-set start earlier, and tail splice snap no longer moves a reviewer-set end later. An untranscribed onset or sonic logo just outside that edge stays in the audio.
+- An untranscribed ad outro, such as a jingle or music, can now stay in the audio when it plays inside the region after the reviewer's last spoken word. The region shows that an ad is present but not where it ends. Unless a probe window, fingerprint match or cue pair in the released span marks the end, the reviewer's word boundary wins.
+
+## [2.97.28] - 2026-09-26
+
+### Fixed
+
+- When the ad reviewer fails, for example because the LLM provider rejects the request, an ad without independently supported bounds is now held for review as reviewer_failed. Before, it was cut unreviewed. This also covers a failure of the whole review batch. An ad whose bounds are covered by independent evidence (a measured cross-fetch region, a cue pair, template-snapped cues, a fingerprint match or a user confirmation) is still cut and flagged "Reviewer failed; bounds supported". If that support check itself errors during a batch failure, every unconfirmed ad is held.
+- When the reviewer trims an ad edge with no measured support, the cut now stops at the timed word that crosses the region edge. Before, it stopped at the region edge and could clip the first words of show speech after the ad. A transcript segment without word timings still keeps the region edge, since it may hold both ad and show speech.
+
+### Changed
+
+- The code now documents the two roles of cross-fetch evidence. The region measured as differing across fetches shows the audio is an ad. The probe windows where correlation was computed show whether an edge was measured. A failed or inconclusive review counts that region as support only if at least one probe window measured it. Older markers without recorded probes use the leading window of each region, as before.
+
+## [2.97.27] - 2026-09-26
+
+### Fixed
+
+- An ad detection absorbed into a pattern marker, fully or in part, is now recorded as a measured member of that marker, so the estimated-tail split can anchor on it instead of holding the whole marker.
+- Pass 2 can approve the measured part of an estimated-pattern hold when a confident re-detection lies almost entirely inside it, even if it does not cover most of the hold. The rest of the hold stays in the audio.
+- A trimmed pass-2 auto-approval no longer turns the audio it left out into a protected keep range. Only a user's trim protects audio from later cuts, so later runs can still detect and cut that audio.
+- Splitting an estimated pattern span now logs the cut range and the held remainder.
+- The reviewer can now trim a dynamically inserted ad region to a transcript pause. The cross-fetch comparison measures only a few seconds of each inserted block, so the rest of the region is inferred and could hold show speech. A trimmed edge still stops at measured evidence: probed audio, fingerprint matches, cue pairs and user-confirmed spans. Other trims still stop at the region edge, as before.
+- A saved confirm correction now cuts its interval even when no detection survives to match it. That covers no detection at all, a wider candidate the validator rejected, and a covering marker the reviewer rejected, trimmed or held. Only the uncovered part of the confirmed span is added as a cut. False-positive corrections and saved trims still win. The per-feed opening exclusion clips a saved confirm to the audio after it. A cut marker is never widened. An uncut marker on the same span is aligned to the confirmed interval, and an overlapping held marker is split around the new cut. Pass-2 auto-approvals do not restore audio.
+
+## [2.97.26] - 2026-09-26
+
+### Fixed
+
+- Ad validation cuts the measured part of a detected ad and holds only the unmeasured estimated-pattern remainder for review. Previously the whole merged marker was held. Approving just the held remainder and reprocessing still cuts the measured part.
+- Pass 2 can auto-approve an estimated-pattern hold when an independent pass-2 re-detection corroborates it.
+- The sponsor gate for long LLM detection windows now accepts a window that names a known sponsor. A sponsor from this episode's pattern or fingerprint matches (in verification, its first-pass cuts) counts anywhere in the detection, including the quoted start or end text. Sponsors from the episode description or the sponsor registry count only in the reason or description, because names like "Calm" or "Indeed" are also common words. A long correct read is no longer dropped for lacking its own ad-language cue.
+- Sponsor names extracted from an episode description now match whole words only, so words like "romance" or "factory" no longer count as sponsors.
+
+## [2.97.25] - 2026-09-25
+
+### Fixed
+
+- Sponsor-cue alignment keeps the full introduction when the cue occurs mid-sentence.
+
+## [2.97.24] - 2026-09-25
+
+### Fixed
+
+- Saved boundary trims keep excluded speech in the audio when a later detection spans several ads, including after reviewer adjustments and verification.
+- A word-timed ad start moves past preceding show speech when a nearby explicit sponsor introduction marks the actual boundary.
+
+## [2.97.23] - 2026-09-25
+
+### Fixed
+
+- Detection and review use word-timed transcript lines when available, allowing ad boundaries inside mixed speech segments. Merges and validation preserve these precise edges.
+- An estimated text pattern no longer hides or widens one precise LLM detection covering its matched words.
+- A renewed ad marker that extends beyond a saved confirmation cuts only the overlapping approved audio. Longer outside portions receive independent review.
+- Audio rendering preserves the end of a user-confirmed cut during close-gap merging and end-of-episode trimming.
+- The legacy episode reprocess URL honors the requested mode. LLM reruns keep the saved transcript, and full reruns retain it until fresh transcription begins.
+
+## [2.97.22] - 2026-09-25
+
+### Fixed
+
+- Text pattern edits, disables, and deletes take effect on the next match without a worker restart.
+- Auto-learned patterns no longer use weak outro text to extend cuts. Estimated pattern spans need full measured coverage before removal. Sponsor registry confirmation requires the marker's advertiser and commercial language in the audio.
+- An inconclusive review holds a cut for manual review when measured evidence does not support both boundaries, in either processing pass.
+
+## [2.97.21] - 2026-09-24
+
+### Fixed
+
+- Refresh system packages for each image version so cached Docker layers do not retain available updates.
+
+## [2.97.20] - 2026-09-24
+
+### Fixed
+
+- Ad boundary extension uses word times to recover supported calls to action. Unclear tails stay at their reviewed boundary.
+- Learned patterns use the final cut and exclude words outside it.
+
+## [2.97.19] - 2026-09-24
+
+### Fixed
+
+- Estimated text-pattern spans can use a corroborating detection's boundary instead of a stored duration.
+- Markers split around a conflicting action no longer repeat an excluded ad's reason or sponsor.
+
+## [2.97.18] - 2026-09-24
+
+### Changed
+
+- Pattern learning uses recorded boundaries to make separate patterns from ads combined for cutting.
+
+### Fixed
+
+- Split is disabled when no reliable boundary exists. Failed splits leave the original pattern active.
+- Reviewer abstentions report missing boundary coverage. Since 2.97.22 the marker keeps its bounds only when measured evidence supports them and is otherwise held for review.
+- SQLite transaction warnings distinguish elapsed time that may include a lock wait from time spent holding a write lock.
+
+## [2.97.17] - 2026-09-23
+
+### Changed
+
+- Settings groups configuration and diagnostic exports in a Troubleshooting section with two cards that fit smaller screens.
+- Existing cached RSS feeds re-render once after a renderer update so stored metadata catches up.
+
+### Fixed
+
+- Served RSS now reports the processed audio duration for completed episodes.
+- Reviewer abstentions on inconclusive HTTP 422 responses show a bounded reason and avoid retries or breaker failures. Since 2.97.22 the marker keeps its bounds only when measured evidence supports them and is otherwise held for review.
+
+## [2.97.16] - 2026-09-23
+
+### Added
+
+- Settings can export 1, 6, or 24 hours of application event metadata without log messages or identifying content.
+
+### Changed
+
+- Runtime, frontend, and CPU image build dependencies were updated to reviewed upstream releases.
+
+### Fixed
+
+- Previously confirmed ads stay approved after small boundary shifts on re-detection, without cutting beyond the approved span.
+- Processing history shows Skipped when normalization was disabled for that run.
+- Spend date filters accept full years on desktop and provide a visible calendar button.
+- SQLite diagnostics separate lock-acquisition wait time from time held after a transaction begins.
+
 ## [2.97.15] - 2026-09-22
 
 ### Fixed
@@ -3441,8 +3820,8 @@ release notes.
 
 - Pass-2 auto-approval no longer demands the corroborating detection cover
   90 percent of the held span. Differential hold tails carry alignment
-  padding the detection rightly excludes: a 240 second ZocDoc break on
-  tosh-show scored 89.9 percent coverage, missed the bar by 0.3 seconds,
+  padding the detection rightly excludes: a 240 second sponsor break on
+  one feed scored 89.9 percent coverage, missed the bar by 0.3 seconds,
   and shipped audible after a reprocess. The bar drops to 75 percent, and
   in exchange the auto-filed confirm is trimmed to the sub-span pass 2
   actually attested (the same shape a human trimmed approval files), so
@@ -3464,7 +3843,7 @@ release notes.
   phrases, so a boundary note like "that interview material is not
   advertising and should be excluded" (about a 28 second tail) held a 231
   second block of three sponsor reads that every detection signal agreed
-  on (tosh-show, and the same shape previously on daily-tech-news-show).
+  on (seen on one feed, and the same shape previously on another).
   An affirmation paired with trim language now wins, and a confirmed
   verdict whose prose describes a trim gets the trim recovered and applied
   as an adjust instead of a hold. An affirmation with a whole-span
@@ -3473,7 +3852,7 @@ release notes.
 - Merged ad spans are no longer blanket expand-only in the reviewer. Merge
   sites now record which member spans are transcript-anchored; reviewer
   trims and trim recovery clamp to that protected union, so a trailing
-  member ad still cannot be severed (the original Grainger case) while
+  member ad still cannot be severed (the original trailing-ad case) while
   the alignment-derived padding of differential regions is trimmable
   again. Markers persisted by earlier releases keep the old blanket rule.
 - Pass-2 auto-approval now releases every releasable hold reason
@@ -3519,7 +3898,7 @@ release notes.
 
 ### Fixed
 - Two bugs that kept obvious DAI ads stuck in the review queue (found by
-  tracing a Daily Tech News Show episode through both a normal run and a
+  tracing one episode through both a normal run and a
   reprocess):
   - The detection merge decided cut-vs-held by sort order. When a Claude ad
     started fractionally before the differential region it corroborated
@@ -4902,7 +5281,7 @@ found by review, removes dead code, and adds the repo's first Python lint gate.
 
 ### Changed
 
-- The "Find cue candidates" scan now finds recurring sounds by fingerprinting the whole episode instead of hunting for loud spots. The old pass only triggered on loud bursts, so it missed ad-break stings that play at the same level as the talking around them. On one Daily Tech News Show episode the recurring sting sits at or below the speech level at most of its appearances, and the loud-spot pass returned nothing usable. The new scan generates one Chromaprint fingerprint of the episode and surfaces the windows that repeat across it, which does not depend on loudness: on that same episode it now returns the sting as the top candidate (5 of its 6 appearances) plus two other recurring segments, in about two seconds. Candidates are ranked by how often they repeat.
+- The "Find cue candidates" scan now finds recurring sounds by fingerprinting the whole episode instead of hunting for loud spots. The old pass only triggered on loud bursts, so it missed ad-break stings that play at the same level as the talking around them. On one episode the recurring sting sits at or below the speech level at most of its appearances, and the loud-spot pass returned nothing usable. The new scan generates one Chromaprint fingerprint of the episode and surfaces the windows that repeat across it, which does not depend on loudness: on that same episode it now returns the sting as the top candidate (5 of its 6 appearances) plus two other recurring segments, in about two seconds. Candidates are ranked by how often they repeat.
 
 ### Added
 
@@ -5237,13 +5616,13 @@ found by review, removes dead code, and adds the repo's first Python lint gate.
 
 ### Fixed
 
-- Extended the 2.8.3 reviewer fix to the merge path that actually caused the Grainger survival. A back-to-back ad chain is collapsed into one cut by the window-deduplication step before validation ever sees it, and that step did not mark the result as a multi-ad span. So when the reviewer trimmed the merged block's end, it still severed the trailing ad. Re-verifying 2.8.3 on the Daily Tech News Show episode showed the cut was only saved by a second detection pass, not by the reviewer guard. Every merge that joins separate ads now sets one shared marker, including window and detection-stage merges and ads that sit exactly back-to-back, so the reviewer treats the whole span as expand-only. A single ad re-detected across an overlapping window is left tightenable as before.
+- Extended the 2.8.3 reviewer fix to the merge path that actually caused the trailing-ad survival. A back-to-back ad chain is collapsed into one cut by the window-deduplication step before validation ever sees it, and that step did not mark the result as a multi-ad span. So when the reviewer trimmed the merged block's end, it still severed the trailing ad. Re-verifying 2.8.3 on the same episode showed the cut was only saved by a second detection pass, not by the reviewer guard. Every merge that joins separate ads now sets one shared marker, including window and detection-stage merges and ads that sit exactly back-to-back, so the reviewer treats the whole span as expand-only. A single ad re-detected across an overlapping window is left tightenable as before.
 
 ## [2.8.3] - 2026-06-10
 
 ### Fixed
 
-- The ad reviewer no longer drops a confirmed ad when several back-to-back ads were merged into one cut. When the validator joins adjacent ads across a short gap, or merges fragments of the same sponsor, the result is one span covering several independently detected ads. The reviewer refines that span's boundaries, and an inward pull could land mid-span and sever a trailing ad from the cut. On a sampled Daily Tech News Show episode this left a full Grainger read (about 26 seconds) in the audio after the reviewer trimmed the merged block's end. Merged spans are now expand-only in the reviewer: it can still grow a cut outward to catch a leading or trailing call to action, but it cannot shrink one below the union of the ads it already confirmed. Single detected ads are unaffected and still tighten normally.
+- The ad reviewer no longer drops a confirmed ad when several back-to-back ads were merged into one cut. When the validator joins adjacent ads across a short gap, or merges fragments of the same sponsor, the result is one span covering several independently detected ads. The reviewer refines that span's boundaries, and an inward pull could land mid-span and sever a trailing ad from the cut. On a sampled episode this left a full trailing sponsor read (about 26 seconds) in the audio after the reviewer trimmed the merged block's end. Merged spans are now expand-only in the reviewer: it can still grow a cut outward to catch a leading or trailing call to action, but it cannot shrink one below the union of the ads it already confirmed. Single detected ads are unaffected and still tighten normally.
 
 ## [2.8.2] - 2026-06-10
 
@@ -5521,7 +5900,7 @@ found by review, removes dead code, and adds the repo's first Python lint gate.
 
 ### Fixed
 
-- **v2 backfill of `processing_history.ads_detected` for episodes where the reviewer rejected some pass-1 ads.** The v1 backfill in 2.5.29 compared `history.ads_detected` against `episodes.ads_removed_firstpass`, but `firstpass` stores the pass-1 DETECTION count (pre-reviewer), not the post-reviewer cuts that the buggy 2.5.27 writer captured. v1 only matched episodes where the reviewer rejected zero ads, so cases like `macbreak-weekly-audio:2d9ccd57b93b` (firstpass detection=10, reviewer kept 6, verification=2, total cuts=8) stayed at the wrong value of 6. v2 (`_run_backfill_history_ads_detected_v2` in `src/database/schema/__init__.py`) derives the correct pass-1 cut count as `ads_removed - ads_removed_secondpass`, which equals the buggy writer's value regardless of how many ads the reviewer rejected or resurrected. New gate row `backfill_history_ads_detected_v2_postreviewer_cuts` so v2 runs once on the next boot for every deployer; v1's gate stays set and v1 does not re-run. v1-corrected rows are naturally excluded from v2 because their `ads_detected == ads_removed` and v2 requires `ads_detected == ads_removed - secondpass`, impossible when `secondpass > 0`.
+- **v2 backfill of `processing_history.ads_detected` for episodes where the reviewer rejected some pass-1 ads.** The v1 backfill in 2.5.29 compared `history.ads_detected` against `episodes.ads_removed_firstpass`, but `firstpass` stores the pass-1 DETECTION count (pre-reviewer), not the post-reviewer cuts that the buggy 2.5.27 writer captured. v1 only matched episodes where the reviewer rejected zero ads, so cases like `example-podcast:a1b2c3d4e5f6` (firstpass detection=10, reviewer kept 6, verification=2, total cuts=8) stayed at the wrong value of 6. v2 (`_run_backfill_history_ads_detected_v2` in `src/database/schema/__init__.py`) derives the correct pass-1 cut count as `ads_removed - ads_removed_secondpass`, which equals the buggy writer's value regardless of how many ads the reviewer rejected or resurrected. New gate row `backfill_history_ads_detected_v2_postreviewer_cuts` so v2 runs once on the next boot for every deployer; v1's gate stays set and v1 does not re-run. v1-corrected rows are naturally excluded from v2 because their `ads_detected == ads_removed` and v2 requires `ads_detected == ads_removed - secondpass`, impossible when `secondpass > 0`.
 - **Webhook now only fires when the history row is written.** `_record_history_and_event` previously had separate `try/except` blocks for `record_processing_history` vs `fire_event`, so a failed history INSERT (disk full, locked DB, missing podcast row) still fired `EVENT_EPISODE_PROCESSED` with an `ads_removed` total that no `/api/v1/history` row backed. External webhook consumers and the History page are now consistent: if the history row was not written, the webhook is skipped and the skip is logged.
 - **Backfill hardening for v1 and v2.** Five defensive changes to `_run_backfill_history_ads_detected[_v2]` in `src/database/schema/__init__.py`: (a) `conn.rollback()` on outer-`except` so a v1 failure cannot leak uncommitted UPDATEs into v2's commit; (b) `INSERT OR IGNORE` on the gate-row INSERT so a concurrent gunicorn worker's race does not raise `UNIQUE constraint failed`; (c) `CREATE TABLE IF NOT EXISTS schema_migrations` is hoisted to the top of `_run_schema_migrations` so the backfills no longer depend on `_run_env_backed_settings_migration` succeeding first; (d) `ROW_NUMBER() OVER (... ORDER BY processed_at DESC, h.id DESC)` adds a stable tie-break so two history rows written in the same second pick the actual latest by primary-key order; (e) `COALESCE(..., 0)` wraps `ads_removed`, `ads_removed_firstpass`, `ads_removed_secondpass` so legacy rows with NULL columns are treated as 0 instead of silently failing the predicate.
 - **`_log_completion_summary` `verification_count` is now keyword-only.** Inserting `verification_count` into the positional signature in 2.5.28 created a footgun where a future positional caller using the older 7-arg form would shift a float `original_duration` into the `verification_count` slot. The `*,` separator forces all callers to pass it by name.
@@ -5534,7 +5913,7 @@ found by review, removes dead code, and adds the repo's first Python lint gate.
 
 ### Added
 
-- **`tests/unit/test_history_backfill_migration_v2.py`: 7 cases.** The macbreak-style row (firstpass != cuts because reviewer rejected) gets corrected. v1-already-corrected rows are not touched. Episodes with `secondpass=0` are untouched. Older reprocess rows are left alone while the latest row is corrected. The gate prevents v2 from running twice. Failed-status rows are untouched. The coexistence test verifies that a single boot of a deployer upgrading from `<=2.5.28` directly to 2.5.30 corrects both the easy-case rows (via v1) and the reviewer-rejected rows (via v2).
+- **`tests/unit/test_history_backfill_migration_v2.py`: 7 cases.** The reviewer-rejected row (firstpass != cuts because reviewer rejected) gets corrected. v1-already-corrected rows are not touched. Episodes with `secondpass=0` are untouched. Older reprocess rows are left alone while the latest row is corrected. The gate prevents v2 from running twice. Failed-status rows are untouched. The coexistence test verifies that a single boot of a deployer upgrading from `<=2.5.28` directly to 2.5.30 corrects both the easy-case rows (via v1) and the reviewer-rejected rows (via v2).
 
 ## [2.5.29] - 2026-05-26
 
@@ -5556,7 +5935,7 @@ found by review, removes dead code, and adds the repo's first Python lint gate.
 
 ### Added
 
-- **`tests/unit/test_history_ad_count.py`: regression test pinning the history-ad-count contract.** Five cases: history records total (pass-1 + verification) and not pass-1 alone; the zero-verification path still records pass-1; the zero-pass-1-positive-verification path (the `glt1412515089:a40d43aec65b` scenario that prompted the audit) records the verification cuts; the completion log line includes verification in its total; the completion log reports `0 ads removed` when neither pass cut anything. Without these, the omission would have been invisible to CI for a third release in a row.
+- **`tests/unit/test_history_ad_count.py`: regression test pinning the history-ad-count contract.** Five cases: history records total (pass-1 + verification) and not pass-1 alone; the zero-verification path still records pass-1; the zero-pass-1-positive-verification path (the scenario that prompted the audit) records the verification cuts; the completion log line includes verification in its total; the completion log reports `0 ads removed` when neither pass cut anything. Without these, the omission would have been invisible to CI for a third release in a row.
 
 ## [2.5.27] - 2026-05-26
 
@@ -5663,13 +6042,13 @@ found by review, removes dead code, and adds the repo's first Python lint gate.
 
 ### Fixed
 
-- **Verification-pass auto-pattern-creation now matches the filter discipline of the first-pass learner.** Pre-2.5.13, `pattern_service.record_verification_misses` trusted every "missed ad" the verification LLM reported and called `text_pattern_matcher.create_pattern_from_ad` with no confidence floor, no `was_cut` check, and only a presence-only sponsor-in-intro test downstream. The first-pass learner at `ad_detector._ad_passes_learning_filters` already enforced `confidence >= 0.85` (`>= 0.92` for ads longer than 90 s), `was_cut == True`, and `detection_stage == 'claude'`. That asymmetry produced Pattern #354 (drink-champs, sponsor=Modelo): the verification LLM read host conversation about "how you get the big, Modelo?" as a missed Modelo ad and the auto-creator wrote 870 chars of unrelated dialogue into a podcast-scoped pattern. The function has carried the presence-only check since commit `f07ddf3` on 2025-12-17. Five filters added at the verification-miss entry point: (1) `confidence >= 0.85` floor, `>= 0.92` for ads with `duration > 90 s`; (2) reject when `reason` starts with a `SPONSOR_REASONING_PREFIXES` entry or contains a `SPONSOR_REASONING_SUBSTRINGS` entry (catches the case where the LLM put its rationale in the `reason` field); (3) require the sponsor brand (with aliases and whitespace-stripped variants via `count_brand_occurrences`) to appear at least twice in the actual transcript window between `start` and `end`. The existing "boost the matching pattern's `confirmation_count`" path also goes through the same filters now; this matters because the boost path inflates `confirmation_count` and was making it look like rare-brand patterns had "matched real ads" when they had only been re-flagged by the same kind of host-name-drop the original pattern came from.
+- **Verification-pass auto-pattern-creation now matches the filter discipline of the first-pass learner.** Pre-2.5.13, `pattern_service.record_verification_misses` trusted every "missed ad" the verification LLM reported and called `text_pattern_matcher.create_pattern_from_ad` with no confidence floor, no `was_cut` check, and only a presence-only sponsor-in-intro test downstream. The first-pass learner at `ad_detector._ad_passes_learning_filters` already enforced `confidence >= 0.85` (`>= 0.92` for ads longer than 90 s), `was_cut == True`, and `detection_stage == 'claude'`. That asymmetry produced Pattern #354 (one feed, sponsor=Acme): the verification LLM read host conversation that name-dropped the brand once as a missed Acme ad and the auto-creator wrote 870 chars of unrelated dialogue into a podcast-scoped pattern. The function has carried the presence-only check since commit `f07ddf3` on 2025-12-17. Five filters added at the verification-miss entry point: (1) `confidence >= 0.85` floor, `>= 0.92` for ads with `duration > 90 s`; (2) reject when `reason` starts with a `SPONSOR_REASONING_PREFIXES` entry or contains a `SPONSOR_REASONING_SUBSTRINGS` entry (catches the case where the LLM put its rationale in the `reason` field); (3) require the sponsor brand (with aliases and whitespace-stripped variants via `count_brand_occurrences`) to appear at least twice in the actual transcript window between `start` and `end`. The existing "boost the matching pattern's `confirmation_count`" path also goes through the same filters now; this matters because the boost path inflates `confirmation_count` and was making it look like rare-brand patterns had "matched real ads" when they had only been re-flagged by the same kind of host-name-drop the original pattern came from.
 - **`text_pattern_matcher.create_pattern_from_ad` now requires `duration >= 15 s`** in addition to the existing `<= 120 s` upper bound. Pattern #356 (Patreon, 8 s, first-pass detection) was the canonical floor false-positive: a real sponsor read does not fit in eight seconds. The guard keeps the same shape as the original duration check, with a matching warning log.
 - **Sponsor occurrence guard in `create_pattern_from_ad` is now alias-aware.** The 2.5.13a draft used a raw substring count on the canonical sponsor string. That undercounted patterns where the brand lives only inside a compound (e.g. "DeleteMe" inside `joindeleteme.com`) and would have wrongly rejected the existing Pattern #350. The new check uses `community_export.count_brand_occurrences`, which counts case-insensitive substring matches across `known_sponsors.name`, every alias, and whitespace-stripped variants of both. Real ads where the canonical brand is referenced only via a URL or alias now pass; one-mention name-drops still fail. Falls back to `{name: sponsor, aliases: '[]'}` when `get_known_sponsor_by_name` returns nothing, so installs that haven't yet seeded their sponsor catalog still get the guard.
 - **One-shot `_cleanup_low_mention_patterns` migration retires structurally false-positive rows.** Rewritten from the 2.5.13a draft (which had a single criterion of "fewer than 2 sponsor occurrences" and would have disabled eight patterns with `confirmation_count > 0` that have matched real ads). New criteria, all conservative, must each be satisfied independently to disable a row:
   - **low-mention auto-created never-matched**: brand variants appear <2 times in `text_template` AND `created_by = 'auto'` AND `confirmation_count = 0` AND `false_positive_count = 0`;
   - **sponsor field is an LLM rationale**: `sponsor` starts with a `SPONSOR_REASONING_PREFIXES` entry or contains a `SPONSOR_REASONING_SUBSTRINGS` entry (catches Pattern #202 where the full Walden University reasoning sentence got stored as the sponsor name);
-  - **sponsor field has an LLM-suffix tell**: ends with `' brand'`, `' pre-roll'`, `' sponsor ad'`, `' sponsor ad with url'`, or `' advertisement'` (catches Pattern #227 `Grainger brand`);
+  - **sponsor field has an LLM-suffix tell**: ends with `' brand'`, `' pre-roll'`, `' sponsor ad'`, `' sponsor ad with url'`, or `' advertisement'` (catches a pattern stored as `Acme brand`);
   - **sponsor is non-canonical AND no template variant matches**: sponsor stripped of whitespace is not in `known_sponsors` AND no brand variant appears in the template (catches Pattern #142 `statefarm`).
   Idempotent via the `low_mention_cleanup_revision = '2.5.13'` settings flag. Reversible per row (`is_active = 1` re-enables). Dry-run against the prod 177-pattern catalog before this release shipped: 29 rows would be disabled (26 low-mention auto-created never-matched + #227 + #202 + #142), and the eight `confirmation_count > 0` low-mention edge cases (`#238 SoFi conf=7`, `#87 Chubbiesshorts conf=5`, `#248 Just Another conf=3`, `#259 Athletic Brewing conf=2`, `#245 San Diego Tourism`, `#348 SilverMirror`, `#55 Pura`) are all kept. The migration runs the same way on any install regardless of pattern count or sponsor catalog.
 
@@ -6570,7 +6949,7 @@ Two complementary expansions to the sponsor recognition layer: ~36 more `SPONSOR
 
 ### Improved
 
-- `SPONSOR_ALIASES` (`src/utils/constants.py`) goes from 138 to 174 entries. New families: Affirm, Brex, Cloudflare, Eight Sleep, GitHub Copilot, LMNT, Mercury, Miro, Patreon, Perplexity, Pura, Retool, SeatGeek, Skyscanner, SoFi, StubHub, Substack, Vercel, Whoop. Each family includes the safe compound-split / hyphen / no-space variants. Risky homophones with common English words (`mirror` -> Miro, `cloud` -> Claude, `Sophie` -> SoFi, `brexit` -> Brex, `fuel` -> Huel, `thorn` -> Thorne) and AI model names (`gpt four`, `o three`, etc.) are intentionally excluded. The `Patreon` addition is direct-evidence-driven: episode `ff5a6158313e` ("It's a Thing 416") had a Patreon ad caught only by the verification pass on 2.0.12 with no canonical mapping; the new `pay tree on` and `patron` aliases close that gap.
+- `SPONSOR_ALIASES` (`src/utils/constants.py`) goes from 138 to 174 entries. New families: Affirm, Brex, Cloudflare, Eight Sleep, GitHub Copilot, LMNT, Mercury, Miro, Patreon, Perplexity, Pura, Retool, SeatGeek, Skyscanner, SoFi, StubHub, Substack, Vercel, Whoop. Each family includes the safe compound-split / hyphen / no-space variants. Risky homophones with common English words (`mirror` -> Miro, `cloud` -> Claude, `Sophie` -> SoFi, `brexit` -> Brex, `fuel` -> Huel, `thorn` -> Thorne) and AI model names (`gpt four`, `o three`, etc.) are intentionally excluded. The `Patreon` addition is direct-evidence-driven: one episode had a Patreon ad caught only by the verification pass on 2.0.12 with no canonical mapping; the new `pay tree on` and `patron` aliases close that gap.
 - `KNOWN_SHORT_BRANDS` (`src/utils/constants.py`) gains `lmnt` and `acast`. Both are sub-6-character podcast-relevant single words that Gate B was rejecting.
 
 ### Added
@@ -6599,8 +6978,8 @@ Two follow-up fixes on 2.0.10, re-tagged under 2.0.11 rather than a new version.
 
 ### Fixed
 
-- Reprocess detection in the new versioned-mp3 path used `processed_at` to decide first-process vs reprocess, but the reprocess state reset in `database.episodes` clears `processed_at` to NULL before `process_episode` runs. Result on 2.0.10: `previously_processed` was always False, `new_version` stayed at 0, and the reprocess output overwrote `{episode_id}.mp3` in place, defeating the point of the versioned filename. Observed live on DTNS 5253 reprocess: `processedUrl` came back without the `-v1` suffix. `src/main_app/processing.py` now derives the reprocess signal from `processed_version > 0` OR `reprocess_requested_at` being set. Both are preserved by the reprocess state reset (the version column because it's new, the timestamp because the reprocess endpoint stamps it on its way in). First-ever process still writes `{episode_id}.mp3`; second run and beyond write `{episode_id}-v{N}.mp3` as intended.
-- DTNS 5253 reprocess also surfaced that Whisper transcribes the Xero sponsor read as "Zero" in some passes. The 2.0.10 auto-pattern-create path then declined because no matching pattern existed under "Zero" and the miss could not be learned. New `SPONSOR_ALIASES` map and `canonical_sponsor()` helper in `src/utils/constants.py` (maps ``zero``/``xerox`` -> ``Xero``); `src/ad_detector.py:learn_from_detections` and `src/pattern_service.py:record_verification_misses` normalize the detected sponsor before Gate A/B and the pattern-existence lookup. Effect: a verification miss reporting "Zero" now matches existing Xero patterns for a boost, and a new pattern (where the validator allows it) is stored under "Xero" instead of a parallel "Zero" entry.
+- Reprocess detection in the new versioned-mp3 path used `processed_at` to decide first-process vs reprocess, but the reprocess state reset in `database.episodes` clears `processed_at` to NULL before `process_episode` runs. Result on 2.0.10: `previously_processed` was always False, `new_version` stayed at 0, and the reprocess output overwrote `{episode_id}.mp3` in place, defeating the point of the versioned filename. Observed on one reprocess: `processedUrl` came back without the `-v1` suffix. `src/main_app/processing.py` now derives the reprocess signal from `processed_version > 0` OR `reprocess_requested_at` being set. Both are preserved by the reprocess state reset (the version column because it's new, the timestamp because the reprocess endpoint stamps it on its way in). First-ever process still writes `{episode_id}.mp3`; second run and beyond write `{episode_id}-v{N}.mp3` as intended.
+- The same reprocess also surfaced that Whisper transcribes the Xero sponsor read as "Zero" in some passes. The 2.0.10 auto-pattern-create path then declined because no matching pattern existed under "Zero" and the miss could not be learned. New `SPONSOR_ALIASES` map and `canonical_sponsor()` helper in `src/utils/constants.py` (maps ``zero``/``xerox`` -> ``Xero``); `src/ad_detector.py:learn_from_detections` and `src/pattern_service.py:record_verification_misses` normalize the detected sponsor before Gate A/B and the pattern-existence lookup. Effect: a verification miss reporting "Zero" now matches existing Xero patterns for a boost, and a new pattern (where the validator allows it) is stored under "Xero" instead of a parallel "Zero" entry.
 
 ## [2.0.10] - 2026-04-22
 
@@ -6635,7 +7014,7 @@ Two unrelated fixes bundled into a single release: VAD gap detector false-positi
 
 ### Fixed
 
-- VAD gap detector mid-gap branch (`src/vad_gap_detector.py`) now requires BOTH a signoff phrase before the gap AND a resume phrase after it (logical AND). Previously either side alone was enough, so common podcast filler ("thanks for tuning in", "welcome back") triggered cuts on its own. Marker reason text updated from "VAD gap with signoff/resume context" to "VAD gap with signoff and resume context" to reflect the new semantics. Head-gap and tail-gap branches are unchanged. Concrete regression: MacBreak Weekly 1021 (`5ef2df166c8e`) had 9 of 11 ad markers come from `vad_gap`, of which 8 carried `WARN: No ad signals in transcript` yet were ACCEPTed at adjusted confidence 0.80 and cut 9 to 44 seconds of show content each.
+- VAD gap detector mid-gap branch (`src/vad_gap_detector.py`) now requires BOTH a signoff phrase before the gap AND a resume phrase after it (logical AND). Previously either side alone was enough, so common podcast filler ("thanks for tuning in", "welcome back") triggered cuts on its own. Marker reason text updated from "VAD gap with signoff/resume context" to "VAD gap with signoff and resume context" to reflect the new semantics. Head-gap and tail-gap branches are unchanged. Concrete regression: one episode had 9 of 11 ad markers come from `vad_gap`, of which 8 carried `WARN: No ad signals in transcript` yet were ACCEPTed at adjusted confidence 0.80 and cut 9 to 44 seconds of show content each.
 - `src/ad_validator.py:_verify_in_transcript` now forces vad_gap markers below the validator's `min_cut_confidence` threshold when neither sponsor names nor ad-signal patterns matched in range. The marker is sent to REVIEW instead of being auto-cut. Other detection stages (`claude`, `text_pattern`, `verification`, `fingerprint`) are unaffected. The clamp uses `min_cut_confidence - 0.01` rather than a fixed -0.15, so it stays correct if a user moves the aggressiveness slider. Defense-in-depth: even if the detector regresses, the validator stops unsupported cuts.
 - Webhook URL validation now uses `validate_base_url` instead of the strict `validate_url`, matching the SSRF posture already used for the LLM and Whisper base URLs. Self-hosted destinations on private IPs or non-default ports (e.g. Home Assistant on `http://192.168.x.x:8123`) are accepted; cloud metadata IPs and bad schemes are still blocked. Closes #158. The webhook create/update guard in `src/api/settings.py:_validate_webhook_url` is the single validation point at write time; `safe_post(..., trust=URLTrust.OPERATOR_CONFIGURED)` revalidates at dispatch and on every redirect hop, so the redundant pre-check that used to live in `webhook_service._prepare_and_dispatch` was removed.
 
@@ -6688,7 +7067,7 @@ Dependency rollup. No application-behavior changes. Every Dependabot PR open aft
 ## [2.0.7] - 2026-04-21
 
 ### Added
-- VAD gap detector (`src/vad_gap_detector.py`) catches audio regions Whisper's VAD drops so they never reach the transcript: sped-up legal disclaimers at ad tails, distorted interstitials, long untranscribed silences adjacent to an ad. Runs after Claude + text-pattern + roll detection, before validation. Head-of-episode gaps (>= 3s) are always cut; mid-episode gaps either extend an adjacent existing ad in place or require signoff/resume context before a standalone cut emits; tail-of-episode gaps (>= 3s) are cut when no postroll already covers them. Motivated by a DTNS episode where the DIA ad's sped-up legal babble sat in the pre-transcript window and would otherwise leak into the processed output. Confidence 0.75 on emitted markers; `detection_stage='vad_gap'`.
+- VAD gap detector (`src/vad_gap_detector.py`) catches audio regions Whisper's VAD drops so they never reach the transcript: sped-up legal disclaimers at ad tails, distorted interstitials, long untranscribed silences adjacent to an ad. Runs after Claude + text-pattern + roll detection, before validation. Head-of-episode gaps (>= 3s) are always cut; mid-episode gaps either extend an adjacent existing ad in place or require signoff/resume context before a standalone cut emits; tail-of-episode gaps (>= 3s) are cut when no postroll already covers them. Motivated by an episode where the DIA ad's sped-up legal babble sat in the pre-transcript window and would otherwise leak into the processed output. Confidence 0.75 on emitted markers; `detection_stage='vad_gap'`.
 - Four env vars for operators to tune or disable the detector: `VAD_GAP_DETECTION_ENABLED` (default `true`), `VAD_GAP_START_MIN_SECONDS` (default `3.0`), `VAD_GAP_MID_MIN_SECONDS` (default `8.0`), `VAD_GAP_TAIL_MIN_SECONDS` (default `3.0`). Each also available as a DB setting and via `PUT /api/v1/settings` for parity with other whisper knobs. Not surfaced in the UI; these are advanced knobs most operators will never touch.
 
 ### Changed
@@ -6708,7 +7087,7 @@ Dependency rollup. No application-behavior changes. Every Dependabot PR open aft
 ## [2.0.5] - 2026-04-20
 
 ### Changed
-- Transient-failure auto-retry schedule extended from 3 attempts (5/15/45 min) to 5 attempts (5/15/30/60 min) before marking `permanently_failed`. Covers the common case where upstream CDNs (Acast's `sphinx` in particular) take 30-90 minutes to propagate a newly-published MP3 after the RSS `<item>` appears. Without the extra attempts, episodes like `daily-tech-news-show:407e3e5382c5` gave up at roughly 8 minutes of wall clock time and required manual reprocess; the new tail reaches ~1h50m. `MAX_EPISODE_RETRIES` bumped 3 -> 4 in `config.py`. Backoff ladder in `reset_failed_queue_items` updated to `5m / 15m / 30m / 60m`. Applies to both auto-process and client-requested reprocess paths.
+- Transient-failure auto-retry schedule extended from 3 attempts (5/15/45 min) to 5 attempts (5/15/30/60 min) before marking `permanently_failed`. Covers the common case where upstream CDNs (Acast's `sphinx` in particular) take 30-90 minutes to propagate a newly-published MP3 after the RSS `<item>` appears. Without the extra attempts, some episodes gave up at roughly 8 minutes of wall clock time and required manual reprocess; the new tail reaches ~1h50m. `MAX_EPISODE_RETRIES` bumped 3 -> 4 in `config.py`. Backoff ladder in `reset_failed_queue_items` updated to `5m / 15m / 30m / 60m`. Applies to both auto-process and client-requested reprocess paths.
 - `reset_episode_status` (invoked by `POST /api/v1/feeds/<slug>/episodes/<id>/reprocess`) now zeroes `auto_process_queue.attempts` in addition to `episodes.retry_count`. Before this, a user clicking Reprocess on an episode that had hit attempt 4 would reset the episode row but leave the queue's attempt counter stale, causing the next auto-retry to wait 60 minutes instead of the 5-minute first-step delay. Both counters now reset together so a manual reprocess is a true clean slate.
 
 ## [2.0.4] - 2026-04-20
@@ -6807,7 +7186,7 @@ Coordinated security hardening pass across the auth surface, crypto, SSRF, path 
 - `requirements.in` is the new direct-dependency source of truth; `requirements.txt` is the fully-pinned lockfile regenerated via `pip-compile --resolver=backtracking --output-file=requirements.txt requirements.in`. Transitive versions are now explicit.
 - `docker-compose.yml` documents the non-root UID/GID 1000 contract with a commented-out `user: "1000:1000"` line so operators can override when their volume is owned by a different UID.
 - `safe_url_for_log` is now applied at every outbound URL log site (`rss_parser`, `transcriber`, `pricing_fetcher`, `storage`, `llm_client`, `webhook_service`). URL paths and query strings no longer reach logs; scheme + host only.
-- Processing finalize now closes any `pending` / `processing` / `failed` row in `auto_process_queue` for the just-completed episode. Fixes a double-trigger bug where a manual `POST /episodes/<id>/reprocess` finished but left the background-enqueued queue row pending; the refresh loop then re-fired the same episode seconds later (observed on `the-brilliant-idiots:52070c1f9bd2`, which ran through two full 20-minute processing cycles back-to-back). New index `idx_queue_podcast_episode(podcast_id, episode_id)` keeps the cleanup UPDATE off the full-scan path.
+- Processing finalize now closes any `pending` / `processing` / `failed` row in `auto_process_queue` for the just-completed episode. Fixes a double-trigger bug where a manual `POST /episodes/<id>/reprocess` finished but left the background-enqueued queue row pending; the refresh loop then re-fired the same episode seconds later (observed on one episode, which ran through two full 20-minute processing cycles back-to-back). New index `idx_queue_podcast_episode(podcast_id, episode_id)` keeps the cleanup UPDATE off the full-scan path.
 - HTTP and subprocess timeouts plus `max_redirects` are defined in `src/config.py` as tiered constants (`HTTP_TIMEOUT_PROBE/API/EXTERNAL/FETCH/WHISPER`, `HTTP_MAX_REDIRECTS_FEED/API`, `FFMPEG_CHUNK_TIMEOUT`, `FPCALC_TIMEOUT_FULL`, `SUBPROCESS_VERSION_PROBE`). Every outbound-HTTP and long-running subprocess call site now references a named constant so a future policy change (e.g. CDN redirect bump) is a one-line diff. `utils/safe_http.py` function defaults also reference the constants. `webhook_service.py` dropped its module-local `_REQUEST_TIMEOUT_SECS` in favour of the shared `HTTP_TIMEOUT_PROBE`. The `audio_fingerprinter` chunked-extract path was unified at 60s (was 30s) so a slow-IO fingerprint no longer spuriously times out.
 - `smoke/` directory adds local and remote smoke-test scripts for operators to exercise the 2.0 surface (CSRF, login lockout, SSRF, XXE, rate limits, artwork, RSS public paths, backup, patterns, log hygiene, shutdown, multi-worker).
 
@@ -8226,7 +8605,7 @@ Major release: pipeline redesign, MinusPod rebrand, and ad detection overhaul.
 ## [0.1.236] - 2026-02-06
 
 ### Fixed
-- **Non-ads extracted as ads when Claude marks them `is_ad: false`**: Added filtering in `_parse_ads_from_response()` to skip entries where `is_ad` is explicitly false/no/0 or where `classification`/`type` indicates non-ad content (content, editorial, organic, interview, etc.). This was the root cause of episodes like `it-s-a-thing:1af1082d376d` losing over half their duration -- Claude's second pass returned segments with `is_ad: false` and `classification: "content"` but the parser treated ALL entries as ads regardless.
+- **Non-ads extracted as ads when Claude marks them `is_ad: false`**: Added filtering in `_parse_ads_from_response()` to skip entries where `is_ad` is explicitly false/no/0 or where `classification`/`type` indicates non-ad content (content, editorial, organic, interview, etc.). This was the root cause of some episodes losing over half their duration: Claude's second pass returned segments with `is_ad: false` and `classification: "content"` but the parser treated ALL entries as ads regardless.
 - **Generic "Advertisement detected" fallback from unknown field names**: Replaced static allowlists for sponsor and description extraction with dynamic field scanning. Instead of maintaining lists of field names Claude might use, the parser now defines STRUCTURAL_FIELDS (timestamps, booleans, config) and treats everything else as a candidate for sponsor/description info. This eliminates the recurring need to patch field names (previously patched in v0.1.217, 218, 220, 232, 234, 235).
 - **Reason field duplication when sponsor and description overlap**: Added `_text_is_duplicate()` helper that checks if one string starts with the other or they share >80% of words. Prevents output like "BetterHelp advertisement: BetterHelp advertisement for therapy services".
 - **Processing queue kills long-running jobs via stale lock detection**: `_clear_stale_state()` was called from `is_busy()`/`get_current()` without `_fd_lock` protection. When a long episode exceeded `MAX_JOB_DURATION`, stale detection would release the lock from under the running thread, allowing another episode to acquire it and causing concurrent processing failures. Now checks if the current process holds the lock before clearing -- if it does, the job is still alive (just long-running) and only a warning is logged.
@@ -8684,7 +9063,7 @@ Major release: pipeline redesign, MinusPod rebrand, and ad detection overhaul.
 ## [0.1.190] - 2026-01-18
 
 ### Fixed
-- **Music analysis timeout on long episodes**: Episodes over 1.5 hours now use "fast mode" that analyzes every 3rd frame and skips expensive HPSS (Harmonic-Percussive Source Separation) computation. This prevents the 805s+ timeouts that were occurring on 2+ hour episodes like Security Now.
+- **Music analysis timeout on long episodes**: Episodes over 1.5 hours now use "fast mode" that analyzes every 3rd frame and skips expensive HPSS (Harmonic-Percussive Source Separation) computation. This prevents the 805s+ timeouts that were occurring on 2+ hour episodes.
 - **Non-English DAI ads not detected**: Changed Whisper from `language="en"` to `language=None` for auto-detection. Non-English segments (especially Spanish ads) are now automatically flagged and treated as ads.
 - **VAD filter too aggressive**: Adjusted VAD parameters to be more sensitive (`min_silence_duration_ms`: 500->1000, `speech_pad_ms`: 400->600, `threshold`: 0.3). This helps capture music-heavy ad segments that were being skipped.
 - **End-of-episode ads not fully trimmed**: Ads that end within 30 seconds of the episode end are now extended to the actual end, eliminating leftover ad snippets at the end.
@@ -8799,7 +9178,7 @@ Major release: pipeline redesign, MinusPod rebrand, and ad detection overhaul.
 - **Improved chapter generation**:
   - Fixed HTML description parsing for timestamp extraction (handles `<br>` tags properly)
   - Content-aware chapter detection: Long segments (>15 min) are automatically split using AI topic detection
-  - Topic-based chapter detection: Descriptions with topic headers but no timestamps (like Windows Weekly show notes) are matched to transcript positions using AI
+  - Topic-based chapter detection: Descriptions with topic headers but no timestamps (like some network show notes) are matched to transcript positions using AI
 
 ---
 
@@ -8838,7 +9217,7 @@ Major release: pipeline redesign, MinusPod rebrand, and ad detection overhaul.
 - **Chapters startTime compatibility with podcast apps**
   - Changed from float values (738.8) to integers (739)
   - Changed minimum startTime from 0 to 1 (required by some apps like Pocket Casts)
-  - Based on analysis of working No Agenda podcast feed format
+  - Based on analysis of a working podcast feed format
 
 ### Changed
 - VTT and chapters stored in database instead of filesystem
@@ -8957,7 +9336,7 @@ Major release: pipeline redesign, MinusPod rebrand, and ad detection overhaul.
 ### Added
 - **Per-Podcast Second Pass Toggle**
   - New `skipSecondPass` setting for podcasts that discuss products (tech shows, etc.)
-  - Second pass detection was too aggressive for shows like Windows Weekly
+  - Second pass detection was too aggressive for some long-form shows
   - Prevents false positives where product discussions are flagged as "subtle ads"
   - Toggle via API: `PATCH /api/v1/feeds/{slug}` with `{"skipSecondPass": true}`
   - Setting is logged during processing: "Second pass skipped (podcast setting)"
@@ -10643,7 +11022,7 @@ Major release: pipeline redesign, MinusPod rebrand, and ad detection overhaul.
 - Wrap descriptions in CDATA to fix invalid XML in RSS feeds
   - Channel descriptions were not escaped, causing raw HTML and `&nbsp;` entities to break XML parsing
   - Episode descriptions now also use CDATA for consistency
-  - Fixes Pocket Casts rejecting feeds with HTML in descriptions (e.g., No Agenda, DTNS)
+  - Fixes Pocket Casts rejecting feeds with HTML in descriptions (seen on several feeds)
 
 ### Changed
 - OpenAPI version is now dynamically injected from version.py
@@ -11575,7 +11954,7 @@ Major release: pipeline redesign, MinusPod rebrand, and ad detection overhaul.
 - Feed slugs defaulting to "rss" - now generates slug from podcast title
 
 ### Changed
-- Slug generation now fetches RSS feed to get podcast name (e.g., "tosh-show" instead of "rss")
+- Slug generation now fetches RSS feed to get podcast name (e.g., "example-podcast" instead of "rss")
 - Added Claude Opus 4.5 to available models list
 - Model validation now checks against VALID_MODELS list
 

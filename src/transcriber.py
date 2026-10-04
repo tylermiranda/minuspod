@@ -12,6 +12,7 @@ import subprocess
 import threading
 import time
 import wave
+from contextlib import contextmanager
 
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -19,11 +20,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import run_context
 from run_context import run_in_worker_thread
 from user_agent import download_user_agent
-from utils.audio import get_audio_duration
+from utils.audio import get_audio_duration, mean_volume_db
 from utils.errors import (
     ServiceUnavailableError, AudioTooLargeError, AudioExtractionError,
-    AudioExtractionTimeout,
+    AudioExtractionTimeout, LocalTranscriptionUnavailableError, ModelLoadError,
 )
+from utils.text import transcript_gaps
 from utils.time import format_vtt_timestamp, parse_iso_utc, utc_now, utc_now_iso
 from utils.gpu import (clear_gpu_memory, get_available_memory_gb,
                        get_gpu_device_name, get_gpu_memory_info)
@@ -67,6 +69,7 @@ from config import (
     coerce_bool_setting,
     get_env_backed_int, MAX_AUDIO_DOWNLOAD_MB_MIN, MAX_AUDIO_DOWNLOAD_MB_ADVISORY,
     log_download_query_enabled,
+    HOLE_RETRANSCRIBE_MAX_HOLES, HOLE_RETRANSCRIBE_MAX_SECONDS, HOLE_RETRANSCRIBE_QUIET_DB,
 )
 
 # Suppress ONNX Runtime warnings before importing faster_whisper
@@ -79,10 +82,30 @@ os.environ.setdefault('HF_HOME', cache_dir)
 os.environ.setdefault('HUGGINGFACE_HUB_CACHE', os.path.join(cache_dir, 'hub'))
 os.environ.setdefault('XDG_CACHE_HOME', cache_dir)
 
-import ctranslate2
-from faster_whisper import WhisperModel, BatchedInferencePipeline
+# Remote-only installs do not ship the local stack; keep the module importable
+# so WHISPER_BACKEND=openai-api still works without it (#795).
+try:
+    import ctranslate2
+    from faster_whisper import WhisperModel, BatchedInferencePipeline
+    _LOCAL_IMPORT_ERROR: ImportError | None = None
+except ImportError as e:
+    ctranslate2 = WhisperModel = BatchedInferencePipeline = None
+    _LOCAL_IMPORT_ERROR = e
 
 logger = logging.getLogger(__name__)
+
+
+def _local_unavailable_message() -> str:
+    return (
+        f"Local Whisper backend needs faster-whisper and ctranslate2 "
+        f"({_LOCAL_IMPORT_ERROR}); install them or set WHISPER_BACKEND=openai-api "
+        f"with WHISPER_API_BASE_URL and WHISPER_API_KEY"
+    )
+
+
+def _require_local_transcription() -> None:
+    if _LOCAL_IMPORT_ERROR is not None:
+        raise LocalTranscriptionUnavailableError(_local_unavailable_message())
 
 # Whisper's encoder window. A clip handed to BatchedInferencePipeline longer
 # than this is silently truncated to its first 30s.
@@ -127,6 +150,30 @@ def _gpu_admission_acquire(device: str) -> bool:
 
 def _gpu_admission_release() -> None:
     _GPU_ADMISSION_SEMAPHORE.release()
+
+
+@contextmanager
+def _all_admission_permits():
+    """Yield whether every admission permit was taken without blocking; they are released on exit."""
+    taken = 0
+    try:
+        # Holding every permit means no local transcription is running or can start meanwhile.
+        while (taken < GPU_TRANSCRIBE_MAX_CONCURRENT
+               and _GPU_ADMISSION_SEMAPHORE.acquire(blocking=False)):
+            taken += 1
+        yield taken == GPU_TRANSCRIBE_MAX_CONCURRENT
+    finally:
+        for _ in range(taken):
+            _GPU_ADMISSION_SEMAPHORE.release()
+
+
+def unload_whisper_if_idle() -> bool:
+    """Unload the local model when no transcription holds an admission permit; True if one was unloaded."""
+    with _all_admission_permits() as free:
+        if not free or not WhisperModelSingleton.is_loaded():
+            return False
+        WhisperModelSingleton.unload_model()
+        return True
 
 
 # Last local transcription outcome, mirrored at module scope so
@@ -201,6 +248,14 @@ def get_local_transcriber_health() -> dict:
     reports the latest one; no attempt yet reads as available.
     """
     device = resolve_whisper_device()
+    if _LOCAL_IMPORT_ERROR is not None:
+        return {
+            'backend': WHISPER_BACKEND_LOCAL,
+            'device': device,
+            'available': False,
+            'reason': _local_unavailable_message(),
+            'lastOutcome': None,
+        }
     outcome = _latest_local_outcome(device)
     last_outcome = None
     if outcome is not None:
@@ -1172,6 +1227,14 @@ def calculate_optimal_chunk_duration(
     return chunk_duration, reason
 
 
+def _raise_if_load_oom(err: Exception) -> None:
+    """Re-raise a GPU allocation failure at model load as ModelLoadError."""
+    if 'out of memory' in str(err).lower():
+        # Worded without the OOM terms so string classifiers do not read it as permanent.
+        raise ModelLoadError(
+            'Whisper model could not be loaded on the GPU at any precision') from err
+
+
 class WhisperModelSingleton:
     _instance = None
     _base_model = None
@@ -1233,6 +1296,10 @@ class WhisperModelSingleton:
             logger.info("CUDA cache cleared")
 
     @classmethod
+    def is_loaded(cls) -> bool:
+        return cls._instance is not None or cls._base_model is not None
+
+    @classmethod
     def get_instance(cls) -> tuple[WhisperModel, BatchedInferencePipeline]:
         """
         Get both the base model and batched pipeline instance.
@@ -1247,6 +1314,7 @@ class WhisperModelSingleton:
             cls.unload_model()
 
         if cls._instance is None:
+            _require_local_transcription()
             model_size = reload_model or cls.get_configured_model()
             device = resolve_whisper_device()
             configured_compute_type = _get_whisper_compute_type()
@@ -1298,11 +1366,14 @@ class WhisperModelSingleton:
                         except Exception as retry_err:
                             last_err = retry_err
                     else:
+                        _raise_if_load_oom(last_err)
                         # Preserve the original float16 failure as __cause__ so
                         # operators can see the root cause, not just the last
                         # fallback attempt's error.
                         raise last_err from init_err
                 else:
+                    if device == "cuda":
+                        _raise_if_load_oom(init_err)
                     raise
 
             # Initialize batched pipeline
@@ -1390,6 +1461,18 @@ def _effective_language(language_override: str | None, whisper_settings: dict[st
     return (whisper_settings.get('language') or 'en').strip().lower()
 
 
+_NOVAD_LABELS = {'novad_tail': 'Tail', 'novad_hole': 'Hole'}
+# Within this many seconds a gap matches a recorded hole.
+_HOLE_MATCH_S = 0.05
+
+
+def _hole_recorded(hole, records) -> bool:
+    """Whether a hole matches a recorded {start, end} within _HOLE_MATCH_S."""
+    return any(abs(hole[0] - (rec.get('start') or 0.0)) <= _HOLE_MATCH_S
+               and abs(hole[1] - (rec.get('end') or 0.0)) <= _HOLE_MATCH_S
+               for rec in records if isinstance(rec, dict))
+
+
 def _full_span_clips(duration: float | None) -> list[dict] | None:
     """Cover the whole file with 30s clips for a VAD-off transcription.
 
@@ -1417,6 +1500,9 @@ class Transcriber:
         # Last local transcribe() outcome (batch_size/retry_count/device/etc),
         # read by callers that want it beside the per-phase stats (#519).
         self.last_transcription_stats = None
+        if (_LOCAL_IMPORT_ERROR is not None
+                and _get_whisper_settings()['backend'] != WHISPER_BACKEND_API):
+            logger.warning(_local_unavailable_message())
 
     def _transcribe_via_api(
         self,
@@ -1703,6 +1789,171 @@ class Transcriber:
         finally:
             _unlink_quiet(preprocessed_path)
             _unlink_quiet(flac_path)
+
+    def _record_local_stats(self, outcome, batch_size, retry_count, device, model,
+                            error=None) -> None:
+        """Store and persist the outcome of a local batched transcription."""
+        stats = {
+            'outcome': outcome,
+            'batch_size': batch_size,
+            'retry_count': retry_count,
+            'retry_succeeded': outcome == 'success' and retry_count > 0,
+            'device': device,
+            'gpu_device_name': get_gpu_device_name() if device == 'cuda' else None,
+            'model': model,
+        }
+        if error is not None:
+            stats['error'] = error[:500]
+        self.last_transcription_stats = stats
+        _record_local_transcription_outcome(stats)
+
+    def _transcribe_sequential(self, audio_path: str,
+                               language_override: str | None = None) -> list[dict] | None:
+        """No-VAD decode on the base WhisperModel with its temperature fallback; None on failure.
+
+        The batched pipeline can skip the start of a clip; this path is for short repair spans.
+        """
+        whisper_settings = _get_whisper_settings()
+        if whisper_settings['backend'] == WHISPER_BACKEND_API:
+            return self._transcribe_via_api(
+                audio_path, whisper_settings, language_override=language_override,
+                vad_filter=False)
+        _require_local_transcription()
+        language_setting = _effective_language(language_override, whisper_settings)
+        language = None if language_setting == 'auto' else (language_setting or 'en')
+        preprocessed_path = None
+        acquired = _gpu_admission_acquire(resolve_whisper_device())
+        try:
+            preprocessed_path = self.preprocess_audio(audio_path)
+            model, _batched = WhisperModelSingleton.get_instance()
+            segments, _info = model.transcribe(
+                preprocessed_path or audio_path, language=language, beam_size=5,
+                word_timestamps=True, vad_filter=False)
+            return [{
+                'start': seg.start,
+                'end': seg.end,
+                'text': seg.text.strip(),
+                'words': [{'word': w.word, 'start': w.start, 'end': w.end}
+                          for w in seg.words or []],
+            } for seg in segments]
+        except ModelLoadError:
+            raise
+        except Exception as e:
+            logger.error(f"{_log_prefix()}Sequential transcription failed: {e}")
+            return None
+        finally:
+            if acquired:
+                _gpu_admission_release()
+            _unlink_quiet(preprocessed_path)
+
+    def transcribe_span_no_vad(self, audio_path: str, start: float, end: float,
+                               language_override: str | None, flag: str,
+                               quiet_db: float | None = None) -> tuple[list[dict] | None, str | None]:
+        """Sequential no-VAD decode of start-end. Returns (offset segments flagged `flag` or None, empty_reason).
+
+        empty_reason is 'quiet', 'unreadable' or 'no_speech' when the span should not be retried.
+        With quiet_db set, a span below it (or with an unreadable volume) is skipped before extraction.
+        ModelLoadError propagates; other failures return (None, None).
+        """
+        label = _NOVAD_LABELS[flag]
+        prefix = _log_prefix()
+        if quiet_db is not None:
+            volume = mean_volume_db(audio_path, start, end - start)
+            if volume is None or volume < quiet_db:
+                reading = 'unreadable' if volume is None else f'{volume:.1f} dB'
+                logger.info(f"{prefix}{label} {start:.1f}s-{end:.1f}s mean volume {reading}; skipping")
+                return None, 'unreadable' if volume is None else 'quiet'
+        try:
+            chunk_path = extract_audio_chunk(audio_path, start, end)
+        except AudioExtractionTimeout as e:
+            logger.warning(f"{prefix}{label} chunk extraction timed out; skipping: {e}")
+            return None, None
+        if not chunk_path:
+            logger.warning(f"{prefix}{label} chunk extraction failed; skipping")
+            return None, None
+        try:
+            new_segments = self._transcribe_sequential(chunk_path, language_override)
+        except ModelLoadError:
+            raise
+        except Exception as e:
+            logger.warning(f"{prefix}{label} re-transcription failed; "
+                           f"proceeding without {label.lower()}: {e}")
+            return None, None
+        finally:
+            _unlink_quiet(chunk_path)
+        if new_segments is None:
+            logger.warning(f"{prefix}{label} re-transcription failed; "
+                           f"proceeding without {label.lower()}")
+            return None, None
+        new_segments = self.filter_hallucinations(new_segments)
+        if not new_segments:
+            logger.info(f"{prefix}{label} re-transcription produced no segments")
+            return None, 'no_speech'
+        for seg in new_segments:
+            seg['start'] += start
+            seg['end'] += start
+            for word in seg.get('words') or []:
+                word['start'] += start
+                word['end'] += start
+            seg[flag] = True
+        logger.info(
+            f"{prefix}{label} re-transcription added {len(new_segments)} segment(s) "
+            f"({new_segments[0]['start']:.1f}s-{new_segments[-1]['end']:.1f}s)")
+        return new_segments, None
+
+    @staticmethod
+    def unload_after_repair() -> None:
+        """Free the model the repair decodes reloaded after transcribe_chunked unloaded it."""
+        with _all_admission_permits() as free:
+            if not free:
+                logger.debug("Skipping the post-repair Whisper unload: a local transcription holds the GPU")
+                return
+            if WhisperModelSingleton.is_loaded():
+                WhisperModelSingleton.unload_model()
+                logger.info("Whisper model unloaded after transcript repair")
+
+    def repair_gaps(self, audio_path: str, segments: list[dict], min_s: float,
+                    language_override: str | None = None,
+                    skip=()) -> tuple[list[dict], list[dict]]:
+        """Re-decode transcript gaps of min_s or more the batched decoder skipped.
+
+        Holes matching a `skip` record are left alone; caps keep the largest holes.
+        Returns (added segments flagged novad_hole, holes that held nothing as {start, end, reason}).
+        """
+        prefix = _log_prefix()
+        holes = transcript_gaps(segments, min_s)
+        known = [hole for hole in holes if _hole_recorded(hole, skip)]
+        if known:
+            logger.info(f"{prefix}Skipping {len(known)} untranscribed hole(s) "
+                        f"already re-transcribed without speech")
+            holes = [hole for hole in holes if hole not in known]
+        picked, skipped = [], []
+        budget = HOLE_RETRANSCRIBE_MAX_SECONDS
+        for hole in sorted(holes, key=lambda h: h[1] - h[0], reverse=True):
+            length = hole[1] - hole[0]
+            if len(picked) < HOLE_RETRANSCRIBE_MAX_HOLES and length <= budget:
+                picked.append(hole)
+                budget -= length
+            else:
+                skipped.append(hole)
+        if skipped:
+            logger.info(
+                f"{prefix}Skipping {len(skipped)} untranscribed hole(s) "
+                f"({sum(e - s for s, e in skipped):.1f} s) over the per-episode cap of "
+                f"{HOLE_RETRANSCRIBE_MAX_HOLES} holes / {HOLE_RETRANSCRIBE_MAX_SECONDS:.0f} s")
+        added, empty = [], []
+        for hole_start, hole_end in sorted(picked):
+            logger.info(
+                f"{prefix}Untranscribed hole {hole_start:.1f}s-{hole_end:.1f}s "
+                f"({hole_end - hole_start:.1f} s); re-transcribing without VAD")
+            recovered, reason = self.transcribe_span_no_vad(
+                audio_path, hole_start, hole_end, language_override, 'novad_hole',
+                quiet_db=HOLE_RETRANSCRIBE_QUIET_DB)
+            if recovered:
+                added.extend(recovered)
+            elif reason:
+                empty.append({'start': hole_start, 'end': hole_end, 'reason': reason})
+        return added, empty
 
     def filter_hallucinations(self, segments: list[dict]) -> list[dict]:
         """Filter out common Whisper hallucinations and artifacts."""
@@ -2109,6 +2360,8 @@ class Transcriber:
                 preprocessed=preprocessed,
                 vad_filter=vad_filter,
             )
+        # Outside the try below so the actionable message is not swallowed.
+        _require_local_transcription()
 
         language_setting = _effective_language(language_override, whisper_settings)
         transcribe_language = None if language_setting == 'auto' else (language_setting or 'en')
@@ -2292,16 +2545,8 @@ class Transcriber:
                         # proves the size fits; failures never persist anything.
                         self.record_batch_size_ceiling(batch_size)
 
-                    self.last_transcription_stats = {
-                        'outcome': 'success',
-                        'batch_size': batch_size,
-                        'retry_count': retry_count,
-                        'retry_succeeded': retry_count > 0,
-                        'device': device,
-                        'gpu_device_name': get_gpu_device_name() if device == 'cuda' else None,
-                        'model': current_model,
-                    }
-                    _record_local_transcription_outcome(self.last_transcription_stats)
+                    self._record_local_stats('success', batch_size, retry_count,
+                                             device, current_model)
 
                     return result
 
@@ -2332,17 +2577,8 @@ class Transcriber:
 
         except Exception as e:
             logger.error(f"Transcription failed: {e}")
-            self.last_transcription_stats = {
-                'outcome': 'failed',
-                'batch_size': batch_size,
-                'retry_count': retry_count,
-                'retry_succeeded': False,
-                'device': device,
-                'gpu_device_name': get_gpu_device_name() if device == 'cuda' else None,
-                'model': current_model,
-                'error': str(e)[:500],
-            }
-            _record_local_transcription_outcome(self.last_transcription_stats)
+            self._record_local_stats('failed', batch_size, retry_count, device,
+                                     current_model, error=str(e))
             # Clean up GPU memory on ANY failure to prevent memory leaks
             # This is critical for OOM recovery - free memory before retry
             try:
@@ -2351,6 +2587,8 @@ class Transcriber:
                 logger.info("Cleaned up GPU memory after transcription failure")
             except Exception as cleanup_err:
                 logger.warning(f"Failed to clean up GPU memory: {cleanup_err}")
+            if isinstance(e, ModelLoadError):
+                raise
             return None
         finally:
             if gpu_admission_acquired:
@@ -2611,6 +2849,7 @@ class Transcriber:
                     audio_path, duration, whisper_settings,
                     language_override=language_override,
                 )
+        _require_local_transcription()
 
         # Get current model and device for memory calculation
         model_name = WhisperModelSingleton.get_configured_model()

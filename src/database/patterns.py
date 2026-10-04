@@ -2,7 +2,11 @@
 import json
 import logging
 
-from config import SEGMENT_CATEGORIES
+from config import (
+    CORRECTION_ORIGIN_AUTO_PASS2, CORRECTION_ORIGIN_USER, SEGMENT_CATEGORIES,
+)
+from utils.markers import parse_ad_markers
+from utils.pattern_catalog import invalidate_pattern_catalog_scope
 
 logger = logging.getLogger(__name__)
 
@@ -40,6 +44,7 @@ class PatternMixin:
         # (podcast_id stores slugs since v0.1.194; sponsor moved to FK in v2.2.0)
         query = """
             SELECT ap.*, ks.name AS sponsor, ks.segment_category AS sponsor_segment_category,
+                   ks.tags AS sponsor_tags, ks.is_active AS sponsor_active,
                    p.title as podcast_name, p.slug as podcast_slug
             FROM ad_patterns ap
             LEFT JOIN podcasts p ON ap.podcast_id = p.slug
@@ -50,7 +55,7 @@ class PatternMixin:
 
         if active_only:
             query += " AND ap.is_active = 1"
-        if scope:
+        if scope and scope != 'all':
             query += " AND ap.scope = ?"
             params.append(scope)
         if podcast_id:
@@ -197,6 +202,7 @@ class PatternMixin:
 
     def create_ad_pattern(self, *args, **kwargs) -> int:
         """Create a new ad pattern in its own transaction. Returns pattern ID."""
+        invalidate_pattern_catalog_scope()
         with self.transaction() as conn:
             return self._create_ad_pattern_conn(conn, *args, **kwargs)
 
@@ -218,6 +224,18 @@ class PatternMixin:
                 fields.append(f"{key} = ?")
                 values.append(json.dumps(value) if isinstance(value, list) else value)
 
+        # SET reads the pre-update row, so re-disabling keeps the original stamp.
+        if 'is_active' in kwargs and 'disabled_at' not in kwargs:
+            if kwargs['is_active']:
+                fields.append("disabled_at = NULL")
+                if 'disabled_reason' not in kwargs:
+                    fields.append("disabled_reason = NULL")
+            else:
+                fields.append(
+                    "disabled_at = CASE WHEN is_active = 1 "
+                    "THEN strftime('%Y-%m-%dT%H:%M:%SZ', 'now') "
+                    "ELSE COALESCE(disabled_at, strftime('%Y-%m-%dT%H:%M:%SZ', 'now')) END")
+
         if not fields:
             return False
 
@@ -230,6 +248,7 @@ class PatternMixin:
 
     def update_ad_pattern(self, pattern_id: int, **kwargs) -> bool:
         """Update an ad pattern in its own transaction."""
+        invalidate_pattern_catalog_scope()
         with self.transaction() as conn:
             return self._update_ad_pattern_conn(conn, pattern_id, **kwargs)
 
@@ -282,11 +301,13 @@ class PatternMixin:
 
     def bulk_delete_patterns(self, ids: list[int]) -> int:
         """Hard-delete patterns by id in its own transaction. Returns rows deleted."""
+        invalidate_pattern_catalog_scope()
         with self.transaction() as conn:
             return self._bulk_delete_patterns_conn(conn, ids)
 
     def bulk_disable_patterns(self, ids: list[int]) -> int:
         """Set is_active=0 on patterns by id. Returns rows changed."""
+        invalidate_pattern_catalog_scope()
         if not ids:
             return 0
         conn = self.get_connection()
@@ -330,6 +351,7 @@ class PatternMixin:
 
     def update_pattern_duration(self, pattern_id: int, observed_duration: float) -> bool:
         """Update pattern avg_duration as a running average."""
+        invalidate_pattern_catalog_scope()
         conn = self.get_connection()
         conn.execute(
             """UPDATE ad_patterns SET
@@ -357,6 +379,7 @@ class PatternMixin:
 
     def delete_ad_pattern(self, pattern_id: int) -> bool:
         """Delete an ad pattern in its own transaction. Returns True if deleted."""
+        invalidate_pattern_catalog_scope()
         with self.transaction() as conn:
             return self._delete_ad_pattern_conn(conn, pattern_id)
 
@@ -369,6 +392,7 @@ class PatternMixin:
         patterns. The FK cascades, but only on a connection with
         foreign_keys on, so the delete stays explicit.
         """
+        invalidate_pattern_catalog_scope()
         conn = self.get_connection()
         conn.execute(
             "DELETE FROM audio_fingerprints WHERE pattern_id IN ("
@@ -389,7 +413,9 @@ class PatternMixin:
                                    corrected_bounds: dict = None, text_snippet: str = None,
                                    sponsor_id: int = None,
                                    source_hold_reason: str = None,
-                                   podcast_id: int = None) -> int:
+                                   podcast_id: int = None,
+                                   origin: str = CORRECTION_ORIGIN_USER,
+                                   hold_id: str = None) -> int:
         """Create a pattern correction record. Returns correction ID.
 
         source_hold_reason records which hold gate produced a
@@ -401,12 +427,12 @@ class PatternMixin:
             """INSERT INTO pattern_corrections
                (pattern_id, episode_id, podcast_title, episode_title, correction_type,
                 original_bounds, corrected_bounds, text_snippet, sponsor_id, podcast_id,
-                source_hold_reason)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                source_hold_reason, origin, hold_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (pattern_id, episode_id, podcast_title, episode_title, correction_type,
              json.dumps(original_bounds) if original_bounds else None,
              json.dumps(corrected_bounds) if corrected_bounds else None,
-             text_snippet, sponsor_id, podcast_id, source_hold_reason)
+             text_snippet, sponsor_id, podcast_id, source_hold_reason, origin, hold_id)
         )
         conn.commit()
         return cursor.lastrowid
@@ -632,7 +658,8 @@ class PatternMixin:
         """Get all corrections for a specific episode, newest first."""
         conn = self.get_connection()
         cursor = conn.execute(
-            """SELECT id, correction_type, original_bounds, corrected_bounds, created_at
+            """SELECT id, correction_type, original_bounds, corrected_bounds, created_at,
+                      origin
                FROM pattern_corrections
                WHERE episode_id = ? AND podcast_id = ?
                ORDER BY id DESC""",
@@ -711,7 +738,8 @@ class PatternMixin:
         """
         conn = self.get_connection()
         cursor = conn.execute(
-            """SELECT correction_type, original_bounds, corrected_bounds
+            """SELECT correction_type, original_bounds, corrected_bounds,
+                      origin, source_hold_reason, hold_id
                FROM pattern_corrections
                WHERE podcast_id = ? AND episode_id = ?
                  AND correction_type IN ('confirm', 'boundary_adjustment')
@@ -729,6 +757,12 @@ class PatternMixin:
                 if confirmed_span:
                     bounds['confirmed_span'] = confirmed_span
                 bounds['correction_type'] = row['correction_type']
+                if row['origin'] == CORRECTION_ORIGIN_AUTO_PASS2:
+                    bounds['auto_filed'] = True
+                    if row['source_hold_reason']:
+                        bounds['hold_reason'] = row['source_hold_reason']
+                    if row['hold_id']:
+                        bounds['hold_id'] = row['hold_id']
                 results.append(bounds)
         return results
 
@@ -743,7 +777,8 @@ class PatternMixin:
         orig_start/orig_end (the bounds of the marker the user adjusted) so
         the learner can match the adjustment to its marker. Rows without
         valid bounds are skipped. Only corrections for episode_ids are
-        returned, keeping the query bounded to the learning window.
+        returned, keeping the query bounded to the learning window. Pass-2
+        auto-filed confirms are excluded so the prior never learns its own output.
         """
         if not episode_ids:
             return []
@@ -759,8 +794,9 @@ class PatternMixin:
             WHERE p.slug = ?
             AND pc.correction_type IN
                 ('false_positive', 'confirm', 'boundary_adjustment', 'create')
+            AND NOT (pc.correction_type = 'confirm' AND pc.origin = ?)
             AND pc.episode_id IN ({placeholders})
-        ''', [podcast_slug] + list(episode_ids))  # noqa: S608
+        ''', [podcast_slug, CORRECTION_ORIGIN_AUTO_PASS2] + list(episode_ids))  # noqa: S608
 
         results = []
         for row in cursor.fetchall():
@@ -873,14 +909,8 @@ def suppress_differential_fp_texts(db) -> int:
             "SELECT ad_markers_json FROM episode_details WHERE episode_id = ?",
             (episode_matches[0]['id'],)
         ).fetchone()
-        if not episode_row or not episode_row['ad_markers_json']:
-            continue
-
-        try:
-            markers = json.loads(episode_row['ad_markers_json'])
-        except (json.JSONDecodeError, TypeError):
-            continue
-        if not isinstance(markers, list):
+        markers = parse_ad_markers(episode_row['ad_markers_json']) if episode_row else None
+        if markers is None:
             continue
 
         matched = False

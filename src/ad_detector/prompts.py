@@ -7,8 +7,13 @@ for readability; behavior is unchanged from the pre-split module.
 import logging
 import json
 import re
+from collections import Counter
+from typing import NamedTuple
 
+from sponsor_context import (SPONSOR_MIN_MENTIONS, framed_sponsor_names, registry_sponsor,
+                             text_has_commercial_context)
 from sponsor_service import SponsorService
+from text_pattern_matcher import bounded_segment_texts
 from utils.prompt import (
     format_sponsor_block, render_prompt, strip_comments_from_prompt
 )
@@ -16,12 +21,14 @@ from utils.text import truncate
 from utils.time import parse_timestamp
 from utils.llm_response import extract_json_ads_array
 from utils.constants import (
-    INVALID_SPONSOR_VALUES, STRUCTURAL_FIELDS,
+    AUDIO_ECHO_RE, INVALID_SPONSOR_VALUES, STRUCTURAL_FIELDS,
     SPONSOR_PRIORITY_FIELDS, SPONSOR_PATTERN_KEYWORDS,
     SPONSOR_MAX_NAME_CHARS, REASON_DESCRIPTION_MAX,
+    is_non_brand_name,
     is_sponsor_reasoning_rationale,
     mentions_advertising,
     NOT_AD_CLASSIFICATIONS,
+    squash_brand,
 )
 from config import (
     LOW_CONFIDENCE, CONFIDENCE_STRING_MAP,
@@ -35,6 +42,7 @@ logger = logging.getLogger('podcast.claude')
 # this ratio the shorter one is a fragment of the longer, which is worth
 # keeping rather than discarding.
 DUPLICATE_MIN_LENGTH_RATIO = 0.8
+
 
 def _singular(key: str) -> str:
     """Drop one trailing plural. rstrip('s') stemmed 'names' to 'name' but also
@@ -200,6 +208,13 @@ SEGMENT_ID_WINDOW_RULES = (
 )
 
 
+AD_QUOTE_ANCHOR_SECTION = """
+
+AD-ONLY WORD ANCHORS:
+Every ad object must include start_text and end_text. Copy 5-12 consecutive spoken words from the transcript at each edge. start_text begins with the first words of the ad or its explicit sponsor handoff. end_text ends with the last words of the ad, including its final sponsor thanks or call to action. Exclude ordinary show setup before the sponsor and return-to-show speech after it. Do not use a whole transcript line when it contains both ad and show speech. If either ad edge is unclear, use an empty string for that quote. Keep the required start/end timestamps or segment IDs; the quotes only locate words inside those coarse lines.
+"""
+
+
 def get_static_system_prompt() -> str:
     """Return DEFAULT_SYSTEM_PROMPT with the static SEED_SPONSORS list substituted.
 
@@ -285,7 +300,7 @@ def _get_valid_sponsor_value(value):
         return None
     if len(str_value) > SPONSOR_MAX_NAME_CHARS:
         return None
-    if is_sponsor_reasoning_rationale(str_value):
+    if is_sponsor_reasoning_rationale(str_value) or AUDIO_ECHO_RE.search(str_value):
         return None
     return str_value
 
@@ -337,6 +352,13 @@ def _extract_sponsor_name(ad: dict) -> str:
         key_lower = key.lower()
         if key_lower in STRUCTURAL_FIELDS or key_lower in priority_lower:
             continue
+        if key_lower in ('reason', 'description'):
+            # Prose about the span names a sponsor only through a credit ("brought to you by Acme").
+            framed = framed_sponsor_names(val) if isinstance(val, str) else []
+            value = _get_valid_sponsor_value(framed[0]) if framed else None
+            if value:
+                return value
+            continue
         if isinstance(val, str) and len(val) < 80:
             value = _get_valid_sponsor_value(val)
             if value:
@@ -346,15 +368,67 @@ def _extract_sponsor_name(ad: dict) -> str:
         if key.lower() in STRUCTURAL_FIELDS:
             continue
         if isinstance(val, str) and len(val) > 10:
-            sponsor = extract_sponsor_from_text(val)
-            if sponsor:
+            sponsor = extract_sponsor_from_text(AUDIO_ECHO_RE.sub(' ', val))
+            if sponsor and not is_non_brand_name(sponsor):
                 return sponsor
 
     return 'Advertisement detected'
 
 
+class EpisodeSponsors(NamedTuple):
+    """Sponsor matchers for one episode, split by where a name may match."""
+    audio_re: re.Pattern | None  # heard in this episode's audio: summary and quotes
+    summary_re: re.Pattern | None  # description-derived: summary only
+
+
+def _names_known_sponsor(summary: list[str], quotes: list[str],
+                         episode_sponsors: EpisodeSponsors | None,
+                         sponsor_service) -> bool:
+    """Whether any text names a known episode sponsor, or the summary a registry sponsor."""
+    if episode_sponsors is not None:
+        audio_re, summary_re = episode_sponsors
+        if audio_re is not None and any(audio_re.search(t) for t in summary + quotes):
+            return True
+        if summary_re is not None and any(summary_re.search(t) for t in summary):
+            return True
+    # Quotes are excluded: registry names like "Indeed" are common words.
+    return bool(sponsor_service) and any(
+        sponsor_service.find_sponsor_in_text(t) for t in summary)
+
+
+def _span_names_sponsor(segments: list[dict], start: float, end: float,
+                        episode_sponsors: EpisodeSponsors | None, sponsor_service) -> bool:
+    """Whether the span transcript names one known sponsor at least twice."""
+    texts = bounded_segment_texts(segments, start, end)
+    text = ' '.join(texts)
+    if episode_sponsors is not None:
+        audio_re, summary_re = episode_sponsors
+        # Keyed by offset so a name both matchers carry counts once, as heard.
+        names = {m.start(): (m.group(0).lower(), p is audio_re)
+                 for p in (summary_re, audio_re) if p is not None for m in p.finditer(text)}
+        counts = Counter(name for name, _heard in names.values())
+        heard = {name for name, is_heard in names.values() if is_heard}
+        # A description-only name can be an everyday word, so it also needs commercial context.
+        if any(n >= SPONSOR_MIN_MENTIONS and (name in heard or text_has_commercial_context(
+                text, name,
+                names_sponsor=lambda t, b: any(m.group(0).lower() == b
+                                               for m in summary_re.finditer(t)),
+                matches_expected=lambda f, b: squash_brand(f) == squash_brand(b)))
+               for name, n in counts.items()):
+            return True
+    if not sponsor_service:
+        return False
+    # Registry names can be everyday words, so a registry brand also needs commercial context.
+    return registry_sponsor(
+        sponsor_service, texts,
+        names_sponsor=sponsor_service.mentions_brand,
+        matches_expected=lambda f, b: squash_brand(f) == squash_brand(b))[2]
+
+
 def _normalize_ad(ad: dict, start: float, end: float, slug: str = None,
-                   episode_id: str = None, sponsor_service=None) -> dict | None:
+                   episode_id: str = None, sponsor_service=None,
+                   episode_sponsors: EpisodeSponsors | None = None,
+                   segments: list[dict] | None = None) -> dict | None:
     """Post-parse normalization shared by the timestamp-mode and segment-id-mode
     parsers: degenerate-range rejection, is_ad/classification filters, sponsor
     name + reason/description extraction, confidence normalization, the
@@ -398,11 +472,12 @@ def _normalize_ad(ad: dict, start: float, end: float, slug: str = None,
     elif existing_reason and isinstance(existing_reason, str) and len(existing_reason) > len(reason) + 5:
         # Claude's reason is substantially more descriptive than the bare sponsor name
         reason = existing_reason
+    base_reason = reason
 
     # Extract description from Claude's response to enrich the reason
     # Dynamic scan: check ALL non-structural string fields > 10 chars
     # Skip 'reason' (already used above); duplication with sponsor handled at combine time
-    description = None
+    description = description_key = None
     for key, val in ad.items():
         if key.lower() in STRUCTURAL_FIELDS:
             continue
@@ -411,12 +486,11 @@ def _normalize_ad(ad: dict, start: float, end: float, slug: str = None,
         if isinstance(val, str) and len(val) > 10:
             # Prefer longer descriptive text over short values
             if description is None or len(val) > len(description):
-                description = val
+                description, description_key = val, key
     # Kept whole (#591); the old 300/150 caps put a literal
     # "..." in the UI with no fuller text to expand to.
-    description = truncate(
-        _strip_continuation_prefix(description),
-        REASON_DESCRIPTION_MAX)
+    full_description = _strip_continuation_prefix(description)
+    description = truncate(full_description, REASON_DESCRIPTION_MAX)
 
     # Combine sponsor + description in reason field
     if description:
@@ -449,11 +523,25 @@ def _normalize_ad(ad: dict, start: float, end: float, slug: str = None,
         and _get_valid_sponsor_value(val)
         for key, val in ad.items()
     )
-    has_known_sponsor = (
-        sponsor_service and
-        sponsor_service.find_sponsor_in_text(reason)
-    ) if reason else False
     has_ad_language = mentions_advertising(reason)
+    # Checked only when cheaper evidence is missing: the registry scan is costly.
+    has_known_sponsor = False
+    if not has_sponsor_field and not has_ad_language:
+        # Untruncated pieces, so a sponsor past the reason's length cap still counts.
+        raw_description = (_as_text(ad.get('description'))
+                           if description_key != 'description' else '')
+        summary = [t for t in (base_reason, full_description, raw_description) if t]
+        quotes = [t for t in (_as_text(ad.get('start_text')),
+                              _as_text(ad.get('end_text'))) if t]
+        has_known_sponsor = _names_known_sponsor(
+            summary, quotes, episode_sponsors, sponsor_service)
+    # A truncated reason can omit the sponsor the span transcript names.
+    found_in_span = (
+        not has_sponsor_field and not has_known_sponsor and not has_ad_language
+        and segments is not None and duration >= CONTENT_DURATION_THRESHOLD
+        and norm_conf >= LOW_CONFIDENCE
+        and _span_names_sponsor(segments, start, end, episode_sponsors, sponsor_service))
+    has_known_sponsor = has_known_sponsor or found_in_span
 
     if not has_sponsor_field and not has_known_sponsor and not has_ad_language:
         # Low confidence + no evidence = reject regardless of duration
@@ -482,12 +570,14 @@ def _normalize_ad(ad: dict, start: float, end: float, slug: str = None,
                 f"reason: {reason[:100] if reason else 'None'}"
             )
 
-    logger.info(f"[{slug}:{episode_id}] Extracted ad: {start:.1f}s-{end:.1f}s, reason='{reason}', fields={list(ad.keys())}")
+    span_note = ' (sponsor found in span transcript)' if found_in_span else ''
+    logger.info(f"[{slug}:{episode_id}] Extracted ad: {start:.1f}s-{end:.1f}s, reason='{reason}', fields={list(ad.keys())}{span_note}")
     ad_entry = {
         'start': start,
         'end': end,
         'confidence': norm_conf,
         'reason': reason,
+        'start_text': _as_text(ad.get('start_text')),
         'end_text': _as_text(ad.get('end_text'))
     }
     # Store sponsor name separately for UI display
@@ -505,7 +595,9 @@ def _normalize_ad(ad: dict, start: float, end: float, slug: str = None,
 def parse_ads_from_response(response_text: str, slug: str = None,
                               episode_id: str = None,
                               sponsor_service=None,
-                              compliance_meta: dict | None = None) -> list[dict]:
+                              compliance_meta: dict | None = None,
+                              episode_sponsors: EpisodeSponsors | None = None,
+                              segments: list[dict] | None = None) -> list[dict]:
     """Parse ad segments from Claude's JSON response.
 
     ``compliance_meta``: optional out-param dict (same pattern as
@@ -573,7 +665,8 @@ def parse_ads_from_response(response_text: str, slug: str = None,
                     start = parse_timestamp(start_val)
                     end = parse_timestamp(end_val)
                     ad_entry = _normalize_ad(
-                        ad, start, end, slug, episode_id, sponsor_service)
+                        ad, start, end, slug, episode_id, sponsor_service,
+                        episode_sponsors, segments)
                     if ad_entry is not None:
                         valid_ads.append(ad_entry)
                 except ValueError as e:
@@ -661,7 +754,8 @@ def parse_id_ads_from_response(response_text: str, slug: str = None,
 
 def resolve_segment_id_ads(ads: list[dict], window_segments: list[dict],
                             slug: str = None, episode_id: str = None,
-                            sponsor_service=None) -> list[dict]:
+                            sponsor_service=None,
+                            episode_sponsors: EpisodeSponsors | None = None) -> list[dict]:
     """Map start_id/end_id to exact segment start/end seconds, then run the
     resolved ads through the same post-parse normalization
     ``parse_ads_from_response`` applies (confidence normalization, sponsor
@@ -686,13 +780,18 @@ def resolve_segment_id_ads(ads: list[dict], window_segments: list[dict],
         start = seg_lo['start']
         end = seg_hi['end']
         try:
-            ad_entry = _normalize_ad(raw, start, end, slug, episode_id, sponsor_service)
+            ad_entry = _normalize_ad(raw, start, end, slug, episode_id,
+                                     sponsor_service, episode_sponsors, window_segments)
         except (ValueError, TypeError) as e:
             logger.warning(
                 f"[{slug}:{episode_id}] Skipping ad with invalid field "
                 f"(ids {lo}-{hi}): {e}")
             continue
         if ad_entry is not None:
+            if seg_lo.get('word_timed_line'):
+                ad_entry['word_timed_start'] = start
+            if seg_hi.get('word_timed_line'):
+                ad_entry['word_timed_end'] = end
             resolved.append(ad_entry)
     return resolved
 
@@ -773,6 +872,7 @@ AD_DETECTION_JSON_SCHEMA = {
                     "end": {"type": "number"},
                     "start_id": {"type": "integer"},
                     "end_id": {"type": "integer"},
+                    "start_text": {"type": "string"},
                     # The prompt requires end_text on every segment and the
                     # sponsor extractors read these names; a schema-enforcing
                     # decoder would silently strip anything absent here.

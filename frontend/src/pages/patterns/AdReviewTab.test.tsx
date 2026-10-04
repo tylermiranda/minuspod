@@ -1,4 +1,4 @@
-import { render, screen, waitFor, within } from '@testing-library/react';
+import { act, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { MemoryRouter } from 'react-router';
@@ -42,7 +42,13 @@ vi.mock('../../api/patterns', async (importOriginal) => ({
 }));
 // AdReviewModal renders WaveSurfer; its own behavior is covered by its use on
 // the episode page. Here only AdReviewTab's submit mapping matters.
-vi.mock('../../components/AdReviewModal', () => ({ default: () => null }));
+const modalProps: { onSubmit?: (s: { kind: string; sponsor?: string }) => void } = {};
+vi.mock('../../components/AdReviewModal', () => ({
+  default: (props: typeof modalProps) => {
+    modalProps.onSubmit = props.onSubmit;
+    return null;
+  },
+}));
 
 function detection(over: Partial<ReviewDetection> = {}): ReviewDetection {
   return {
@@ -56,7 +62,7 @@ function detection(over: Partial<ReviewDetection> = {}): ReviewDetection {
     patternId: null, detectionStage: 'first_pass',
     category: null, actionApplied: null,
     reviewerVerdict: null, reviewerOriginalStart: null, reviewerOriginalEnd: null,
-    reviewerMoved: false,
+    reviewerMoved: false, holdReason: null,
     status: 'rejected', resolution: 'unresolved',
     ...over,
   };
@@ -74,6 +80,7 @@ function renderTab() {
 }
 
 beforeEach(() => {
+  modalProps.onSubmit = undefined;
   mockGetDetections.mockResolvedValue({
     detections: [detection()], total: 1, page: 1, totalPages: 1, limit: 20,
     counts: COUNTS,
@@ -219,6 +226,20 @@ describe('AdReviewTab row actions', () => {
     // Review is bulk work: the server stamps the episode and the Apply bar
     // cuts it once, so a decision must not start its own recut.
     expect(mockReprocess).not.toHaveBeenCalled();
+  });
+
+  it('a confirm from the review modal forwards the typed sponsor', async () => {
+    renderTab();
+    const user = userEvent.setup();
+    await user.click((await screen.findAllByRole('button', { name: 'Edit' }))[0]);
+    await waitFor(() => expect(modalProps.onSubmit).toBeDefined());
+    act(() => modalProps.onSubmit!({ kind: 'confirm', sponsor: 'Globex' }));
+    await waitFor(() => expect(mockSubmitCorrection).toHaveBeenCalledOnce());
+    expect(mockSubmitCorrection.mock.calls[0][2]).toMatchObject({
+      type: 'confirm',
+      original_ad: { start: 100, end: 130, sponsor: 'Acme' },
+      sponsor: 'Globex',
+    });
   });
 
   it('dismiss submits a reject correction with no recut', async () => {
@@ -375,5 +396,42 @@ describe('AdReviewTab loading placeholder', () => {
     renderTab();
     await screen.findAllByRole('link', { name: 'Episode One' });
     expect(screen.queryByTestId('skeleton-rows')).toBeNull();
+  });
+});
+
+describe('AdReviewTab hold-reason filter', () => {
+  it('shows the select for needs_review and pending only, with per-reason counts', async () => {
+    mockGetDetections.mockResolvedValue({
+      detections: [detection()], total: 1, page: 1, totalPages: 1, limit: 20,
+      counts: { ...COUNTS, pendingByHoldReason: { verification_miss: 3 } },
+    });
+    renderTab();
+    const user = userEvent.setup();
+    await screen.findAllByRole('link', { name: 'Episode One' });
+    const select = screen.getByLabelText('Hold reason');
+    expect(within(select).getByRole('option', { name: 'Verification catch (3)' })).toBeTruthy();
+    expect(within(select).getByRole('option', { name: 'Over max duration' })).toBeTruthy();
+    await user.selectOptions(screen.getByLabelText('Status'), 'pending');
+    expect(screen.getByLabelText('Hold reason')).toBeTruthy();
+    await user.selectOptions(screen.getByLabelText('Status'), 'accepted');
+    expect(screen.queryByLabelText('Hold reason')).toBeNull();
+  });
+
+  it('sends the selected reason with page 1 and drops it when the status leaves pending', async () => {
+    renderTab();
+    const user = userEvent.setup();
+    await screen.findAllByRole('link', { name: 'Episode One' });
+    expect(mockGetDetections.mock.calls[0][0].holdReason).toBeUndefined();
+    await user.selectOptions(screen.getByLabelText('Hold reason'), 'max_duration');
+    await waitFor(() => {
+      expect(mockGetDetections.mock.lastCall?.[0]).toMatchObject({
+        holdReason: 'max_duration', page: 1,
+      });
+    });
+    await user.selectOptions(screen.getByLabelText('Status'), 'all');
+    await waitFor(() => {
+      expect(mockGetDetections.mock.lastCall?.[0]).toMatchObject({ status: 'all' });
+    });
+    expect(mockGetDetections.mock.lastCall?.[0].holdReason).toBeUndefined();
   });
 });

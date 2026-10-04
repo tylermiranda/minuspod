@@ -56,6 +56,7 @@ def test_default_returns_needs_review_only(app_client, seeded_detections):
     assert body['counts'] == {
         'total': 3, 'needsReview': 2, 'pending': 1, 'rejected': 1,
         'accepted': 1, 'confirmed': 0, 'dismissed': 0,
+        'pendingByHoldReason': {},
     }
 
 
@@ -94,6 +95,7 @@ def test_pagination_limits(app_client, seeded_detections):
 
 @pytest.mark.parametrize('query', [
     'status=bogus', 'sort=bogus', 'order=sideways', 'reviewer=bogus',
+    'holdReason=bogus',
 ])
 def test_invalid_params_return_400(app_client, seeded_detections, query):
     _csrf(app_client)
@@ -124,6 +126,61 @@ def test_reviewer_filter_narrows_rows_and_cut_summary(app_client, seeded_detecti
         '/api/v1/detections?status=all&reviewer=unadjusted').get_json()
     assert [d['start'] for d in body['detections']] == [100.0]
     assert body['detections'][0]['reviewerOriginalStart'] is None
+
+
+def test_hold_reason_filter_and_counts(app_client, seeded_detections):
+    _csrf(app_client)
+    db = seeded_detections['db']
+    slug = seeded_detections['slug']
+    db.save_episode_details(slug, 'det-ep-1', ad_markers=[
+        {'start': 10.0, 'end': 40.0, 'held_for_review': True, 'was_cut': False,
+         'hold_reason': 'max_duration'},
+        {'start': 100.0, 'end': 130.0, 'held_for_review': True, 'was_cut': False,
+         'hold_reason': 'verification_miss'},
+        {'start': 200.0, 'end': 230.0, 'held_for_review': True, 'was_cut': False,
+         'hold_reason': 'verification_miss'},
+        {'start': 300.0, 'end': 330.0, 'held_for_review': True, 'was_cut': True,
+         'hold_reason': 'max_duration'},
+        {'start': 400.0, 'end': 430.0, 'held_for_review': True, 'was_cut': False,
+         'hold_reason': 'max_duration', 'action_applied': 'keep'},
+    ])
+    body = app_client.get(
+        '/api/v1/detections?holdReason=verification_miss').get_json()
+    assert [d['start'] for d in body['detections']] == [200.0, 100.0]
+    assert all(d['holdReason'] == 'verification_miss' for d in body['detections'])
+    assert body['counts']['pendingByHoldReason'] == {
+        'max_duration': 1, 'verification_miss': 2,
+    }
+    body = app_client.get(
+        '/api/v1/detections?holdReason=max_duration').get_json()
+    assert [d['start'] for d in body['detections']] == [10.0]
+    # Counts follow the status filter so each chip matches the rows it would show.
+    for query, expected in (
+            ('status=pending', {'max_duration': 2, 'verification_miss': 2}),
+            ('status=all', {'max_duration': 2, 'verification_miss': 2}),
+            ('status=accepted', {}),
+            ('q=nomatch', {'max_duration': 1, 'verification_miss': 2})):
+        counts = app_client.get(f'/api/v1/detections?{query}').get_json()['counts']
+        assert counts['pendingByHoldReason'] == expected
+    body = app_client.get(
+        '/api/v1/detections?status=pending&holdReason=max_duration').get_json()
+    assert body['total'] == body['counts']['pendingByHoldReason']['max_duration']
+    other = 'example-other'
+    db.create_podcast(other, 'https://example.com/other.xml', title='Other Feed')
+    try:
+        db.upsert_episode(other, 'det-ep-2', original_url='https://example.com/e2.mp3',
+                          title='Episode Two', status='processed')
+        db.save_episode_details(other, 'det-ep-2', ad_markers=[
+            {'start': 5.0, 'end': 35.0, 'held_for_review': True, 'was_cut': False,
+             'hold_reason': 'max_duration'}])
+        counts = app_client.get('/api/v1/detections').get_json()['counts']
+        assert counts['pendingByHoldReason'] == {'max_duration': 2, 'verification_miss': 2}
+        counts = app_client.get(f'/api/v1/detections?feed={slug}').get_json()['counts']
+        assert counts['pendingByHoldReason'] == {'max_duration': 1, 'verification_miss': 2}
+        counts = app_client.get(f'/api/v1/detections?feed={other}').get_json()['counts']
+        assert counts['pendingByHoldReason'] == {'max_duration': 1}
+    finally:
+        db.delete_podcast(other)
 
 
 def test_resolved_detection_leaves_needs_review(app_client, seeded_detections):

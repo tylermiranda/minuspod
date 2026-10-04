@@ -15,10 +15,13 @@ The spec is also confirmed to be loadable and to expose the expected
 top-level shape so a future careless edit (e.g. dropping ``paths:``
 or breaking the indentation under ``components.schemas``) fails fast.
 """
+import re
 from pathlib import Path
 
 import pytest
 import yaml
+
+import config
 
 
 SPEC_PATH = Path(__file__).resolve().parents[2] / 'openapi.yaml'
@@ -178,3 +181,66 @@ def test_string_enums_are_quoted_in_the_spec():
                 f"episodeLogs enum value {value!r} parsed as {type(value).__name__}; "
                 f"quote it in openapi.yaml"
             )
+
+
+def test_every_hold_reason_list_matches_config_constants():
+    with SPEC_PATH.open() as f:
+        doc = yaml.safe_load(f)
+    schemas = doc['components']['schemas']
+    param = next(p for p in doc['paths']['/detections']['get']['parameters']
+                 if p['name'] == 'holdReason')
+    constants = {value for name, value in vars(config).items()
+                 if name.startswith('HOLD_REASON_')}
+    assert config.ALL_HOLD_REASONS == constants
+    for enum in (schemas['AdMarker']['properties']['hold_reason']['enum'],
+                 schemas['ReviewDetection']['properties']['holdReason']['enum'],
+                 param['schema']['enum']):
+        assert set(enum) - {None} == constants
+    frontend = SPEC_PATH.parent / 'frontend' / 'src'
+    labels = (frontend / 'utils' / 'holdReason.ts').read_text()
+    for name in ('HOLD_REASON_LABELS', 'HOLD_REASON_TITLES'):
+        block = labels.split(f'export const {name}')[1].split('};')[0]
+        assert set(re.findall(r"^\s+(\w+):", block, re.M)) == constants, name
+    types = (frontend / 'api' / 'types.ts').read_text()
+    union = types.split('hold_reason?:')[1].split(';')[0]
+    assert set(re.findall(r"'(\w+)'", union)) == constants
+
+
+def test_splice_calibration_fields_are_documented():
+    with SPEC_PATH.open() as f:
+        schemas = yaml.safe_load(f)['components']['schemas']
+    calibration = schemas['EpisodeDetail']['allOf'][1]['properties']['spliceCalibration']
+    assert calibration['properties']['status']['enum'] == ['cold_start', 'calibrated', 'host_read']
+    assert set(calibration['properties']['long_cut_corroboration']['properties']) == {
+        'episodes', 'cuts', 'corroborated', 'fraction'}
+    validation = schemas['AdMarker']['properties']['validation']['properties']
+    assert validation['audio_corroboration']['enum'] == [
+        'transition_pair', 'template_cue', 'volume_anomaly', 'splice_evidence',
+        'dai_differential', 'none']
+
+
+def test_patterns_list_params_match_handler():
+    """GET /patterns documents exactly the query params the handler reads."""
+    with SPEC_PATH.open() as f:
+        doc = yaml.safe_load(f)
+    params = doc['paths']['/patterns']['get']['parameters']
+    documented = {p['name'] for p in params}
+    assert documented == {'scope', 'active_only', 'podcast_id', 'network_id', 'source'}
+
+    scope_schema = next(p for p in params if p['name'] == 'scope')['schema']
+    assert scope_schema['enum'] == ['all', 'global', 'network', 'podcast']
+    assert scope_schema['default'] == 'all'
+
+    active_only_schema = next(p for p in params if p['name'] == 'active_only')['schema']
+    assert active_only_schema['default'] is False
+
+
+def test_every_stage_tunable_is_documented():
+    with SPEC_PATH.open() as f:
+        doc = yaml.safe_load(f)
+    put_props = (doc['paths']['/settings/ad-detection']['put']['requestBody']
+                 ['content']['application/json']['schema']['properties'])
+    for payload_key, _db_key, _kind in config.STAGE_TUNABLE_PAYLOAD_KEYS:
+        assert payload_key in put_props, payload_key
+    entry = doc['components']['schemas']['Settings']['properties']['stageTunables']['additionalProperties']
+    assert set(entry['properties']) == {'value', 'isDefault', 'envOverride'}

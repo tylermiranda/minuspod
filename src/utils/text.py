@@ -45,6 +45,14 @@ def pattern_offsets(text: str, patterns: dict) -> dict[str, list[int]]:
     return found
 
 
+def most_mentioned(offsets: dict[str, list[int]]) -> tuple[str | None, int]:
+    """The name with the most offsets (earliest first on a tie) and its count; (None, 0) when empty."""
+    if not offsets:
+        return None, 0
+    name = max(offsets, key=lambda n: (len(offsets[n]), -offsets[n][0]))
+    return name, len(offsets[name])
+
+
 def truncate(text: str, limit: int) -> str:
     """Cut text to limit characters, ellipsis included in the count."""
     if not text or len(text) <= limit:
@@ -104,6 +112,17 @@ def get_transcript_text_for_range(
         if seg['end'] >= start_time and seg['start'] <= end_time:
             texts.append(seg.get('text', ''))
     return ' '.join(texts)
+
+
+def transcript_gaps(segments: list[dict], min_s: float) -> list[tuple[float, float]]:
+    """(start, end) of every stretch of min_s or more that no segment covers, between the first and last segment."""
+    gaps, covered = [], None
+    for seg in segments:
+        start, end = seg.get('start', 0.0), seg.get('end', 0.0)
+        if covered is not None and start - covered >= min_s:
+            gaps.append((covered, start))
+        covered = end if covered is None else max(covered, end)
+    return gaps
 
 
 def get_timestamped_transcript_for_range(

@@ -268,6 +268,11 @@ class TestProcessEpisodeModePlumbing:
         assert m['detect'].call_args.kwargs['keep_content'] is None
         assert m['verify'].call_args.kwargs['skip_verification'] is False
 
+    def test_records_disabled_normalization_in_run_stats(self):
+        m = _run_pipeline(_row())
+        assert m['result'] is True
+        assert m['finalize'].call_args.kwargs['run_stats']['normalization_skipped'] is True
+
     def test_provider_denial_happens_after_transcription_before_detection(self):
         m = _run_pipeline(
             _row(), admission={'allowed': False, 'reason': 'daily limit'})
@@ -606,12 +611,10 @@ class TestRefineAndValidateHeuristicRollGating:
 
     def _call(self, **kwargs):
         with patch.object(processing, '_apply_heuristic_rolls') as rolls, \
-             patch.object(processing, 'db') as db:
-            db.get_false_positive_corrections.return_value = []
-            db.get_confirmed_corrections.return_value = []
+             patch.object(processing, 'db'):
             result = processing._refine_and_validate(
                 'slug', 'ep1', [], SEGMENTS, '/tmp/a.mp3',
-                'desc', 100.0, 0.8, 'Pod', **kwargs)
+                'desc', 100.0, 0.8, 'Pod', corrections=([], []), **kwargs)
         return result, rolls
 
     def test_cue_only_never_calls_apply_heuristic_rolls(self):

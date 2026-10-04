@@ -5,45 +5,45 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'src'))
 
 from ad_validator import AdValidator
+from sponsor_normalize import extract_description_sponsors
 from utils.text import word_boundary_re
 
 
 def _validator(description='', segments=None, sponsors=None):
     v = AdValidator(1200.0, segments or [], episode_description=description)
     if sponsors is not None:
-        v.description_sponsors = set(sponsors)
         v._description_sponsor_re = word_boundary_re(sponsors)
     return v
 
 
 class TestDescriptionHarvest:
     def test_a_real_brand_link_is_harvested(self):
-        v = _validator('<a href="https://betterhelp.com/show">BetterHelp</a>')
-        assert 'betterhelp' in v.description_sponsors
+        found = extract_description_sponsors('<a href="https://betterhelp.com/show">BetterHelp</a>')
+        assert 'betterhelp' in found
 
     def test_a_hosting_platform_is_never_a_sponsor(self):
-        v = _validator('<a href="https://acast.com/privacy">Privacy</a>'
-                       '<a href="https://megaphone.fm/adchoices">Choices</a>')
-        assert 'acast' not in v.description_sponsors
-        assert 'megaphone' not in v.description_sponsors
+        found = extract_description_sponsors('<a href="https://acast.com/privacy">Privacy</a>'
+                                             '<a href="https://megaphone.fm/adchoices">Choices</a>')
+        assert 'acast' not in found
+        assert 'megaphone' not in found
 
     def test_listening_apps_and_socials_are_dropped(self):
-        v = _validator('<a href="https://apple.com/podcast">Apple</a>'
-                       '<a href="https://spotify.com/show">Spotify</a>'
-                       '<a href="https://instagram.com/show">Us</a>')
-        assert v.description_sponsors == set()
+        found = extract_description_sponsors('<a href="https://apple.com/podcast">Apple</a>'
+                                             '<a href="https://spotify.com/show">Spotify</a>'
+                                             '<a href="https://instagram.com/show">Us</a>')
+        assert found == set()
 
     def test_a_three_letter_outlet_token_is_dropped(self):
-        v = _validator('<a href="https://wsj.com/article">Read it</a>')
-        assert 'wsj' not in v.description_sponsors
+        found = extract_description_sponsors('<a href="https://wsj.com/article">Read it</a>')
+        assert 'wsj' not in found
 
     def test_a_curated_short_brand_survives_the_length_floor(self):
-        v = _validator('<a href="https://ag1.com/show">AG1</a>')
-        assert 'ag1' in v.description_sponsors
+        found = extract_description_sponsors('<a href="https://ag1.com/show">AG1</a>')
+        assert 'ag1' in found
 
     def test_a_spoken_two_word_brand_is_kept_in_both_spellings(self):
-        v = _validator('This episode is sponsored by Liquid IV.')
-        assert {'liquid iv', 'liquidiv'} <= v.description_sponsors
+        found = extract_description_sponsors('This episode is sponsored by Liquid IV.')
+        assert {'liquid iv', 'liquidiv'} <= found
 
 
 class TestWordBoundaryConfirmation:
@@ -56,23 +56,23 @@ class TestWordBoundaryConfirmation:
         v = _validator('<a href="https://wsj.com/x">WSJ</a>',
                        self._segments('The wsjournal covered it at length.'),
                        sponsors={'wsj'})
-        assert v._is_sponsor_confirmed(dict(self.ADS)) is False
+        assert v._sponsor_confirmation_source(dict(self.ADS)) is None
 
     def test_the_same_token_standing_alone_confirms(self):
         v = _validator('', self._segments('Brought to you by WSJ this week.'),
                        sponsors={'wsj'})
-        assert v._is_sponsor_confirmed(dict(self.ADS)) is True
+        assert v._sponsor_confirmation_source(dict(self.ADS)) is not None
 
     def test_a_real_brand_still_confirms_from_the_reason(self):
         v = _validator('<a href="https://betterhelp.com/show">BetterHelp</a>',
                        self._segments('Ordinary conversation here.'))
         ad = dict(self.ADS, reason='BetterHelp sponsor read with a code')
-        assert v._is_sponsor_confirmed(ad) is True
+        assert v._sponsor_confirmation_source(ad) is not None
 
     def test_a_real_brand_still_confirms_from_the_transcript(self):
         v = _validator('<a href="https://betterhelp.com/show">BetterHelp</a>',
                        self._segments('Try BetterHelp and get ten percent off.'))
-        assert v._is_sponsor_confirmed(dict(self.ADS)) is True
+        assert v._sponsor_confirmation_source(dict(self.ADS)) is not None
 
     def test_the_match_is_case_insensitive(self):
         assert word_boundary_re(['betterhelp']).search('Visit BetterHelp today')
@@ -85,3 +85,12 @@ class TestWordBoundaryConfirmation:
         pattern = word_boundary_re(['Liquid I.V.', 'Yahoo!'])
         assert pattern.search('try Liquid I.V. today')
         assert pattern.search('over on Yahoo! Finance')
+
+
+def test_reason_boost_keeps_substring_match_description_extraction_does_not():
+    extract_description_sponsors.cache_clear()
+    embedded = 'Promo read: visitsquarespace.com for a free trial'
+    assert extract_description_sponsors(embedded) == frozenset()
+    flags = []
+    assert _validator()._check_reason_quality(
+        {'reason': embedded}, 0.5, flags) == 0.6

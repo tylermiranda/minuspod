@@ -6,11 +6,10 @@ and a resolution derived from corrections: false_positive dismisses, while
 confirm and boundary_adjustment (an Edit that kept the ad) confirm.
 Kept free of Flask and DB imports so it can be unit tested directly.
 """
-import json
 import math
 
 from config import SEGMENT_CATEGORIES, is_pending_review
-from utils.markers import spans_match
+from utils.markers import parse_ad_markers, spans_match
 
 # Filter value and summary key for markers no stage classified. Not a member of
 # SEGMENT_CATEGORIES: unset is the absence of a category, not a category.
@@ -58,11 +57,8 @@ def flatten_detections(rows: list[dict], corrections: list[dict]) -> list[dict]:
 
     items = []
     for row in rows:
-        try:
-            markers = json.loads(row['ad_markers_json'])
-        except (TypeError, ValueError):
-            continue
-        if not isinstance(markers, list):
+        markers = parse_ad_markers(row['ad_markers_json'])
+        if markers is None:
             continue
         episode_corrections = by_episode.get((row.get('podcast_id'), row['episode_id']), [])
         for marker in markers:
@@ -97,6 +93,7 @@ def flatten_detections(rows: list[dict], corrections: list[dict]) -> list[dict]:
                 'reviewerOriginalStart': marker.get('reviewer_original_start'),
                 'reviewerOriginalEnd': marker.get('reviewer_original_end'),
                 'reviewerMoved': _reviewer_moved_from_marker(marker),
+                'holdReason': marker.get('hold_reason') if is_pending_review(marker) else None,
                 'status': marker_status(marker),
                 'resolution': marker_resolution(marker, episode_corrections),
             })
@@ -176,7 +173,8 @@ def filter_detections(items: list[dict], status: str = 'needs_review',
                       feed: str | None = None,
                       q: str | None = None,
                       category: str | None = None,
-                      reviewer: str | None = None) -> list[dict]:
+                      reviewer: str | None = None,
+                      hold_reason: str | None = None) -> list[dict]:
     out = items
     if status == 'needs_review':
         out = [i for i in out if awaits_decision(i)]
@@ -186,6 +184,8 @@ def filter_detections(items: list[dict], status: str = 'needs_review',
         out = [i for i in out if not i.get('category')]
     elif category:
         out = [i for i in out if i.get('category') == category]
+    if hold_reason:
+        out = [i for i in out if i.get('holdReason') == hold_reason]
     if reviewer == 'adjusted':
         out = [i for i in out if reviewer_moved(i)]
     elif reviewer == 'unadjusted':

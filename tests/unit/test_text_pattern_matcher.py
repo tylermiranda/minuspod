@@ -1,7 +1,9 @@
 """Unit tests for text_pattern_matcher helper functions and ad_detector region helpers."""
 import json
 import os
+import sqlite3
 import sys
+import threading
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'src'))
 
@@ -12,6 +14,7 @@ from text_pattern_matcher import (
     TextPatternMatcher, AdPattern, TextMatch, MAX_MATCH_DURATION,
     MIN_TEXT_LENGTH, FUZZY_DISCRIMINATIVE_LENGTH, required_fuzzy_score,
 )
+from utils.pattern_catalog import pattern_catalog_scope
 from ad_detector import _unpack_region, get_uncovered_portions, AdDetector
 from config import (
     DEFAULT_AD_DURATION_ESTIMATE, TFIDF_MATCH_THRESHOLD, FUZZY_MATCH_THRESHOLD,
@@ -338,7 +341,7 @@ def _make_bare_matcher():
 class TestConstrainOverlongSpans:
     """Regression tests for the text_pattern over-cut fix.
 
-    Reproduces the Brilliant Idiots case: a merged span whose leading minutes
+    Reproduces an observed case: a merged span whose leading minutes
     are show content with zero sponsor mentions and the real ad only at the
     tail. The matcher must trim the span to the brand-bearing region instead of
     cutting the content.
@@ -666,10 +669,10 @@ class TestFuzzyFindReportsWhatMatched:
 
     def test_returns_the_aligned_text_not_the_window(self):
         text = ('so anyway we were talking about the weather for a while and '
-                'then he said go to squarespace.com slash rogan for a free '
+                'then he said go to squarespace.com slash show for a free '
                 'trial and then we moved on to something else entirely')
         pos, score, matched = self._matcher()._fuzzy_find(
-            text, 'squarespace.com slash rogan for a free trial')
+            text, 'squarespace.com slash show for a free trial')
 
         assert score > 90
         assert 'squarespace' in matched
@@ -685,7 +688,7 @@ class TestFuzzyFindReportsWhatMatched:
 
 class TestFuzzyFindCutoff:
     def test_fixture_transcript_keeps_misspelled_sponsor_variant(self):
-        with open('tests/fixtures/sn1071_transcript.json') as fixture_file:
+        with open('tests/fixtures/example_long_transcript.json') as fixture_file:
             fixture = json.load(fixture_file)
         transcript = ' '.join(segment['text'] for segment in fixture['segments']).lower()
         phrase_words = fixture['segments'][13]['text'].lower().split()[61:70]
@@ -761,3 +764,219 @@ def test_variants_shorter_than_the_floor_are_skipped():
 
     assert matcher._find_phrase_matches(full_text, segments, segment_map, [short]) == []
     assert matcher._find_phrase_matches(full_text, segments, segment_map, [long_enough])
+
+
+def test_active_pattern_changes_refresh_matcher_without_restart(temp_db):
+    intro = 'this episode is brought to you by acme today'
+    transcript = (intro + ' visit acme dot com for the current offer '
+                  'and use code podcast to save on your order')
+    segments = [{'start': 0.0, 'end': 30.0, 'text': transcript}]
+    pattern_id = temp_db.create_ad_pattern(
+        scope='global', text_template=transcript,
+        intro_variants=[intro], duration=30.0)
+    matcher = TextPatternMatcher(db=temp_db)
+
+    assert any(m.pattern_id == pattern_id for m in matcher.find_matches(segments))
+    vectors = matcher._pattern_vectors
+    temp_db.increment_pattern_match(pattern_id)
+    matcher.find_matches(segments)
+    assert matcher._pattern_vectors is vectors
+
+    with sqlite3.connect(temp_db.db_path) as other_worker:
+        other_worker.execute(
+            'UPDATE ad_patterns SET is_active = 0 WHERE id = ?', (pattern_id,))
+    assert matcher.find_matches(segments) == []
+    assert matcher._pattern_vectors is None
+
+    temp_db.update_ad_pattern(pattern_id, is_active=1)
+    assert any(m.pattern_id == pattern_id for m in matcher.find_matches(segments))
+
+    temp_db.update_ad_pattern(pattern_id, intro_variants=[],
+                              text_template='unrelated recipe for a vegetable soup')
+    assert matcher.find_matches(segments) == []
+
+    temp_db.bulk_delete_patterns([pattern_id])
+    assert matcher.find_matches(segments) == []
+
+
+def test_auto_pattern_show_outro_is_only_an_intro_hint(temp_db):
+    sponsor_id = temp_db.create_known_sponsor('Acme')
+    intro = 'This episode is brought to you by Acme and its new service.'
+    ad = ('Acme can help organize your work. Visit acme.com to sign up. '
+          'Acme offers a free trial today.')
+    show = ('Tell me what happened when you got home. I still laugh about '
+            'that story. Welcome back to the show. Find us at example.com.')
+    segments = [
+        {'start': 60.0, 'end': 90.0, 'text': intro + ' ' + ad},
+        {'start': 90.0, 'end': 120.0, 'text': show},
+    ]
+    auto_id = temp_db.create_ad_pattern(
+        scope='global', sponsor_id=sponsor_id,
+        text_template=intro + ' ' + ad + ' ' + show,
+        intro_variants=[intro], outro_variants=[show], duration=60.0)
+    matcher = TextPatternMatcher(db=temp_db)
+
+    matches = matcher.find_matches(segments)
+    assert matches
+    assert all(m.pattern_id == auto_id and m.match_type == 'intro'
+               and m.span_estimated and m.text_end == 90.0 for m in matches)
+
+    temp_db.update_ad_pattern(
+        auto_id, outro_variants=[show, 'Visit acme.com and use code PODCAST'])
+    mixed_matches = matcher.find_matches(segments)
+    assert all(m.match_type == 'intro' and m.span_estimated
+               for m in mixed_matches)
+
+    temp_db.update_ad_pattern(auto_id, created_by='user')
+    defined_matches = matcher.find_matches(segments)
+    assert any(m.pattern_id == auto_id and not m.span_estimated
+               for m in defined_matches)
+
+
+def test_auto_pattern_outro_needs_sponsor_link_or_offer(temp_db):
+    temp_db.create_known_sponsor('Acme')
+    matcher = TextPatternMatcher(db=temp_db)
+    assert matcher._outro_has_ad_evidence(
+        'Acme shares fell. Visit example.com for the report.', 'Acme') is False
+    assert matcher._outro_has_ad_evidence(
+        'Visit acme.com and use code PODCAST.', 'Acme') is True
+    # The outro shares the commercial-context offers and the domain-label reader.
+    assert matcher._outro_has_ad_evidence('Acme ships free, free shipping today.', 'Acme') is True
+    assert matcher._outro_has_ad_evidence('Find Acme at acme dot com.', 'Acme') is True
+    assert matcher._outro_has_ad_evidence('Acme is on acme.io now.', 'Acme') is True
+    for ending in ('com', 'org', 'net', 'co'):
+        assert matcher._outro_has_ad_evidence(f'Find Acme at acme dot {ending}.', 'Acme') is True
+        assert matcher._outro_has_ad_evidence(f'Find Acme at acme.{ending}.', 'Acme') is True
+
+
+def test_outro_sponsor_lookup_runs_once_per_sponsor_per_pass(temp_db, monkeypatch):
+    sponsor_id = temp_db.create_known_sponsor('Acme')
+    intro = 'This episode is brought to you by Acme and its new service.'
+    show = 'Tell me what happened when you got home. Welcome back to the show.'
+    for n in range(3):
+        temp_db.create_ad_pattern(
+            scope='global', sponsor_id=sponsor_id,
+            text_template=f'{intro} Acme helps with task {n}. {show}',
+            intro_variants=[intro], outro_variants=[show, f'{show} Part {n}.'],
+            duration=60.0)
+    matcher = TextPatternMatcher(db=temp_db)
+    lookups = []
+    real_lookup = temp_db.get_known_sponsor_by_name
+    monkeypatch.setattr(temp_db, 'get_known_sponsor_by_name',
+                        lambda name: lookups.append(name) or real_lookup(name))
+    segments = [{'start': 60.0, 'end': 120.0, 'text': f'{intro} Acme helps. {show}'}]
+
+    matcher.find_matches(segments)
+    assert lookups == ['Acme']
+    matcher.find_matches(segments)
+    assert lookups == ['Acme', 'Acme']
+
+
+def test_catalog_read_failure_skips_stale_patterns_then_recovers(temp_db, monkeypatch):
+    transcript = ('This episode is sponsored by Acme. '
+                  'Visit acme.com and use code PODCAST for a free trial.')
+    temp_db.create_ad_pattern(
+        scope='global', text_template=transcript,
+        intro_variants=[transcript], duration=30.0)
+    matcher = TextPatternMatcher(db=temp_db)
+    segments = [{'start': 0.0, 'end': 30.0, 'text': transcript}]
+    assert matcher.find_matches(segments)
+
+    original_get = temp_db.get_ad_patterns
+    def unavailable(*args, **kwargs):
+        raise sqlite3.OperationalError('database temporarily unavailable')
+    monkeypatch.setattr(temp_db, 'get_ad_patterns', unavailable)
+    assert matcher.find_matches(segments) == []
+    monkeypatch.setattr(temp_db, 'get_ad_patterns', original_get)
+    assert matcher.find_matches(segments)
+
+
+def test_community_tag_edit_updates_matcher_across_connections(temp_db):
+    transcript = ('This episode is sponsored by Acme. '
+                  'Visit acme.com and use code PODCAST for a free trial.')
+    sponsor_id = temp_db.create_known_sponsor('Acme', tags=['science'])
+    temp_db.create_ad_pattern(
+        scope='global', source='community', sponsor_id=sponsor_id,
+        text_template=transcript, intro_variants=[transcript], duration=30.0)
+    matcher = TextPatternMatcher(db=temp_db)
+    segments = [{'start': 0.0, 'end': 30.0, 'text': transcript}]
+
+    assert matcher.find_matches(segments, podcast_tags={'science'})
+    with sqlite3.connect(temp_db.db_path) as other_worker:
+        other_worker.execute(
+            "UPDATE known_sponsors SET tags = '[\"finance\"]' WHERE id = ?",
+            (sponsor_id,))
+    assert matcher.find_matches(segments, podcast_tags={'science'}) == []
+
+
+def test_catalog_refresh_waits_for_inflight_matching(temp_db, monkeypatch):
+    transcript = ('This episode is sponsored by Acme. '
+                  'Visit acme.com and use code PODCAST for a free trial.')
+    pattern_id = temp_db.create_ad_pattern(
+        scope='global', text_template=transcript,
+        intro_variants=[transcript], duration=30.0)
+    matcher = TextPatternMatcher(db=temp_db)
+    segments = [{'start': 0.0, 'end': 30.0, 'text': transcript}]
+    assert matcher.find_matches(segments)
+
+    scoring = threading.Event()
+    release = threading.Event()
+    second_done = threading.Event()
+    first_results = []
+    second_results = []
+    original_score = matcher._score_windows
+
+    def paused_score(*args, **kwargs):
+        if threading.current_thread().name == 'first-match':
+            scoring.set()
+            assert release.wait(2.0)
+        return original_score(*args, **kwargs)
+
+    monkeypatch.setattr(matcher, '_score_windows', paused_score)
+    first = threading.Thread(
+        name='first-match', target=lambda: first_results.extend(
+            matcher.find_matches(segments)))
+    first.start()
+    try:
+        assert scoring.wait(2.0)
+        temp_db.update_ad_pattern(pattern_id, is_active=0)
+
+        def second_match():
+            second_results.extend(matcher.find_matches(segments))
+            second_done.set()
+
+        second = threading.Thread(target=second_match)
+        second.start()
+        assert not second_done.wait(0.05)
+    finally:
+        release.set()
+        first.join(2.0)
+    second.join(2.0)
+    assert first_results
+    assert second_done.is_set()
+    assert second_results == []
+
+
+def test_catalog_scope_reads_active_patterns_once_until_a_pattern_write(temp_db, monkeypatch):
+    transcript = ('This episode is sponsored by Acme. '
+                  'Visit acme.com and use code PODCAST for a free trial.')
+    pattern_id = temp_db.create_ad_pattern(
+        scope='global', text_template=transcript,
+        intro_variants=[transcript], duration=30.0)
+    matcher = TextPatternMatcher(db=temp_db)
+    segments = [{'start': 0.0, 'end': 30.0, 'text': transcript}]
+    assert matcher.is_available()
+    reads = []
+    original_get = temp_db.get_ad_patterns
+    monkeypatch.setattr(temp_db, 'get_ad_patterns',
+                        lambda *a, **k: reads.append(1) or original_get(*a, **k))
+
+    with pattern_catalog_scope():
+        assert matcher.find_matches(segments)
+        assert matcher.find_matches(segments)
+        assert len(reads) == 1
+        temp_db.update_ad_pattern(pattern_id, scope='global')
+        assert matcher.find_matches(segments)
+        assert len(reads) == 2
+    matcher.find_matches(segments)
+    assert len(reads) == 3

@@ -78,6 +78,47 @@ def test_plain_content_between_tail_and_splice_blocks_extension():
     assert 'tail_splice_snap' not in result[0]
 
 
+def test_mixed_segment_sponsor_before_tail_does_not_clear_show_after_it():
+    marker = {
+        'start': 80.0, 'end': 100.0,
+        'reason': 'Acme sponsor', 'end_extended_by_content': True,
+    }
+    segment = {
+        'start': 90.0, 'end': 110.0,
+        'text': 'Visit acme.com. Now the story continues.',
+        'words': [
+            {'word': 'Visit', 'start': 90.0, 'end': 90.5},
+            {'word': 'acme.com.', 'start': 90.5, 'end': 91.5},
+            {'word': 'Now', 'start': 101.0, 'end': 101.4},
+            {'word': 'the', 'start': 101.4, 'end': 101.6},
+            {'word': 'story', 'start': 101.6, 'end': 102.1},
+            {'word': 'continues.', 'start': 102.1, 'end': 103.0},
+        ],
+    }
+
+    result = snap_extended_ad_tails_to_splice(
+        [marker], [segment], [_event(105.0)], window_s=10.0)
+
+    assert result[0]['end'] == 100.0
+    assert 'tail_splice_snap' not in result[0]
+
+
+def test_words_without_segment_text_block_tail_splice():
+    marker, segments = _fixture()
+    segments.append({
+        'start': 2412.0, 'end': 2414.0, 'text': '',
+        'words': [
+            {'word': 'Show', 'start': 2412.0, 'end': 2412.5},
+            {'word': 'speech', 'start': 2412.5, 'end': 2413.0},
+        ],
+    })
+
+    result = snap_extended_ad_tails_to_splice(
+        [marker], segments, [_event(2415.85)], window_s=10.0)
+
+    assert result[0]['end'] == 2410.9
+
+
 def test_marker_without_content_extension_is_not_eligible():
     marker, segments = _fixture()
     marker.pop('end_extended_by_content')
@@ -281,7 +322,8 @@ def test_processing_skips_destructive_tail_snap_during_cold_start(monkeypatch):
     assert result == [marker]
 
 
-def test_processing_allows_tail_snap_after_calibration(monkeypatch):
+@pytest.mark.parametrize('status', ['calibrated', 'host_read'])
+def test_processing_allows_tail_snap_after_calibration(monkeypatch, status):
     marker, segments = _fixture()
     snapped = dict(marker, end=2415.85, tail_splice_snap={
         'original_end': 2410.9,
@@ -298,7 +340,7 @@ def test_processing_allows_tail_snap_after_calibration(monkeypatch):
         lambda *args: saves.append(args))
     analysis = SimpleNamespace(splice_evidence={
         'events': [_event(2415.85)],
-        'calibration': {'status': 'calibrated'},
+        'calibration': {'status': status},
     })
 
     result = processing._snap_completed_cut_tails_to_splice(

@@ -101,7 +101,7 @@ def test_second_hold_for_the_same_span_is_not_counted_twice():
     proc = {'start': 401.2, 'end': 420.8, 'confidence': 0.95,
             'held_for_review': True, 'hold_reason': 'cue_unproven'}
     orig = {'start': 500.2, 'end': 519.8, 'confidence': 0.95, 'sponsor': 'Acme'}
-    _cut, ui, gated_held, _n = processing._gate_verification_ads_by_confidence(
+    _cut, ui, gated_held, _n, _rel = processing._gate_verification_ads_by_confidence(
         [proc], [orig], 0.7, pass1_held_markers=[held])
 
     saved, folded = _seam([held], ui, gated_held)
@@ -186,6 +186,26 @@ def test_fold_merges_validation_instead_of_replacing_it():
     assert keep['validation']['flags'] == ['HOLD: cue unproven', 'INFO: kept']
 
 
+def test_fold_winner_does_not_inherit_the_losers_pass2_outcome():
+    keep = {'start': 500.0, 'end': 520.0, 'was_cut': False, 'action_applied': 'keep'}
+    held = {'start': 500.2, 'end': 519.8, 'was_cut': False, 'held_for_review': True,
+            'hold_reason': 'cue_unproven', 'pass2_outcome': 'held:cue_unproven'}
+
+    fold_marker_pair(keep, held)
+
+    assert 'pass2_outcome' not in keep
+
+
+def test_fold_winner_that_was_not_held_does_not_inherit_the_losers_hold_id():
+    keep = {'start': 500.0, 'end': 520.0, 'was_cut': False, 'action_applied': 'keep'}
+    held = {'start': 500.2, 'end': 519.8, 'was_cut': False, 'held_for_review': True,
+            'hold_reason': 'cue_unproven', 'hold_id': 'a1b2c3d4e5f6'}
+
+    fold_marker_pair(keep, held)
+
+    assert 'hold_id' not in keep
+
+
 def test_fold_does_not_shadow_a_hold_reason_already_cleared():
     keep = {'start': 500.0, 'end': 520.0, 'was_cut': False,
             'action_applied': 'keep', 'held_for_review': False,
@@ -232,7 +252,7 @@ def test_a_pass2_hold_survives_a_fold_into_a_rejected_pass1_marker():
                 'validation': {'decision': 'REJECT', 'flags': ['REJECT: no evidence']}}
     proc = {'start': 401.2, 'end': 420.8, 'confidence': 0.62}
     orig = {'start': 500.2, 'end': 519.8, 'confidence': 0.62, 'sponsor': 'Acme'}
-    _cut, ui, gated_held, _n = processing._gate_verification_ads_by_confidence(
+    _cut, ui, gated_held, _n, _rel = processing._gate_verification_ads_by_confidence(
         [proc], [orig], 0.7, verification_miss_hold_min_confidence=0.5,
         verification_miss_autocut_min_confidence=0.0)
     assert gated_held == [orig]

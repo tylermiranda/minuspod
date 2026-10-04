@@ -6,6 +6,7 @@ from unittest.mock import MagicMock
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'src'))
 
 from ad_detector import (
+    AdDetector,
     extract_sponsor_names,
     refine_ad_boundaries,
     merge_same_sponsor_ads,
@@ -17,6 +18,68 @@ from ad_detector import (
     removal_coverage_regions,
     PATTERN_CORRECTION_OVERLAP_THRESHOLD,
 )
+
+
+def test_detector_merge_invalidates_widened_quote_edge():
+    detector = AdDetector(api_key='test-key')
+    anchored = {
+        'start': 100.0, 'end': 150.0, 'confidence': 0.9,
+        'detection_stage': 'claude', 'sponsor': 'Acme',
+        'quote_aligned_start': True, 'quote_start': 100.0,
+        'quote_aligned_end': True, 'quote_end': 150.0,
+    }
+    coarse = {'start': 140.0, 'end': 170.0, 'confidence': 0.9,
+              'detection_stage': 'claude', 'sponsor': 'Acme'}
+
+    merged = detector._merge_detection_results([anchored, coarse])[0]
+    assert merged['start'] == 100.0 and merged['end'] == 170.0
+    assert merged['quote_aligned_start'] is True
+    assert 'quote_aligned_end' not in merged
+
+    quoted_end = dict(coarse, quote_aligned_end=True, quote_end=170.0)
+    merged = detector._merge_detection_results([anchored, quoted_end])[0]
+    assert merged['quote_aligned_end'] is True
+    assert merged['quote_end'] == 170.0
+
+
+def test_detector_merge_inherits_the_later_end_provenance():
+    detector = AdDetector(api_key='test-key')
+    anchored = {'start': 100.0, 'end': 150.0, 'confidence': 0.9,
+                'detection_stage': 'claude', 'sponsor': 'Acme',
+                'quote_aligned_end': True, 'quote_end': 150.0, 'word_timed_end': 150.0}
+    later = {'start': 140.0, 'end': 170.0, 'confidence': 0.9,
+             'detection_stage': 'claude', 'sponsor': 'Acme',
+             'quote_aligned_end': True, 'quote_end': 170.0, 'word_timed_end': 170.0}
+
+    merged = detector._merge_detection_results([anchored, later])[0]
+    assert merged['end'] == 170.0
+    assert (merged['quote_end'], merged['word_timed_end']) == (170.0, 170.0)
+
+    merged = detector._merge_detection_results(
+        [anchored, {k: v for k, v in later.items() if not k.startswith(('quote', 'word'))}])[0]
+    assert merged['end'] == 170.0
+    assert not {'quote_aligned_end', 'quote_end', 'word_timed_end'} & merged.keys()
+
+
+def test_duplicate_merge_keeps_only_quote_provenance_at_union_edges():
+    detector = AdDetector(api_key='test-key')
+    first = {
+        'start': 100.0, 'end': 150.0, 'confidence': 0.9,
+        'sponsor': 'Acme', 'quote_aligned_start': True,
+        'quote_start': 100.0,
+        'quote_aligned_end': True, 'quote_end': 150.0,
+    }
+    second = {'start': 110.0, 'end': 160.0, 'confidence': 0.9,
+              'sponsor': 'Acme'}
+    merged = detector._merge_overlapping_accepted_duplicates([first, second])[0]
+    assert merged['start'] == 100.0 and merged['end'] == 160.0
+    assert merged['quote_aligned_start'] is True
+    assert 'quote_aligned_end' not in merged
+
+    second.update(quote_aligned_end=True, quote_end=160.0)
+    merged = detector._merge_overlapping_accepted_duplicates([first, second])[0]
+    assert merged['quote_aligned_end'] is True
+    assert merged['quote_end'] == 160.0
 
 
 class TestExtractSponsorNames:
@@ -101,6 +164,61 @@ class TestRefineBoundaries:
         refined = refine_ad_boundaries([], segments)
 
         assert refined == []
+
+    def test_word_timed_overlap_starts_at_later_explicit_sponsor_cue(self):
+        def segment(start, words):
+            timed = [{'word': word, 'start': start + i * 0.4,
+                      'end': start + (i + 1) * 0.4}
+                     for i, word in enumerate(words.split())]
+            return {'start': start, 'end': timed[-1]['end'],
+                    'text': words, 'words': timed}
+
+        segments = [
+            segment(95.0, 'We will return after this break'),
+            segment(102.0, 'Then we will discuss the next topic'),
+            segment(106.0, 'Our sponsor for this segment is Acme'),
+            segment(110.0, 'Acme has an offer for listeners today'),
+        ]
+        ads = [
+            {'start': 103.2, 'end': 113.0, 'word_timed_start': 103.2,
+             'confidence': 0.93, 'reason': 'Acme sponsor read'},
+            {'start': 106.0, 'end': 124.0, 'word_timed_start': 106.0,
+             'confidence': 0.98, 'reason': 'Acme sponsor read'},
+        ]
+        merged = deduplicate_window_ads(ads)
+        assert merged[0]['start'] == 103.2
+        refined = refine_ad_boundaries(merged, segments)
+        assert len(refined) == 1
+        assert refined[0]['start'] == 106.0
+        assert refined[0]['word_timed_start'] == 106.0
+
+        segments[1] = segment(102.0, 'Brought to you by Acme today')
+        assert refine_ad_boundaries(ads[:1], segments)[0]['start'] == 103.2
+        segments[1] = segment(102.0, 'Then we will discuss the next topic')
+        short = dict(ads[0], end=105.0)
+        assert refine_ad_boundaries([short], segments)[0]['start'] == 103.2
+
+        intro = segment(
+            100.0, 'This portion of the program is brought to you by Acme.')
+        intro_ad = dict(ads[0], start=100.0, end=130.0,
+                        word_timed_start=100.0)
+        assert refine_ad_boundaries([intro_ad], [intro])[0]['start'] == 100.0
+
+        continued = segment(
+            100.0, ' '.join(['description'] * 25)
+            + ' This portion is brought to you by Acme.')
+        continued_ad = dict(ads[0], start=110.0, end=130.0,
+                            word_timed_start=110.0)
+        assert refine_ad_boundaries([continued_ad], [continued])[0]['start'] == 110.0
+
+        mixed = segment(
+            100.0, 'A show teaser ends. This portion is brought to you by Acme.')
+        mixed_ad = dict(ads[0], start=100.0, end=130.0,
+                        word_timed_start=100.0)
+        assert refine_ad_boundaries([mixed_ad], [mixed])[0]['start'] == 101.6
+
+        unreliable = dict(mixed, text='Transcript does not match its words.')
+        assert refine_ad_boundaries([mixed_ad], [unreliable])[0]['start'] == 100.0
 
     def test_refine_empty_segments(self):
         """Empty segments should return ads unchanged."""
@@ -589,11 +707,11 @@ class TestDeduplicateWindowMergeFlag:
 
     def test_gap_chain_sets_merged_distinct_ads(self):
         # Three back-to-back distinct ads within the 5s merge threshold, like
-        # the DTNS Live With It / Capital One / Grainger chain.
+        # an observed three-sponsor chain.
         ads = [
-            {'start': 1987.2, 'end': 2006.0, 'sponsor': 'Live With It'},
-            {'start': 2006.0, 'end': 2034.1, 'sponsor': 'Capital One'},
-            {'start': 2034.6, 'end': 2073.3, 'sponsor': 'Grainger'},
+            {'start': 1987.2, 'end': 2006.0, 'sponsor': 'Acme'},
+            {'start': 2006.0, 'end': 2034.1, 'sponsor': 'Globex'},
+            {'start': 2034.6, 'end': 2073.3, 'sponsor': 'Initech'},
         ]
         merged = deduplicate_window_ads(ads)
         assert len(merged) == 1
@@ -628,7 +746,7 @@ class TestSplitConflictingActionSpan:
     """split_conflicting_action_span is the shared containment-safe split
     used by both deduplicate_window_ads and _merge_detection_results when
     two adjacent-or-overlapping ads resolve to different actions (#565
-    follow-up, DTNS 5317)."""
+    follow-up)."""
 
     def test_no_true_overlap_both_survive_untouched(self):
         last = {'start': 0.0, 'end': 20.0, 'category': 'sponsor'}
@@ -763,7 +881,7 @@ class TestSplitConflictingActionSpan:
         assert entries == [current]
 
     def test_current_nested_inside_last_splits_last_around_it(self):
-        """The DTNS 5317 shape: a longer remove-resolving pattern match
+        """The observed shape: a longer remove-resolving pattern match
         fully containing a shorter keep-resolving LLM span (e.g. an intro
         tail-aligned inside a pre-roll pattern match) must not collapse the
         nested span to nothing."""
@@ -789,6 +907,56 @@ class TestSplitConflictingActionSpan:
         assert entries[0]['category'] == 'interaction'
         assert entries[1]['start'] == 60.0 and entries[1]['end'] == 100.0
         assert entries[1]['category'] == 'sponsor'
+
+    def test_carved_fragments_do_not_inherit_excluded_ad_explanation(self):
+        last = {
+            'start': 0.0, 'end': 100.0, 'category': 'sponsor',
+            'reason': 'Acme advertising: "Visit Acme.com"',
+            'sponsor': 'Acme', 'end_text': 'Visit Acme.com',
+            'confidence': 0.91, 'pattern_id': 12, 'pattern_defined': True,
+        }
+        current = {
+            'start': 40.0, 'end': 60.0, 'category': 'intro',
+            'reason': 'Show introduction', 'sponsor': None,
+        }
+
+        before, entries = split_conflicting_action_span(
+            last, current, 'remove', 'keep')
+
+        assert entries[0] == current
+        assert last['reason'] == 'Acme advertising: "Visit Acme.com"'
+        for fragment, bounds in ((before, (0.0, 40.0)),
+                                 (entries[1], (60.0, 100.0))):
+            assert (fragment['start'], fragment['end']) == bounds
+            assert 'split at a conflicting action boundary' in fragment['reason']
+            assert 'Acme' not in fragment['reason']
+            assert 'sponsor' not in fragment
+            assert 'end_text' not in fragment
+            assert fragment['category'] == 'sponsor'
+            assert fragment['pattern_id'] == 12
+            assert fragment['pattern_defined'] is True
+            assert fragment['confidence'] == 0.91
+            assert extract_sponsor_names('', fragment['reason']) == set()
+            assert _extract_ad_keywords(fragment) == []
+
+    def test_carved_losing_tail_drops_parent_ad_explanation(self):
+        last = {'start': 0.0, 'end': 40.0, 'category': 'intro'}
+        current = {
+            'start': 30.0, 'end': 70.0, 'category': 'sponsor',
+            'reason': 'Acme advertising: "Visit Acme.com"',
+            'sponsor': 'Acme', 'end_text': 'Visit Acme.com',
+        }
+
+        unchanged, entries = split_conflicting_action_span(
+            last, current, 'keep', 'remove')
+
+        assert unchanged == last
+        assert (entries[0]['start'], entries[0]['end']) == (40.0, 70.0)
+        assert 'Acme' not in entries[0]['reason']
+        assert 'sponsor' not in entries[0]
+        assert 'end_text' not in entries[0]
+        assert extract_sponsor_names('', entries[0]['reason']) == set()
+        assert _extract_ad_keywords(entries[0]) == []
 
     def test_current_same_start_as_last_consumes_last(self):
         last = {'start': 0.0, 'end': 100.0, 'category': 'sponsor'}
@@ -837,7 +1005,7 @@ class TestSplitConflictingActionSpan:
 
 
 class TestDeduplicateWindowAdsActionGate:
-    """DTNS 5317: daily-tech-news-show episode 3c0b827ef2c5, reprocessed
+    """One episode (example-podcast a1b2c3d4e5f6), reprocessed
     with detect_show_segments=true and per-feed actions {cross_promo,
     intro,outro,recap,self_promo: keep; sponsor,interaction: remove}. The
     LLM's raw 9 detections carried category on only the intro and outro;
@@ -847,7 +1015,7 @@ class TestDeduplicateWindowAdsActionGate:
     dropped, and the outro's span was wrongly extended.
     """
 
-    DTNS_ACTION_MAP = {
+    EXAMPLE_ACTION_MAP = {
         'sponsor': 'remove', 'interaction': 'remove',
         'cross_promo': 'keep', 'self_promo': 'keep',
         'intro': 'keep', 'outro': 'keep', 'recap': 'keep',
@@ -856,36 +1024,36 @@ class TestDeduplicateWindowAdsActionGate:
     def _raw_llm_detections(self):
         return [
             {'start': 0.0, 'end': 156.7, 'confidence': 0.98,
-             'reason': 'Pre-roll ad block: Capital One, Olly Sleep, Cologuard, '
-                       'and Morning Brew Daily sponsor reads',
+             'reason': 'Pre-roll ad block: Acme, Globex, Initech, '
+                       'and Umbrella Daily sponsor reads',
              'end_text': 'wherever you get your podcasts'},
             {'start': 158.0, 'end': 166.6, 'confidence': 0.9, 'category': 'intro',
              'reason': 'Show intro marker/theme',
-             'end_text': 'Daily Tech News for Friday'},
+             'end_text': 'Daily Tech Show for Friday'},
             {'start': 687.5, 'end': 845.5, 'confidence': 0.98,
-             'reason': 'Ad break with multiple sponsors: Capital One, Michaels, '
-                       'Morning Brew Daily podcast promo, Stamps.com, Vanta',
+             'reason': 'Ad break with multiple sponsors: Acme, Hooli, '
+                       'Umbrella Daily podcast promo, Stark.com, Wayne',
              'end_text': "All right, let's get into the briefs"},
             {'start': 814.2, 'end': 845.5, 'confidence': 0.97,
-             'reason': 'Vanta sponsor read with call to action (vanta.com), '
+             'reason': 'Wayne sponsor read with call to action (wayne.com), '
                        'continues from previous window',
              'end_text': "let's get into the briefs"},
             {'start': 1502.5, 'end': 1562.5, 'confidence': 0.9,
              'reason': "Patreon promotion with promo code 'experiment' for 26% "
-                       'off, call to action patreon.com/DTNS',
+                       'off, call to action patreon.com/example',
              'end_text': 'little smarter'},
             {'start': 1900.1, 'end': 1972.2, 'confidence': 0.98,
-             'reason': 'Ad break with Capital One and Noom sponsor reads, '
+             'reason': 'Ad break with Acme and Soylent sponsor reads, '
                        'bracketed by ad-break boundary cues',
              'end_text': 'Individual results may vary'},
             {'start': 2314.1, 'end': 2319.2, 'confidence': 0.9,
-             'reason': 'Patreon promo with code experiment and URL patreon.com/DTNS',
-             'end_text': 'patreon.com slash DTNS'},
+             'reason': 'Patreon promo with code experiment and URL patreon.com/example',
+             'end_text': 'patreon.com slash example'},
             {'start': 2324.5, 'end': 2381.1, 'confidence': 0.85, 'category': 'outro',
-             'reason': 'Show credits and DTNS Family of Podcasts sign-off',
+             'reason': 'Show credits and network sign-off',
              'end_text': 'enjoyed this program'},
             {'start': 2385.8, 'end': 2444.9, 'confidence': 0.97,
-             'reason': 'Capital One and Stamps.com sponsor ads with promo code podcast',
+             'reason': 'Acme and Stark.com sponsor ads with promo code podcast',
              'end_text': 'Taxes and fees apply'},
         ]
 
@@ -903,9 +1071,9 @@ class TestDeduplicateWindowAdsActionGate:
         assert last['start'] == 2324.5 and last['end'] == 2444.9
         assert last['category'] == 'outro'
 
-    def test_with_dtns_action_map_intro_and_outro_survive_distinct(self):
+    def test_with_example_action_map_intro_and_outro_survive_distinct(self):
         merged = deduplicate_window_ads(
-            self._raw_llm_detections(), action_map=self.DTNS_ACTION_MAP)
+            self._raw_llm_detections(), action_map=self.EXAMPLE_ACTION_MAP)
 
         by_start = {round(m['start'], 1): m for m in merged}
         assert 0.0 in by_start
@@ -926,7 +1094,7 @@ class TestDeduplicateWindowAdsActionGate:
         assert by_start[2385.8]['end'] == 2444.9
         assert by_start[2385.8].get('category') is None
 
-        # The genuinely-duplicate Vanta re-detection across the window 2/3
+        # The genuinely-duplicate Wayne re-detection across the window 2/3
         # boundary (687.5-845.5 and 814.2-845.5, same resolved action) still
         # merges exactly as before.
         assert 687.5 in by_start
@@ -936,7 +1104,7 @@ class TestDeduplicateWindowAdsActionGate:
         """An all-remove action map (today's default feed) must merge
         identically to the no-map case: the gate never changes behavior
         for a feed that has not opted into per-category actions."""
-        all_remove = {cat: 'remove' for cat in self.DTNS_ACTION_MAP}
+        all_remove = {cat: 'remove' for cat in self.EXAMPLE_ACTION_MAP}
         merged = deduplicate_window_ads(
             self._raw_llm_detections(), action_map=all_remove)
         assert len(merged) == 6
@@ -944,7 +1112,7 @@ class TestDeduplicateWindowAdsActionGate:
 
 class TestRemovalCoverageRegions:
     """removal_coverage_regions gates which pattern-matched regions may
-    shadow (trim) a Claude detection (DTNS 5337): a keep-resolving pattern
+    shadow (trim) a Claude detection: a keep-resolving pattern
     region never cuts, so letting it cover a remove-resolving detection
     leaves the ad in the audio with no marker responsible for removing it."""
 
@@ -976,12 +1144,12 @@ class TestRemovalCoverageRegions:
                     'category': 'cross_promo'}]
         assert removal_coverage_regions(regions, None) == regions
 
-    def test_dtns_5337_keep_pattern_does_not_trim_sponsor_detection(self):
-        """The DTNS 5337 shape: a cross_promo->keep pattern match covered
-        52% of a Morning Brew + Vanta sponsor detection; the trim left only
-        the Vanta half cut and the Morning Brew read in the audio."""
+    def test_keep_pattern_does_not_trim_sponsor_detection(self):
+        """A cross_promo->keep pattern match covered 52% of an Umbrella +
+        Wayne sponsor detection; the trim left only the Wayne half cut and
+        the Umbrella read in the audio."""
         ad = {'start': 1752.4, 'end': 1808.6, 'confidence': 0.97,
-              'category': 'sponsor', 'reason': 'Morning Brew Daily + Vanta'}
+              'category': 'sponsor', 'reason': 'Umbrella Daily + Wayne'}
         regions = [{'start': 1686.7, 'end': 1781.64, 'pattern_id': 625,
                     'category': 'cross_promo'}]
         coverage = removal_coverage_regions(regions, self.ACTION_MAP)
@@ -998,7 +1166,7 @@ class TestAddPatternMatchRegionCategory:
     def _match(self, category):
         from types import SimpleNamespace
         return SimpleNamespace(start=10.0, end=40.0, confidence=0.9,
-                               sponsor='Morning Brew', pattern_id=625,
+                               sponsor='Umbrella', pattern_id=625,
                                category=category, matched_text=None)
 
     def test_region_carries_match_category(self):

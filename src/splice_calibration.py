@@ -15,10 +15,15 @@ import logging
 from config import (
     SPLICE_CALIBRATION_MIN_EPISODES, SPLICE_CALIBRATION_RECENT_EPISODES,
     SPLICE_CALIBRATION_MAX_FP_PER_HOUR,
+    SPLICE_CALIBRATED_MIN_CORROBORATED, SPLICE_HOST_READ_RECENT_EPISODES,
     SPLICE_DIGITAL_SILENCE_MIN_SECONDS, SPLICE_DEEP_SILENCE_MIN_SECONDS,
 )
+from utils.markers import parse_ad_markers
 
 logger = logging.getLogger(__name__)
+
+# Statuses whose splice events are trusted to extend a cut; host_read only stops the veto.
+SPLICE_EVENTS_CALIBRATED_STATUSES = ('calibrated', 'host_read')
 
 _SILENCE_TYPES = ('digital_silence', 'deep_silence')
 _DEFAULT_MIN_S = {
@@ -42,11 +47,44 @@ def cold_start_calibration(episodes_considered: int = 0) -> dict:
     }
 
 
-def build_calibration(rows) -> dict:
+def long_cut_corroboration(rows) -> dict:
+    """Share of eligible long transcript-detected cuts with audio corroboration, from stored markers."""
+    episodes = cuts = corroborated = 0
+    for row in rows:
+        markers = parse_ad_markers(row.get('ad_markers_json')) or []
+        found = []
+        origins = set()
+        for m in markers:
+            if not (isinstance(m, dict) and isinstance(m.get('validation'), dict)
+                    and 'audio_corroboration' in m['validation']):
+                continue
+            # A reviewer reject is a false positive, not a standing cut.
+            if m.get('source') == 'reviewer' and m.get('was_cut') is False:
+                continue
+            # Fragments carved from one detection, or pieces of one hold, count once.
+            origin = m.get('carved_from')
+            keys = {('hold', m['hold_id'])} if m.get('hold_id') else set()
+            if isinstance(origin, dict):
+                keys.add((origin.get('start'), origin.get('end')))
+            if keys & origins:
+                continue
+            origins |= keys
+            found.append(m['validation']['audio_corroboration'])
+        if not found:
+            continue
+        episodes += 1
+        cuts += len(found)
+        corroborated += sum(source != 'none' for source in found)
+    return {'episodes': episodes, 'cuts': cuts, 'corroborated': corroborated,
+            'fraction': round(corroborated / cuts, 3) if cuts else None}
+
+
+def build_calibration(rows, ad_history_rows=()) -> dict:
     """Build the calibration dict from stored history rows.
 
     rows: dicts with original_duration and audio_analysis_json (newest-first,
-    from db.get_recent_audio_analyses).
+    from db.get_recent_audio_analyses). ad_history_rows: ad_markers_json rows
+    (from db.get_recent_episode_ad_history) that decide calibrated vs host_read.
 
     The returned thresholds (digital_silence_min_s, deep_silence_min_s) are
     stored in the audio analysis payload as observability data and are visible
@@ -96,11 +134,16 @@ def build_calibration(rows) -> dict:
         else:
             thresholds[f'{etype}_min_s'] = default_min
 
+    corroboration = long_cut_corroboration(ad_history_rows)
+    # Until enough episodes carry the measurement the feed keeps today's status.
+    host_read = (corroboration['episodes'] >= SPLICE_CALIBRATION_MIN_EPISODES
+                 and corroboration['fraction'] < SPLICE_CALIBRATED_MIN_CORROBORATED)
     return {
-        'status': 'calibrated',
+        'status': 'host_read' if host_read else 'calibrated',
         'episodes_considered': considered,
         'events_per_hour': rates,
         'thresholds': thresholds,
+        'long_cut_corroboration': corroboration,
     }
 
 
@@ -114,7 +157,14 @@ def compute_splice_calibration(db, slug: str,
         rows = db.get_recent_audio_analyses(
             slug, exclude_episode_id=exclude_episode_id,
             limit=SPLICE_CALIBRATION_RECENT_EPISODES)
-        return build_calibration(rows)
+        try:
+            ad_history = db.get_recent_episode_ad_history(
+                slug, exclude_episode_id=exclude_episode_id,
+                limit=SPLICE_HOST_READ_RECENT_EPISODES)
+        except Exception as e:
+            logger.warning(f"[{slug}] Long-cut corroboration history failed: {e}")
+            ad_history = ()
+        return build_calibration(rows, ad_history)
     except Exception as e:
         logger.warning(f"[{slug}] Splice calibration failed: {e}")
         return cold_start_calibration()

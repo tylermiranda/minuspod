@@ -1,4 +1,5 @@
 """Splitting a confirmed miss the transcript gives no handoff phrase for."""
+import logging
 import os
 import sys
 
@@ -74,6 +75,40 @@ def test_each_member_piece_is_learned_under_its_own_sponsor(db):
     assert {rows[c['id']]['sponsor'] for c in created} == {'Acme Tools', 'Beta Corp'}
 
 
+def test_distinct_same_sponsor_members_do_not_learn_one_bundle(db):
+    second_read = (
+        "Acme Tools builds garden sheds that arrive ready to assemble. "
+        "A kit from Acme Tools includes every panel and fitting you need. "
+        "Choose a size online and Acme Tools delivers it to your door."
+    )
+    matcher = TextPatternMatcher(db=db)
+    created = matcher.create_patterns_from_ad(
+        segments=_segments(ACME_READ, 0.0, 55.0)
+                 + _segments(second_read, 55.0, 110.0),
+        start=0.0, end=110.0, sponsor='Acme Tools',
+        podcast_id='example-podcast',
+        ad={'merged_distinct_ads': True, 'merged_member_spans': [
+            {'start': 0.0, 'end': 55.0, 'sponsor': 'Acme Tools'},
+            {'start': 55.0, 'end': 110.0, 'sponsor': 'Acme Tools'},
+        ]},
+    )
+    assert [(round(c['start']), round(c['end'])) for c in created] == [
+        (0, 55), (55, 110)]
+    assert all(len(db.get_ad_pattern_by_id(c['id'])['text_template']) <
+               len(ACME_READ + second_read) for c in created)
+
+
+def test_distinct_merge_without_a_reliable_divider_learns_nothing(db):
+    matcher = TextPatternMatcher(db=db)
+    created = matcher.create_patterns_from_ad(
+        segments=_segments(ACME_READ, 0.0, 95.0), start=0.0, end=95.0,
+        sponsor='Acme Tools', podcast_id='example-podcast',
+        ad={'merged_distinct_ads': True},
+    )
+    assert created == []
+    assert db.get_ad_patterns(podcast_id='example-podcast') == []
+
+
 def test_a_brand_change_splits_a_span_with_no_merge_record(db):
     """The registry is the only evidence here: no phrase, no members."""
     matcher = TextPatternMatcher(db=db)
@@ -141,3 +176,185 @@ def test_a_clean_single_brand_read_is_learned_whole(db):
         segments=_segments(ACME_READ, 0.0, 95.0), start=0.0, end=95.0,
         sponsor='Acme Tools', podcast_id='example-podcast')
     assert [(round(c['start']), round(c['end'])) for c in created] == [(0, 95)]
+
+
+PROMO_READ = (
+    "Thanks for listening to the show this week. "
+    "Leave us a rating wherever you listen to podcasts. "
+    "Tell a friend who would enjoy the show too."
+)
+
+
+@pytest.mark.parametrize('intro_sponsor', ['example-podcast', None])
+def test_self_promo_intro_and_sponsor_outro_are_not_learned_as_one(db, caplog,
+                                                                    intro_sponsor):
+    matcher = TextPatternMatcher(db=db)
+    with caplog.at_level(logging.INFO, logger='podcast.textmatch'):
+        created = matcher.create_patterns_from_ad(
+            segments=_segments(PROMO_READ, 0.0, 25.0)
+                     + _segments(ACME_READ, 25.0, 100.0),
+            start=0.0, end=100.0, sponsor='Acme Tools',
+            podcast_id='example-podcast',
+            ad={'merged_member_spans': [
+                {'start': 0.0, 'end': 25.0, 'stage': 'claude',
+                 'sponsor': intro_sponsor, 'category': 'self_promo'},
+                {'start': 25.0, 'end': 100.0, 'stage': 'claude',
+                 'sponsor': 'Acme Tools', 'category': 'sponsor'},
+            ]})
+    rows = db.get_ad_patterns(podcast_id='example-podcast')
+    assert [(round(c['start']), round(c['end'])) for c in created] == [(25, 100)]
+    assert [p['sponsor'] for p in rows] == ['Acme Tools']
+    assert "Splitting bundled span 0-100s: intro from self_promo/" in caplog.text
+
+
+def test_bundled_span_without_a_divider_is_skipped(db, caplog):
+    matcher = TextPatternMatcher(db=db)
+    with caplog.at_level(logging.INFO, logger='podcast.textmatch'):
+        created = matcher.create_patterns_from_ad(
+            segments=_segments(ACME_READ, 0.0, 90.0), start=0.0, end=90.0,
+            sponsor='Acme Tools', podcast_id='example-podcast',
+            ad={'merged_member_spans': [
+                {'start': 0.0, 'end': 90.0, 'stage': 'claude',
+                 'sponsor': 'Acme Tools', 'category': 'self_promo'},
+                {'start': 0.0, 'end': 90.0, 'stage': 'fingerprint',
+                 'sponsor': 'Acme Tools', 'category': 'sponsor'},
+            ]})
+    assert created == []
+    assert "intro and outro come from different reads" in caplog.text
+
+
+def test_split_piece_takes_the_category_of_its_covering_member(db):
+    matcher = TextPatternMatcher(db=db)
+    created = matcher.create_patterns_from_ad(
+        segments=_two_brand_segments(), start=0.0, end=191.0,
+        sponsor='Acme Tools', podcast_id='example-podcast', category='sponsor',
+        ad={'merged_member_spans': [
+            {'start': 0.0, 'end': 95.0, 'stage': 'claude',
+             'sponsor': 'Acme Tools', 'category': 'cross_promo'},
+            {'start': 95.0, 'end': 191.0, 'stage': 'claude',
+             'sponsor': 'Beta Corp', 'category': 'sponsor'},
+        ]})
+    cats = {db.get_ad_pattern_by_id(c['id'])['sponsor']:
+            db.get_ad_pattern_by_id(c['id']).get('category') for c in created}
+    assert cats == {'Acme Tools': 'cross_promo', 'Beta Corp': 'sponsor'}
+
+
+def test_same_label_members_still_learn_one_pattern(db):
+    matcher = TextPatternMatcher(db=db)
+    created = matcher.create_patterns_from_ad(
+        segments=_segments(ACME_READ, 0.0, 90.0), start=0.0, end=90.0,
+        sponsor='Acme Tools', podcast_id='example-podcast',
+        ad={'merged_member_spans': [
+            {'start': 0.0, 'end': 50.0, 'stage': 'claude',
+             'sponsor': 'Acme Tools', 'category': 'sponsor'},
+            {'start': 40.0, 'end': 90.0, 'stage': 'fingerprint',
+             'sponsor': 'acme tools', 'category': 'sponsor'},
+        ]})
+    assert [(round(c['start']), round(c['end'])) for c in created] == [(0, 90)]
+
+
+def test_a_claude_member_of_a_dai_marker_is_split_and_learned(db):
+    from ad_detector import AdDetector
+    detector = AdDetector(api_key='test-key')
+    detector.db = db
+    detector.text_pattern_matcher = TextPatternMatcher(db=db)
+    detector.sponsor_service = None
+    detector.audio_fingerprinter = None
+    marker = {
+        'start': 0.0, 'end': 191.0, 'was_cut': True, 'confidence': 0.9,
+        'detection_stage': 'dai_differential', 'category': 'sponsor',
+        'merged_distinct_ads': True,
+        'merged_member_spans': [
+            {'start': 0.0, 'end': 191.0, 'stage': 'claude', 'confidence': 0.97,
+             'sponsor': 'Acme Tools'},
+            {'start': 0.0, 'end': 191.0, 'stage': 'dai_differential'},
+        ],
+    }
+    learned = detector.learn_from_detections(
+        [marker], _two_brand_segments(), podcast_id='example-podcast',
+        episode_id='a1b2c3d4e5f6')
+    assert learned == 1
+    sponsors = {p['sponsor'] for p in db.get_ad_patterns(podcast_id='example-podcast')}
+    assert sponsors == {'Acme Tools', 'Beta Corp'}
+
+
+def test_a_claude_member_over_two_dai_cores_splits_at_the_inner_core(db):
+    """No registered brand or handoff phrase separates the reads; only the measured cores do."""
+    from ad_detector import AdDetector
+    first = (
+        "Zorbly Goods keeps a workshop running without the usual hassle. "
+        "Every Zorbly Goods order ships free and arrives inside two days. "
+        "Listeners get a month of Zorbly Goods on the house right now. "
+        "Zorbly Goods stands behind every single thing it sells to you."
+    )
+    second = (
+        "Zorbly Goods also files small business taxes in a single afternoon. "
+        "Zorbly Goods reads the forms so you never have to open one. "
+        "Try Zorbly Goods free for a month and see the difference today. "
+        "Zorbly Goods has helped thousands of owners already this year."
+    )
+    detector = AdDetector(api_key='test-key')
+    detector.db = db
+    detector.text_pattern_matcher = TextPatternMatcher(db=db)
+    detector.sponsor_service = None
+    detector.audio_fingerprinter = None
+    marker = {
+        'start': 0.0, 'end': 191.0, 'was_cut': True, 'confidence': 0.9,
+        'detection_stage': 'dai_differential', 'category': 'sponsor',
+        'dai_core_spans': [{'start': 0.0, 'end': 94.0}, {'start': 95.0, 'end': 191.0}],
+        'merged_distinct_ads': True,
+        'merged_member_spans': [
+            {'start': 0.0, 'end': 191.0, 'stage': 'claude', 'confidence': 0.97,
+             'sponsor': 'Zorbly Goods'},
+        ],
+    }
+    real_create = detector.text_pattern_matcher.create_patterns_from_ad
+    created = []
+    detector.text_pattern_matcher.create_patterns_from_ad = (
+        lambda **kwargs: created.extend(real_create(**kwargs)) or created)
+    detector.learn_from_detections(
+        [marker], _segments(first, 0.0, 95.0) + _segments(second, 95.0, 191.0),
+        podcast_id='example-podcast', episode_id='a1b2c3d4e5f6')
+    assert [(c['start'], c['end']) for c in created] == [(0.0, 95.0), (95.0, 191.0)]
+
+
+def test_the_unknown_stretch_of_a_bundled_member_splits_into_its_reads(db):
+    """A known read inside the member is removed; the rest learns as one pattern per brand."""
+    from ad_detector import AdDetector
+    from sponsor_service import SponsorService
+    known = (
+        "Gamma Shoes fits every foot in the family with one easy order. "
+        "Gamma Shoes ships free both ways so returns cost you nothing at all. "
+        "Gamma Shoes has a sale this week on every running shoe they sell."
+    )
+    detector = AdDetector(api_key='test-key')
+    detector.db = db
+    detector.text_pattern_matcher = TextPatternMatcher(db=db)
+    detector.sponsor_service = SponsorService(db)
+    detector.audio_fingerprinter = None
+    marker = {
+        'start': 0.0, 'end': 290.0, 'was_cut': True, 'confidence': 0.9,
+        'detection_stage': 'dai_differential', 'category': 'sponsor',
+        'merged_distinct_ads': True,
+        'merged_member_spans': [
+            {'start': 0.0, 'end': 290.0, 'stage': 'claude', 'confidence': 0.97,
+             'sponsor': 'Gamma Shoes'},
+            {'start': 0.0, 'end': 100.0, 'stage': 'text_pattern', 'pattern_id': 99},
+        ],
+    }
+    real_create = detector.text_pattern_matcher.create_patterns_from_ad
+    created, sponsors_passed = [], []
+
+    def create(**kwargs):
+        sponsors_passed.append(kwargs['sponsor'])
+        created.extend(real_create(**kwargs))
+        return created
+
+    detector.text_pattern_matcher.create_patterns_from_ad = create
+    detector.learn_from_detections(
+        [marker], _segments(known, 0.0, 100.0) + _two_brand_segments(100.0, 195.0, 290.0),
+        podcast_id='example-podcast', episode_id='a1b2c3d4e5f6')
+    assert [(round(c['start']), round(c['end'])) for c in created] == [(100, 195), (195, 290)]
+    assert 'Gamma Shoes' not in sponsors_passed
+    sponsors = {p['sponsor'] for p in db.get_ad_patterns(podcast_id='example-podcast')}
+    assert sponsors == {'Acme Tools', 'Beta Corp'}

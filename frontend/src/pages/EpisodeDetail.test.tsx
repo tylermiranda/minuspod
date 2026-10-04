@@ -15,6 +15,7 @@ import userEvent from '@testing-library/user-event';
 import EpisodeDetail, { KeyedEpisodeDetail } from './EpisodeDetail';
 import EpisodeList from '../components/EpisodeList';
 import type { Episode, EpisodeDetail as EpisodeDetailType } from '../api/types';
+import { formatTimestamp } from '../utils/format';
 
 // react-router stubs. Mutable so a test can move the view to another episode.
 const routeParams = vi.hoisted(() => ({ slug: 'test-feed', episodeId: 'ep-1' }));
@@ -179,8 +180,9 @@ describe('Held for Review section: rendering', () => {
     await waitFor(() => {
       expect(screen.getByTestId('held-for-review-section')).toBeDefined();
     });
-    // Two rows: two timespan pairs.
-    expect(screen.getAllByText(/Held/).length).toBeGreaterThanOrEqual(2);
+    // Two rows, each chip labeled by its hold reason.
+    expect(screen.getByText('Over max duration')).toBeDefined();
+    expect(screen.getByText('No cue evidence')).toBeDefined();
   });
 
   it('does not render the section when pendingReviewMarkers is empty', async () => {
@@ -219,7 +221,7 @@ describe('Held for Review section: rendering', () => {
     expect(screen.getByTitle('No audio-cue evidence')).toBeDefined();
   });
 
-  it('labels a verification_miss marker "Verification catch" instead of the generic Held chip', async () => {
+  it('labels a verification_miss marker "Verification catch"', async () => {
     renderDetail(makeEpisode({ pendingReviewMarkers: [{ ...heldMarker, hold_reason: 'verification_miss' }] }));
     await waitFor(() => {
       expect(screen.getByTestId('held-for-review-section')).toBeDefined();
@@ -796,6 +798,35 @@ describe('Differential status and corroboration badges', () => {
     await waitFor(() => expect(screen.getByText('Test Episode')).toBeDefined());
     expect(screen.queryByText(/^Cross-fetch:/)).toBeNull();
   });
+
+  it('keeps confirmed reviewer markers unchanged without an abstention badge', async () => {
+    renderDetail(makeEpisode({
+      pendingReviewMarkers: [],
+      adMarkers: [{
+        start: 10,
+        end: 40,
+        confidence: 0.9,
+        reviewer_verdict: 'confirmed',
+        reviewer_reasoning: 'The candidate is an ad.',
+      }],
+    }));
+    await waitFor(() => expect(screen.getByText('Reviewer: confirmed')).toBeDefined());
+    expect(screen.queryByText('Reviewer abstained')).toBeNull();
+  });
+
+  it('shows abstention reasoning while keeping an inconclusive marker held', async () => {
+    renderDetail(makeEpisode({
+      pendingReviewMarkers: [{
+        ...heldMarker,
+        reviewer_verdict: 'inconclusive',
+        reviewer_reasoning: 'The review did not have enough context.',
+      }],
+    }));
+    await waitFor(() => expect(screen.getByTestId('held-for-review-section')).toBeDefined());
+    expect(screen.getByText('Reviewer abstained')).toBeDefined();
+    expect(screen.getByText('The review did not have enough context.')).toBeDefined();
+    expect(screen.getByText('Over max duration')).toBeDefined();
+  });
 });
 
 describe('New hold reasons: tooltip titles', () => {
@@ -826,9 +857,53 @@ describe('New hold reasons: tooltip titles', () => {
     expect(screen.getByText('The candidate starts after the protected boundary.')).toBeDefined();
   });
 
+  it('shows why inconclusive bounds were held', async () => {
+    renderDetail(makeEpisode({ pendingReviewMarkers: [{
+      ...heldMarker,
+      hold_reason: 'reviewer_inconclusive_bounds',
+      reviewer_reasoning: 'Reviewer abstained: missing boundary coverage.',
+    }] }));
+    await waitFor(() => expect(screen.getByTitle(
+      'The reviewer could not verify both cut boundaries')).toBeDefined());
+    expect(screen.getByText('Reviewer abstained: missing boundary coverage.')).toBeDefined();
+  });
+
+  it('labels a failed review hold and shows its reasoning', async () => {
+    renderDetail(makeEpisode({ pendingReviewMarkers: [{
+      ...heldMarker,
+      hold_reason: 'reviewer_failed',
+      reviewer_reasoning: 'Review unavailable: LLM call failed',
+    }] }));
+    await waitFor(() => expect(screen.getByText('Reviewer unavailable')).toBeDefined());
+    expect(screen.getByTitle(
+      'The reviewer could not be reached and no independent evidence backs the bounds')).toBeDefined();
+    expect(screen.getByText('Review unavailable: LLM call failed')).toBeDefined();
+  });
+
+  it('shows why estimated pattern bounds were held', async () => {
+    renderDetail(makeEpisode({ pendingReviewMarkers: [{
+      ...heldMarker, hold_reason: 'estimated_pattern_bounds',
+    }] }));
+    await waitFor(() => expect(screen.getByTitle(
+      'Estimated pattern remainder outside the verified ad bounds')).toBeDefined());
+  });
+
   it('shows the no_splice_evidence title', async () => {
     renderDetail(makeEpisode({ pendingReviewMarkers: [{ ...heldMarker, hold_reason: 'no_splice_evidence' }] }));
     await waitFor(() => expect(screen.getByTitle('No splice artifact found at either edge')).toBeDefined());
+  });
+
+  it('labels the pass-2 review apart from the pass-1 reviewer note', async () => {
+    const reason = 'Reviewer abstained: insufficient evidence. Original marker retained.';
+    renderDetail(makeEpisode({ pendingReviewMarkers: [{
+      ...heldMarker,
+      hold_reason: 'reviewer_inconclusive_bounds',
+      reviewer_reasoning: 'Reviewer abstained: transcript gap.',
+      pass2_hold_review: { span: [1040, 1060], verdict: 'inconclusive', reason },
+    }] }));
+    await waitFor(() => expect(screen.getByText('Pass-2 review of 17:20-17:40:')).toBeDefined());
+    expect(screen.getByText(`inconclusive. ${reason}`, { exact: false })).toBeDefined();
+    expect(screen.getByText('Reviewer abstained: transcript gap.')).toBeDefined();
   });
 });
 
@@ -1254,6 +1329,29 @@ describe('Segment category chips (#565)', () => {
     expect(await screen.findByText('Detections Not Cut (1)')).not.toBeNull();
     expect(screen.getByText('Interaction')).not.toBeNull();
     expect(screen.getByText('Kept')).not.toBeNull();
+  });
+
+  it('names the detection a carved fragment came from', async () => {
+    const carvedFrom = { start: 60, end: 120 };
+    const hint = `Split from detection ${formatTimestamp(60)} - ${formatTimestamp(120)}`;
+    renderDetail(makeEpisode({
+      adMarkers: [{ start: 60, end: 90, confidence: 0.9, category: 'sponsor', carved_from: carvedFrom }],
+      pendingReviewMarkers: [],
+      rejectedAdMarkers: [{
+        start: 90, end: 120, confidence: 0.9, category: 'sponsor', carved_from: carvedFrom,
+      }],
+    }));
+    expect(await screen.findByText('Detections Not Cut (1)')).not.toBeNull();
+    expect(screen.getAllByText(hint)).toHaveLength(2);
+  });
+
+  it('shows no carved hint on a marker that was not carved', async () => {
+    renderDetail(makeEpisode({
+      pendingReviewMarkers: [],
+      rejectedAdMarkers: [{ start: 5, end: 20, confidence: 0.4, category: 'sponsor' }],
+    }));
+    expect(await screen.findByText('Detections Not Cut (1)')).not.toBeNull();
+    expect(screen.queryByText(/^Split from detection /)).toBeNull();
   });
 });
 
@@ -2125,5 +2223,39 @@ describe('Run controls while a job is in flight', () => {
       pendingReviewMarkers: [], jobState: 'idle', status: 'processing', cumulativeSpend: spend,
     }));
     expect(await screen.findByText(/Total spend/)).toBeDefined();
+  });
+});
+
+describe('Correction badges', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  const confirm = (origin?: 'user' | 'auto_pass2') => ({
+    id: 1,
+    correction_type: 'confirm' as const,
+    original_bounds: { start: 10, end: 40 },
+    created_at: '2026-01-01T00:00:00Z',
+    origin,
+  });
+
+  it('labels a pass-2 auto-filed confirm Auto-approved', async () => {
+    renderDetail(makeEpisode({
+      pendingReviewMarkers: [],
+      adMarkers: [{ start: 10, end: 40, confidence: 0.9, detection_stage: 'claude' }],
+      corrections: [confirm('auto_pass2')],
+    }));
+    await waitFor(() => expect(screen.getByText('Auto-approved')).toBeDefined());
+    expect(screen.queryByText('Confirmed')).toBeNull();
+  });
+
+  it('labels a user confirm Confirmed', async () => {
+    renderDetail(makeEpisode({
+      pendingReviewMarkers: [],
+      adMarkers: [{ start: 10, end: 40, confidence: 0.9, detection_stage: 'claude' }],
+      corrections: [confirm('user')],
+    }));
+    await waitFor(() => expect(screen.getByText('Confirmed')).toBeDefined());
+    expect(screen.queryByText('Auto-approved')).toBeNull();
   });
 });

@@ -6,11 +6,12 @@ import os
 import shutil
 from pathlib import Path
 
-from utils.audio import AudioMetadata, get_audio_duration
-from embedded_chapters import probe_chapters, remap_chapters, render_ffmetadata
+from utils.audio import AudioMetadata, get_audio_duration, probe_render_input
+from embedded_chapters import parse_chapters, remap_chapters, render_ffmetadata
 from utils.subprocess_registry import tracked_run
 from utils.ffmpeg_run import SAFE_MEDIA_INPUT_ARGS
 from utils.paths import resolve_data_dir
+from utils.markers import precise_edge, subtract_spans
 from config import (
     FFMPEG_LONG_TIMEOUT,
     MIN_AD_DURATION_FOR_REMOVAL, POST_ROLL_TRIM_THRESHOLD, MERGE_GAP_SECONDS,
@@ -239,14 +240,16 @@ class AudioProcessor:
 
     def compute_applied_cuts(self, ad_segments: list[dict],
                              total_duration: float,
-                             cut_barriers: list[dict] | None = None
+                             cut_barriers: list[dict] | None = None,
+                             hard_barriers: list[dict] | None = None
                              ) -> list[dict]:
         """Compute the cuts remove_ads actually applies to the audio.
 
         Requested segments diverge from applied cuts: near-adjacent segments
         merge, short ones drop, and an end-of-episode cut extends to the end
         of the file. ``cut_barriers`` identifies content that must neither be
-        swallowed by a gap merge nor by that trailing extension. Asset
+        swallowed by a gap merge nor by that trailing extension.
+        ``hard_barriers`` are kept audio: every cut is also clipped at them. Asset
         generation and verification timestamp mapping need the applied list,
         not the requested one -- remove_ads returns it.
         """
@@ -257,6 +260,7 @@ class AudioProcessor:
         # below zero or runs past the end of the file, and an out-of-range
         # atrim would silently cut the wrong region.
         clamped = []
+        hard_spans = [(barrier['start'], barrier['end']) for barrier in hard_barriers or []]
         for ad in ad_segments:
             start = max(0.0, ad['start'])
             end = min(ad['end'], total_duration)
@@ -264,11 +268,14 @@ class AudioProcessor:
                 logger.info(f"Skipping out-of-range ad ({ad['start']:.1f}s-{ad['end']:.1f}s "
                             f"vs {total_duration:.1f}s audio)")
                 continue
-            ad = dict(ad)
-            ad['start'], ad['end'] = start, end
-            clamped.append(ad)
+            pieces = subtract_spans([(start, end)], hard_spans)
+            if pieces != [(start, end)]:
+                logger.info(f"Clipping ad {start:.1f}s-{end:.1f}s at kept audio to "
+                            f"{[(round(lo, 1), round(hi, 1)) for lo, hi in pieces]}")
+            clamped.extend(dict(ad, start=lo, end=hi) for lo, hi in pieces)
         if not clamped:
             return []
+        cut_barriers = [*(cut_barriers or []), *(hard_barriers or [])]
 
         sorted_segments = sorted(clamped, key=lambda x: x['start'])
 
@@ -285,12 +292,24 @@ class AudioProcessor:
         merged_ads = []
         current_segment = None
         for ad in sorted_segments:
+            confirmed_cut = bool((ad.get('validation') or {}).get('user_confirmed'))
+            precise_start = precise_edge(ad, 'start')
+            precise_end = precise_edge(ad, 'end')
+            gap = (ad['start'] - current_segment['end']
+                   if current_segment else 0.0)
             if (current_segment
-                    and ad['start'] - current_segment['end'] < MERGE_GAP_SECONDS
+                    and gap < MERGE_GAP_SECONDS
                     and not crosses_barrier(current_segment['end'], ad['start'])
+                    and (gap <= 0 or not (confirmed_cut
+                                         or current_segment.get('_confirmed_cut')
+                                         or current_segment.get('_precise_end')
+                                         or precise_start))
                     and ad.get('beep', False) == current_segment.get('beep', False)):
                 # Extend current segment (use max to handle overlapping/contained ads)
-                current_segment['end'] = max(current_segment['end'], ad['end'])
+                if ad['end'] > current_segment['end']:
+                    current_segment['end'] = ad['end']
+                    current_segment['_confirmed_cut'] = confirmed_cut
+                    current_segment['_precise_end'] = precise_end
                 if 'reason' in ad:
                     current_segment['reason'] = current_segment.get('reason', '') + '; ' + ad['reason']
                 # Carry the strongest trust signal of the merged members so
@@ -304,7 +323,9 @@ class AudioProcessor:
             else:
                 if current_segment:
                     merged_ads.append(current_segment)
-                current_segment = {'start': ad['start'], 'end': ad['end']}
+                current_segment = {'start': ad['start'], 'end': ad['end'],
+                                   '_confirmed_cut': confirmed_cut,
+                                   '_precise_end': precise_end}
                 for key in ('reason', 'confidence', 'detection_stage', 'beep',
                             '_measured_split_fragment'):
                     if key in ad:
@@ -321,7 +342,8 @@ class AudioProcessor:
         for ad in merged_ads:
             duration = ad['end'] - ad['start']
             measured_split = bool(ad.get('_measured_split_fragment'))
-            keep_short = (ad.get('detection_stage') == 'fingerprint'
+            keep_short = (ad.get('_confirmed_cut')
+                          or ad.get('detection_stage') == 'fingerprint'
                           or ad.get('confidence', 0) >= SHORT_CUT_KEEP_CONFIDENCE
                           or measured_split)
             if duration >= MIN_AD_DURATION_FOR_REMOVAL:
@@ -351,11 +373,17 @@ class AudioProcessor:
                 logger.info(
                     f"End-of-episode cut: preserving content after "
                     f"{ads[-1]['end']:.1f}s because a keep barrier follows")
-            elif (remaining < POST_ROLL_TRIM_THRESHOLD
+            elif (not ads[-1].get('_confirmed_cut')
+                  and not ads[-1].get('_precise_end')
+                  and remaining < POST_ROLL_TRIM_THRESHOLD
                   and ads[-1]['end'] != total_duration):
                 logger.info(f"End-of-episode cut: extending {ads[-1]['end']:.1f}s -> "
                             f"{total_duration:.1f}s ({remaining:.1f}s would remain)")
                 ads[-1]['end'] = total_duration
+
+        for ad in ads:
+            ad.pop('_confirmed_cut', None)
+            ad.pop('_precise_end', None)
 
         # Stamp each ad with 'replacement_duration', the length remove_ads
         # will render it with: 'remove' gets the fixed beep clip; 'beep' is
@@ -378,7 +406,8 @@ class AudioProcessor:
 
     def remove_ads(self, input_path: str, ad_segments: list[dict],
                    output_path: str,
-                   cut_barriers: list[dict] | None = None
+                   cut_barriers: list[dict] | None = None,
+                   hard_barriers: list[dict] | None = None
                    ) -> list[dict] | None:
         """Remove ad segments from audio file.
 
@@ -398,8 +427,9 @@ class AudioProcessor:
 
         chapters_meta_path = None
         try:
-            # Get total duration
-            total_duration = self.get_audio_duration(input_path)
+            # One probe for the input's duration, format and chapters.
+            render_input = probe_render_input(input_path)
+            total_duration = render_input.duration if render_input else None
             if not total_duration:
                 logger.error("Could not get audio duration")
                 return None
@@ -408,7 +438,7 @@ class AudioProcessor:
 
             ads = self.compute_applied_cuts(
                 ad_segments, total_duration,
-                cut_barriers=cut_barriers)
+                cut_barriers=cut_barriers, hard_barriers=hard_barriers)
             logger.info(f"After merging and filtering: {len(ads)} ad segments")
             if not ads:
                 # Every requested cut merged/filtered away: nothing to cut,
@@ -434,6 +464,17 @@ class AudioProcessor:
             # length, shared by the chapter remap and drift check below.
             cut_total = sum(a['end'] - a['start'] for a in ads)
             expected_duration = total_duration - cut_total + sum(a['replacement_duration'] for a in ads)
+
+            # concat needs identical formats; the implicit resampler ffmpeg
+            # inserts otherwise is what ffmpeg 9 on aarch64 trips on (#796).
+            conform = ''
+            episode_format = render_input.audio_format
+            if episode_format:
+                rate, channels, layout = episode_format
+                layout = layout or {1: 'mono', 2: 'stereo'}.get(channels, '')
+                conform = f",aresample={rate},aformat=sample_fmts=fltp:sample_rates={rate}"
+                if layout:
+                    conform += f":channel_layouts={layout}"
 
             # Split beep input into N copies (one per ad) - ffmpeg streams can only be used once
             num_ads = len(ads)
@@ -480,7 +521,7 @@ class AudioProcessor:
                     filler = ad['replacement_duration']
                     if filler > beep_duration:
                         beep_chain += f",apad=whole_dur={filler:.3f}"
-                filter_parts.append(f"{beep_chain}[beep{segment_idx}]")
+                filter_parts.append(f"{beep_chain}{conform}[beep{segment_idx}]")
                 concat_parts.append(f"[beep{segment_idx}]")
 
                 current_time = ad_end
@@ -502,16 +543,17 @@ class AudioProcessor:
             filter_str = ';'.join(filter_parts)
             if filter_str:
                 filter_str += ';'
-            filter_str += ''.join(concat_parts) + f"concat=n={len(concat_parts)}:v=0:a=1[out]"
+            # lame rejects short final frames with too little plane padding (#796). 1152 is
+            # lame's largest frame (32 kHz and up; lower rates use 576), so padding adds at most 1151 samples.
+            filter_str += (''.join(concat_parts) + f"concat=n={len(concat_parts)}:v=0:a=1,"
+                           "asetnsamples=n=1152:p=1[out]")
 
             # Remap embedded chapters (ID3v2 CHAP) onto the cut timeline.
             # ffmpeg copies the input's chapters by default, and their
             # timestamps point at the wrong content once ads are removed
             # (issue #500). Remapped chapters are injected as an ffmetadata
-            # input; a definitively chapterless input is stripped explicitly;
-            # a failed probe (None) keeps ffmpeg's default passthrough so a
-            # transient ffprobe failure cannot silently destroy chapters.
-            embedded = probe_chapters(input_path)
+            # input; otherwise chapters are stripped. A failed probe never gets here.
+            embedded = parse_chapters(render_input.chapters)
             remapped = []
             if embedded:
                 remapped = remap_chapters(
@@ -532,7 +574,7 @@ class AudioProcessor:
             ]
             if chapters_meta_path:
                 cmd += ['-f', 'ffmetadata', '-i', chapters_meta_path, '-map_chapters', '2']
-            elif embedded is not None:
+            else:
                 cmd += ['-map_chapters', '-1']
             cmd += [
                 '-filter_complex', filter_str,
@@ -597,7 +639,8 @@ class AudioProcessor:
                 os.unlink(chapters_meta_path)
 
     def process_episode(self, input_path: str, ad_segments: list[dict],
-                        cut_barriers: list[dict] | None = None
+                        cut_barriers: list[dict] | None = None,
+                        hard_barriers: list[dict] | None = None
                         ) -> tuple[str, list[dict]] | None:
         """Process episode audio to remove ads.
 
@@ -611,7 +654,7 @@ class AudioProcessor:
         try:
             applied_cuts = self.remove_ads(
                 input_path, ad_segments, temp_output,
-                cut_barriers=cut_barriers)
+                cut_barriers=cut_barriers, hard_barriers=hard_barriers)
             if applied_cuts is not None:
                 return temp_output, applied_cuts
             # Clean up on failure

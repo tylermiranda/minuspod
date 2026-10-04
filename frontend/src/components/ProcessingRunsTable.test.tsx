@@ -2,6 +2,7 @@ import { fireEvent, render, screen, within } from '@testing-library/react';
 import { describe, expect, it } from 'vitest';
 import ProcessingRunsTable from './ProcessingRunsTable';
 import type { EpisodeProcessingRun } from '../api/types';
+import { formatDuration } from '../pages/settings/settingsUtils';
 
 const statsRun: EpisodeProcessingRun = {
   runNumber: 2,
@@ -157,6 +158,15 @@ describe('ProcessingRunsTable', () => {
     expect(table.getByText('clean')).toBeTruthy();
   });
 
+  it('shows the source time cut next to the net time when beeps were inserted', () => {
+    const beepRun = {
+      ...statsRun,
+      stats: { ...statsRun.stats, secondsRemoved: 589, sourceSecondsRemoved: 609, replacementSecondsAdded: 20 },
+    };
+    expect(renderTable([beepRun]).getByText(`${formatDuration(589)} (${formatDuration(609)} cut)`)).toBeTruthy();
+    expect(renderTable([statsRun]).getByText(formatDuration(609))).toBeTruthy();
+  });
+
   it('falls back to basic columns for runs without a blob', () => {
     const table = renderTable([legacyRun]);
     expect(table.getByText('#1')).toBeTruthy();
@@ -174,6 +184,16 @@ describe('ProcessingRunsTable', () => {
     expect(table.getByText('0:42')).toBeTruthy();
     expect(table.getByText('0:12')).toBeTruthy();
     expect(table.getAllByText('Unavailable').length).toBeGreaterThan(0);
+  });
+
+  it('labels an explicitly disabled normalization pass as skipped', () => {
+    const run = {
+      ...statsRun,
+      stats: { ...statsRun.stats, normalizationSkipped: true },
+    };
+    const table = renderTable([run]);
+    fireEvent.click(table.getByRole('button', { name: /show phase breakdown for run #2/i }));
+    expect(table.getByText('Skipped')).toBeTruthy();
   });
 
   it('shows the Chapters row with a value, and Unavailable when absent', () => {

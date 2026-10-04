@@ -23,7 +23,7 @@ import { applyEpisodeJobState, jobStateFromError } from '../utils/jobStateCache'
 import AdEditor, { AdCorrection } from '../components/AdEditor';
 import AdReviewModal from '../components/AdReviewModal';
 import TranscriptSegmentWorkspace from '../components/TranscriptSegmentWorkspace';
-import type { AdSegment, Feed, EpisodeDetail as EpisodeDetailApi, JobState, ThinkingNoticePass } from '../api/types';
+import type { AdSegment, EpisodeCorrection, Feed, EpisodeDetail as EpisodeDetailApi, JobState, ThinkingNoticePass } from '../api/types';
 import PatternLink from '../components/PatternLink';
 import ExpandableText from '../components/ExpandableText';
 import RichText from '../components/RichText';
@@ -46,6 +46,7 @@ import { btnDestructive, btnPrimary, btnSecondary } from '../components/buttonSt
 import DropdownMenu, { type DropdownMenuItem } from '../components/DropdownMenu';
 import { fileInputBase, focusRing } from '../components/fieldStyles';
 import { badgeBase, tint } from '../components/badgeStyles';
+import { HOLD_REASON_LABELS, HOLD_REASON_TITLES } from '../utils/holdReason';
 
 function btnLabel(status: string, idle: string): string {
   if (status === 'saving') return 'Saving...';
@@ -95,6 +96,14 @@ function btnClass(status: string, idleClass: string): string {
   return idleClass;
 }
 
+// Badge text for a correction; a confirm the verification pass filed reads "Auto-approved".
+function correctionBadgeLabel(correction: EpisodeCorrection): string {
+  if (correction.correction_type === 'confirm') {
+    return correction.origin === 'auto_pass2' ? 'Auto-approved' : 'Confirmed';
+  }
+  return correction.correction_type === 'false_positive' ? 'Not an ad' : 'Adjusted';
+}
+
 // Row-identity payload the corrections API keys on. One builder so the
 // reason coercion stays consistent across the modal and the row buttons.
 function toOriginalAd(segment: AdSegment) {
@@ -104,6 +113,16 @@ function toOriginalAd(segment: AdSegment) {
     confidence: segment.confidence,
     reason: segment.reason || '',
   };
+}
+
+// This row is one piece of a detection the render split.
+function CarvedFromHint({ segment }: { segment: AdSegment }) {
+  if (!segment.carved_from) return null;
+  return (
+    <p className="text-sm text-muted-foreground mt-1 font-mono">
+      Split from detection {formatTimestamp(segment.carved_from.start)} - {formatTimestamp(segment.carved_from.end)}
+    </p>
+  );
 }
 
 // Pencil icon button that opens a held/rejected row in the waveform
@@ -1326,6 +1345,11 @@ function EpisodeDetail() {
                       Reviewer: skipped
                     </span>
                   )}
+                  {segment.reviewer_verdict === 'inconclusive' && (
+                    <span className={`${badgeBase} font-medium ${tint.neutral}`} title={segment.reviewer_reasoning || 'Reviewer abstained; original detection kept'}>
+                      Reviewer abstained
+                    </span>
+                  )}
                   {episode.transcript && (
                     <button
                       onClick={() => handleJumpToAd(index)}
@@ -1346,9 +1370,7 @@ function EpisodeDetail() {
                             ? tint.warning
                             : tint.blue
                         }`}>
-                          {correction.correction_type === 'confirm' ? 'Confirmed'
-                           : correction.correction_type === 'false_positive' ? 'Not an ad'
-                           : 'Adjusted'}
+                          {correctionBadgeLabel(correction)}
                         </span>
                       );
                     }
@@ -1377,6 +1399,7 @@ function EpisodeDetail() {
                     Reviewer: {formatTimestamp(segment.start)} - {formatTimestamp(segment.end)}
                   </p>
                 )}
+                <CarvedFromHint segment={segment} />
                 {segment.reviewer_verdict && segment.reviewer_reasoning && (
                   <ExpandableText
                     label="reviewer note"
@@ -1588,41 +1611,10 @@ function EpisodeDetail() {
           <div className="space-y-3">
             {heldMarkers.map((segment, index) => {
               const correction = getAdCorrection(segment.start, segment.end);
-              const holdTitle = segment.hold_reason === 'max_duration'
-                ? "Exceeds the feed's max ad duration"
-                : segment.hold_reason === 'no_cue_evidence'
-                ? 'No audio-cue evidence'
-                : segment.hold_reason === 'uncorroborated_tail'
-                ? 'Trailing ad with no audio evidence to back it'
-                : segment.hold_reason === 'reviewer_contradiction'
-                ? 'The reviewer disagreed with the detected boundaries'
-                : segment.hold_reason === 'reviewer_boundary_conflict'
-                ? 'The reviewer proposed a boundary that crosses protected ad evidence'
-                : segment.hold_reason === 'reviewer_reject_conflict'
-                ? 'The reviewer rejected a span that carries measured ad evidence'
-                : segment.hold_reason === 'no_splice_evidence'
-                ? 'No splice artifact found at either edge'
-                : segment.hold_reason === 'verification_miss'
-                ? 'A standalone catch from the verification pass, held for a second opinion'
-                : segment.hold_reason === 'differential_uncorroborated'
-                ? 'Audio differs across fetches with no corroborating signal'
-                : segment.hold_reason === 'large_vad_gap_extension'
-                ? 'Untranscribed audio exceeded the safe adjacency-only extension limit'
-                : segment.hold_reason === 'cue_template_unproven'
-                ? "This cue template hasn't cut a confirmed ad yet"
-                : segment.hold_reason === 'cue_low_confidence'
-                ? 'The cue match fell below the cut-confidence threshold'
-                : 'Held for manual review';
-              const holdLabel = segment.hold_reason === 'verification_miss'
-                ? 'Verification catch'
-                : segment.hold_reason === 'differential_uncorroborated'
-                ? 'Differential hold'
-                : segment.hold_reason === 'large_vad_gap_extension'
-                ? 'VAD extension limit'
-                : segment.hold_reason === 'cue_template_unproven'
-                ? 'Unproven cue'
-                : segment.hold_reason === 'cue_low_confidence'
-                ? 'Low-confidence cue'
+              const holdTitle = (segment.hold_reason && HOLD_REASON_TITLES[segment.hold_reason])
+                || 'Held for manual review';
+              const holdLabel = segment.hold_reason
+                ? HOLD_REASON_LABELS[segment.hold_reason]
                 : 'Held';
               const confirmStatus = rowSaveStatus(segment, 'confirm');
               const trimmedStatus = rowSaveStatus(segment, 'confirm-trimmed');
@@ -1630,6 +1622,7 @@ function EpisodeDetail() {
               const heldKey = `held-${segment.start}-${segment.end}`;
               const heldPlaying = markerAudition.playingKey === heldKey;
               const originalAd = toOriginalAd(segment);
+              const pass2Review = segment.pass2_hold_review;
               return (
                 <div
                   key={index}
@@ -1674,13 +1667,22 @@ function EpisodeDetail() {
                       >
                         {holdLabel}
                       </span>
+                      {segment.reviewer_verdict === 'inconclusive' && (
+                        <span
+                          className={`${badgeBase} font-medium ${tint.neutral}`}
+                          title={segment.reviewer_reasoning || 'Reviewer abstained; marker remains held'}
+                        >
+                          Reviewer abstained
+                        </span>
+                      )}
                       {(correction || segment.approved) && (
                         <span className={`${badgeBase} font-medium ${
                           segment.approved || correction?.correction_type === 'confirm'
                             ? tint.success
                             : tint.warning
                         }`}>
-                          {segment.approved || correction?.correction_type === 'confirm' ? 'Confirmed' : 'Not an ad'}
+                          {correction?.correction_type === 'confirm' ? correctionBadgeLabel(correction)
+                           : segment.approved ? 'Confirmed' : 'Not an ad'}
                         </span>
                       )}
                     </div>
@@ -1693,6 +1695,7 @@ function EpisodeDetail() {
                       {segment.validation.flags.join(', ')}
                     </p>
                   )}
+                  <CarvedFromHint segment={segment} />
                   {segment.reason && (
                     <p className="text-sm text-muted-foreground mt-1">
                       <span className="font-medium">Match:</span>{' '}
@@ -1701,11 +1704,22 @@ function EpisodeDetail() {
                   )}
                   {(segment.hold_reason === 'reviewer_contradiction'
                     || segment.hold_reason === 'reviewer_boundary_conflict'
-                    || segment.hold_reason === 'reviewer_reject_conflict')
+                    || segment.hold_reason === 'reviewer_inconclusive_bounds'
+                    || segment.hold_reason === 'reviewer_failed'
+                    || segment.hold_reason === 'reviewer_reject_conflict'
+                    || segment.reviewer_verdict === 'inconclusive')
                     && segment.reviewer_reasoning && (
                     <p className="text-sm text-muted-foreground mt-1">
                       <span className="font-medium">Reviewer:</span>{' '}
                       {segment.reviewer_reasoning}
+                    </p>
+                  )}
+                  {pass2Review && (
+                    <p className="text-sm text-muted-foreground mt-1">
+                      <span className="font-medium">
+                        Pass-2 review of {formatTimestamp(pass2Review.span[0])}-{formatTimestamp(pass2Review.span[1])}:
+                      </span>{' '}
+                      {pass2Review.verdict}. {pass2Review.reason}
                     </p>
                   )}
                   {!correction && !segment.approved && (
@@ -1888,7 +1902,7 @@ function EpisodeDetail() {
                                 ? tint.success
                                 : tint.warning
                             }`}>
-                              {correction.correction_type === 'confirm' ? 'Confirmed' : 'Not an ad'}
+                              {correctionBadgeLabel(correction)}
                             </span>
                           )}
                         </div>
@@ -1901,6 +1915,7 @@ function EpisodeDetail() {
                           {segment.validation.flags.join(', ')}
                         </p>
                       )}
+                      <CarvedFromHint segment={segment} />
                       {segment.reason && (
                         <ExpandableText
                           label="match"

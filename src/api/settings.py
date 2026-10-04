@@ -519,8 +519,7 @@ def _build_settings_payload():
     )
 
     def _tu(db_key):
-        # Reuse the already-loaded settings dict so we don't trigger 21 extra
-        # DB reads from get_stage_tunable's lazy import path.
+        # Reuse the loaded settings dict to avoid a DB read per tunable.
         return {
             'value': get_stage_tunable(db_key, settings=settings),
             'isDefault': _setting_is_default(settings, db_key),
@@ -528,29 +527,7 @@ def _build_settings_payload():
         }
 
     tunables_payload = {
-        'detectionTemperature':        _tu('detection_temperature'),
-        'detectionMaxTokens':          _tu('detection_max_tokens'),
-        'detectionReasoningBudget':    _tu('detection_reasoning_budget'),
-        'detectionReasoningLevel':     _tu('detection_reasoning_level'),
-        'verificationTemperature':     _tu('verification_temperature'),
-        'verificationMaxTokens':       _tu('verification_max_tokens'),
-        'verificationReasoningBudget': _tu('verification_reasoning_budget'),
-        'verificationReasoningLevel':  _tu('verification_reasoning_level'),
-        'reviewerTemperature':         _tu('reviewer_temperature'),
-        'reviewerMaxTokens':           _tu('reviewer_max_tokens'),
-        'reviewerReasoningBudget':     _tu('reviewer_reasoning_budget'),
-        'reviewerReasoningLevel':      _tu('reviewer_reasoning_level'),
-        'chapterBoundaryTemperature':  _tu('chapter_boundary_temperature'),
-        'chapterBoundaryMaxTokens':    _tu('chapter_boundary_max_tokens'),
-        'chapterBoundaryReasoningBudget': _tu('chapter_boundary_reasoning_budget'),
-        'chapterBoundaryReasoningLevel':  _tu('chapter_boundary_reasoning_level'),
-        'chapterTitleTemperature':     _tu('chapter_title_temperature'),
-        'chapterTitleMaxTokens':       _tu('chapter_title_max_tokens'),
-        'chapterTitleReasoningBudget': _tu('chapter_title_reasoning_budget'),
-        'chapterTitleReasoningLevel':  _tu('chapter_title_reasoning_level'),
-        'ollamaNumCtx':                _tu('ollama_num_ctx'),
-        'windowSizeSeconds':           _tu('window_size_seconds'),
-        'windowOverlapSeconds':        _tu('window_overlap_seconds'),
+        payload_key: _tu(db_key) for payload_key, db_key, _kind in STAGE_TUNABLE_PAYLOAD_KEYS
     }
 
     enable_ad_review_raw = _setting_value(
@@ -583,6 +560,8 @@ def _build_settings_payload():
     dai_differential_overrides_keep = coerce_bool_setting(_setting_value(
         settings, 'dai_differential_overrides_keep',
         registry_default('dai_differential_overrides_keep')))
+    splice_veto_enabled = coerce_bool_setting(_setting_value(
+        settings, 'splice_veto_enabled', registry_default('splice_veto_enabled')))
 
     ad_chapters_enabled = coerce_bool_setting(_str_setting('ad_chapters_enabled'))
     ad_chapter_categories = resolve_ad_chapter_categories_map(
@@ -797,6 +776,7 @@ def _build_settings_payload():
         'differentialHoldMinSeconds': _sv('differential_hold_min_seconds', differential_hold_min_seconds),
         'daiDifferentialOverridesKeep': _sv(
             'dai_differential_overrides_keep', dai_differential_overrides_keep),
+        'spliceVetoEnabled': _sv('splice_veto_enabled', splice_veto_enabled),
         'positionalPriorEnabled': _sv('positional_prior_enabled', positional_prior_enabled),
         'audioBitrate': _sv('audio_bitrate', audio_bitrate),
         'audioNormalizeEnabled': _sv('audio_normalize_enabled', audio_normalize_enabled),
@@ -1017,6 +997,8 @@ def _validate_processing_defaults_payload(data):
             return error_response('chaptersMode must be auto, generate, or off', 400)
     if 'skipSecondPass' in data and not isinstance(data['skipSecondPass'], bool):
         return error_response('skipSecondPass must be a boolean', 400)
+    if 'spliceVetoEnabled' in data and not isinstance(data['spliceVetoEnabled'], bool):
+        return error_response('spliceVetoEnabled must be a boolean', 400)
     if 'differentialFetchMode' in data:
         value = str(data['differentialFetchMode'] or '').strip().lower()
         if value not in ('auto', 'on', 'off'):
@@ -2416,6 +2398,11 @@ def _apply_positional_prior_fields(db, data):
         db.set_setting('dai_differential_overrides_keep',
                        'true' if enabled else 'false', is_default=False)
         logger.info(f"Updated dai_differential_overrides_keep to: {enabled}")
+
+    if 'spliceVetoEnabled' in data:
+        enabled = coerce_bool_setting(data['spliceVetoEnabled'])
+        db.set_setting('splice_veto_enabled', 'true' if enabled else 'false', is_default=False)
+        logger.info(f"Updated splice_veto_enabled to: {enabled}")
     return
 
 

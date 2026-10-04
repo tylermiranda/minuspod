@@ -2,6 +2,8 @@
 import math
 import re
 import logging
+from functools import lru_cache
+from itertools import pairwise
 from typing import ClassVar
 from dataclasses import dataclass, field
 from enum import Enum
@@ -12,35 +14,196 @@ from config import (
     REJECT_CONFIDENCE, HIGH_CONFIDENCE_OVERRIDE, PRE_ROLL, MID_ROLL_1,
     POST_ROLL, MAX_AD_PERCENTAGE, MAX_ADS_PER_5MIN,
     MERGE_GAP_THRESHOLD, MAX_SILENT_GAP,
+    SILENT_REMAINDER_MIN_COVERAGE,
     HOLD_REASON_MAX_DURATION, HOLD_REASON_NO_CUE,
-    HOLD_REASON_NO_SPLICE, VETO_MIN_CUT_SECONDS,
+    HOLD_REASON_NO_SPLICE, VETO_MIN_CUT_SECONDS, SPLICE_VETO_IDENTICAL_MIN_COVERAGE,
     HOLD_REASON_UNCORROBORATED_TAIL,
     HOLD_REASON_DIFFERENTIAL_UNCORROBORATED,
+    HOLD_REASON_ESTIMATED_PATTERN,
     SPLICE_CORROBORATION_WINDOW_SECONDS,
     CORRECTION_MATCH_MIN_COVERAGE,
     is_cue_backed, is_template_cue, AUDIO_CUE_ROLE_NON_AD,
     CUE_ONLY_SAFETY_HOLD_NEW, CUE_ONLY_SAFETY_AUTO_CUT,
     CUE_ONLY_AUTOCUT_CONFIDENCE,
     HOLD_REASON_CUE_TEMPLATE_UNPROVEN, HOLD_REASON_CUE_LOW_CONFIDENCE,
-    HOLD_REASON_LARGE_VAD_GAP,
-    MAX_ADJACENT_AUTO_EXTENSION_SECONDS,
-    normalize_segment_category, DEFAULT_SEGMENT_ACTION,
+    HOLD_REASON_LARGE_VAD_GAP, HOLD_REASON_NO_TRANSCRIPT_EVIDENCE,
+    EVIDENCE_GATE_DAI_CORE_MIN_COVERAGE, measured_evidence, repair_segment_category,
+    MAX_ADJACENT_AUTO_EXTENSION_SECONDS, MERGE_GAP_SECONDS, is_pending_review,
+    REVIEWER_REJECT_PRESERVED_FLAG,
 )
 from utils.markers import (
     carve_fragment,
+    ensure_hold_id,
     clip_dai_core_spans,
     clip_merge_spans,
+    COVERAGE_GAP_TOLERANCE,
+    covering_confirm,
+    EDGE_TOLERANCE,
     dai_core_bounds,
+    dai_core_spans,
+    drop_stale_reviewer_locks,
+    find_marker_in_list,
+    finite_number,
+    inherit_edge,
     invalidate_tail_provenance,
+    invalidate_quote_alignment,
+    invalidate_word_timed_edges,
     mark_distinct_merge,
+    measured_member_spans,
+    merge_runs,
     note_fold,
+    precise_edge,
+    recorded_member_spans,
+    reviewer_edge_locked,
+    reviewer_reject_stands,
+    SILENT_ABSORBED_SPANS,
+    learning_bounds,
+    subtract_spans,
+    union_cover,
 )
-from differential_fetcher import differential_region_overlapping
-from utils.constants import NON_SPONSOR_LINK_DOMAINS, is_brand_token
+from differential_fetcher import differential_region_overlapping, identical_coverage
+from community_export import brand_match_candidates
+from text_pattern_matcher import AD_TRANSITION_PHRASES, bounded_segment_texts
+from sponsor_context import (BARE_LINK_RE, BRAND_LINK_RE, COMMERCIAL_CONTEXT_RE, CTA_LINK_RE,
+                             SPONSOR_FRAMING_RE, SPONSOR_IS_SPONSOR_RE, SPONSOR_MIN_MENTIONS,
+                             SPONSOR_THANKS_RE, VANITY_LINK_RE, description_sponsor_re,
+                             framed_sponsor_names, framed_with_link_or_offer,
+                             local_commercial_context, names_vanity_link, registry_sponsor)
+from sponsor_normalize import SPONSOR_SUBSTRING_PATTERNS
+from sponsor_service import SponsorService
+from utils.constants import (AUDIO_ECHO_RE, is_brand_token, is_non_brand_name,
+                             mentions_advertising, squash_brand)
 from utils.text import extract_text_from_segments, word_boundary_re
 from utils.time import overlap_ratio
+from ad_detector.boundaries import effective_resolved_action
 
 logger = logging.getLogger(__name__)
+
+_SPONSOR_SEPARATOR_RE = re.compile(r'[,;/:]|\band\b', re.IGNORECASE)
+# A reason-derived "sponsor" headed by one of these is the audience, not an advertiser.
+_AUDIENCE_WORDS = frozenset({'patrons', 'patron', 'listeners', 'listener', 'members',
+                             'supporters', 'viewers', 'subscribers', 'you'})
+_AUDIENCE_PHRASES = frozenset({'the show', 'our sponsors'})
+
+# A held remainder is a new pending span: the hold's approval stamps and
+# correction bookkeeping describe the released part, not it.
+_REMAINDER_DROPPED_KEYS = (
+    '_confirmed_correction', '_has_confirmed_correction_candidate',
+    '_matches_false_positive_correction', '_saved_was_cut', 'pass2_corroborated',
+    'pass2_corroborated_span', 'pass2_hold_review', 'pass2_reviewed_release',
+    'pass2_released_spans',
+)
+
+
+@lru_cache(maxsize=512)
+def _sponsor_name_re(sponsor: str) -> re.Pattern | None:
+    """Whole-word matcher for one sponsor name, built once per name."""
+    return word_boundary_re((sponsor,))
+
+
+def user_trimmed_keep_ranges(corrections: list[dict]) -> list[dict]:
+    """Return saved trim exclusions after newer approvals take precedence."""
+    protected = []
+    newer_approvals = []
+    for correction in corrections:
+        # Pass-2 auto-approvals carry no user authority over excluded audio.
+        if correction.get('auto_filed'):
+            continue
+        start = finite_number(correction.get('start'))
+        end = finite_number(correction.get('end'))
+        span = correction.get('confirmed_span')
+        approved_start = finite_number(span.get('start')) if isinstance(span, dict) else None
+        approved_end = finite_number(span.get('end')) if isinstance(span, dict) else None
+        if start is None or end is None or end <= start:
+            continue
+        if approved_start is not None and approved_end is not None and approved_end > approved_start:
+            for lo, hi in ((start, min(end, approved_start)),
+                           (max(start, approved_end), end)):
+                pieces = subtract_spans([(lo, hi)] if hi > lo else [], newer_approvals)
+                protected.extend((a, b) for a, b in pieces)
+            newer_approvals.append((approved_start, approved_end))
+        else:
+            newer_approvals.append((start, end))
+    return [{'start': lo, 'end': hi} for lo, hi in merge_runs(protected)]
+
+
+def restore_uncovered_confirmed_spans(ads_to_remove, all_ads, confirmed, false_positives,
+                                      trim_ranges, episode_duration,
+                                      exclude_start_seconds=0.0):
+    """Cut user-confirmed audio that no surviving marker covers."""
+    claimed = [(ad['start'], ad['end']) for ad in ads_to_remove]
+    fp_spans = [(fp['start'], fp['end']) for fp in false_positives or []]
+    barriers = ([(r['start'], r['end']) for r in trim_ranges or []] + fp_spans
+                + [(m['start'], m['end']) for m in all_ads
+                   if m.get('action_applied') == 'keep'])
+    restored = []
+    for corr in confirmed or []:
+        # Restoring is a user-authority action; pass-2 auto-approvals do not qualify.
+        if corr.get('correction_type') != 'confirm' or corr.get('auto_filed'):
+            continue
+        span = corr.get('confirmed_span') or corr
+        span_start = max(0.0, span['start'])
+        span_end = (min(span['end'], episode_duration)
+                    if episode_duration > 0 else span['end'])
+        if span_end <= span_start:
+            continue
+        if any(overlap_ratio(start, end, span_start, span_end) >= CORRECTION_MATCH_MIN_COVERAGE
+               for start, end in fp_spans):
+            continue
+        for lo, hi in subtract_spans([(span_start, span_end)], claimed + barriers):
+            # The per-feed opening exclusion clips a saved confirm.
+            lo = max(lo, exclude_start_seconds)
+            if hi - lo < MERGE_GAP_SECONDS:
+                continue
+            validation = {
+                'decision': Decision.ACCEPT.value, 'adjusted_confidence': 1.0,
+                'user_confirmed': True, 'confirmed_span': {'start': lo, 'end': hi},
+                'flags': ['INFO: Restored user-confirmed span'],
+            }
+            marker = find_marker_in_list(all_ads, lo, hi)
+            if marker is not None:
+                prior = (marker.get('validation') or {}).get('decision')
+                if prior:
+                    validation['flags'].append(f"INFO: Restored over prior {prior}")
+                marker.pop('held_for_review', None)
+                marker.pop('hold_reason', None)
+                if (marker['start'], marker['end']) != (lo, hi):
+                    invalidate_tail_provenance(marker, hi)
+                    marker.update(start=lo, end=hi)
+                    invalidate_quote_alignment(marker)
+                    invalidate_word_timed_edges(marker)
+                # Stale wider evidence must not let a later clamp re-expand it.
+                clip_merge_spans(marker, lo, hi)
+            else:
+                marker = {'start': lo, 'end': hi, 'detection_stage': 'manual',
+                          'confidence': 1.0,
+                          'reason': 'User-confirmed ad restored (no surviving detection)'}
+                all_ads.append(marker)
+            marker.update(was_cut=True, _skip_pattern_learning=True, validation=validation)
+            restored.append(marker)
+            claimed.append((lo, hi))
+            overlapping = [m for m in all_ads if is_pending_review(m)
+                           and m['start'] < hi and m['end'] > lo]
+            # Approving a wider held marker must not re-confirm the restored audio.
+            carved = []
+            for held in overlapping:
+                if lo <= held['start'] and held['end'] <= hi:
+                    logger.info(
+                        f"Restored confirmed span {lo:.1f}s-{hi:.1f}s consumed held marker "
+                        f"{held['start']:.1f}s-{held['end']:.1f}s "
+                        f"(hold_reason={held.get('hold_reason')})")
+                carved.extend(carve_fragment(held, a, b) for a, b in
+                              subtract_spans([(held['start'], held['end'])], [(lo, hi)])
+                              if b - a >= MERGE_GAP_SECONDS)
+            if overlapping:
+                dropped = {id(m) for m in overlapping}
+                all_ads[:] = [m for m in all_ads if id(m) not in dropped] + carved
+            logger.info(
+                f"Restored confirmed span {lo:.1f}s-{hi:.1f}s (no surviving candidate)")
+    if not restored:
+        return ads_to_remove
+    all_ads.sort(key=lambda ad: ad['start'])
+    return sorted(ads_to_remove + restored, key=lambda ad: ad['start'])
 
 
 def _vad_gap_adjacency_extension_seconds(ad: dict) -> float:
@@ -54,12 +217,15 @@ def _adopt_later_marker_end(target: dict, source: dict) -> None:
     if source['end'] <= target['end']:
         return
     invalidate_tail_provenance(target, source['end'])
-    target['end'] = source['end']
+    inherit_edge(target, source, 'end')
+    invalidate_quote_alignment(target)
+    invalidate_word_timed_edges(target)
     if source.get('end_extended_by_content'):
         target['end_extended_by_content'] = True
     if source.get('tail_splice_snap') is not None:
         snap = source['tail_splice_snap']
         target['tail_splice_snap'] = dict(snap) if isinstance(snap, dict) else snap
+    drop_stale_reviewer_locks(target)
 
 
 class Decision(Enum):
@@ -79,6 +245,12 @@ class ValidationResult:
     corrections: list[str] = field(default_factory=list)
 
 
+def _covered_seconds(spans, lo: float, hi: float) -> float:
+    """Seconds of [lo, hi] the union of (start, end) spans covers."""
+    return sum(b - a for a, b in merge_runs(
+        (max(a, lo), min(b, hi)) for a, b in spans if min(b, hi) > max(a, lo)))
+
+
 class AdValidator:
     """Validates and corrects ad detection results.
 
@@ -96,16 +268,7 @@ class AdValidator:
     # POST_ROLL, MAX_AD_PERCENTAGE, MAX_ADS_PER_5MIN, MERGE_GAP_THRESHOLD
 
     # Sponsor patterns for verification
-    SPONSOR_PATTERNS = re.compile(
-        r'betterhelp|athletic\s*greens|ag1|squarespace|nordvpn|'
-        r'expressvpn|hellofresh|audible|masterclass|ziprecruiter|'
-        r'raycon|manscaped|stamps\.com|indeed|linkedin|'
-        r'casper|helix|brooklinen|bombas|calm|headspace|'
-        r'better\s*help|honey|simplisafe|wix|shopify|'
-        r'bluechew|roman|hims|keeps|factor|noom|'
-        r'magic\s*spoon|athletic\s*brewing|liquid\s*iv',
-        re.IGNORECASE
-    )
+    SPONSOR_PATTERNS = SPONSOR_SUBSTRING_PATTERNS
 
     AD_SIGNAL_PATTERNS = re.compile(
         r'promo\s*code|use\s+code\s+\w+|\.com\/\w+|'
@@ -117,6 +280,21 @@ class AdValidator:
         re.IGNORECASE
     )
 
+    # Sources that are evidence from the span itself, unlike the model's reason.
+    SPAN_CONFIRMATION_SOURCES = frozenset({'transcript', 'registry'})
+    # LLM-detected stages whose cut needs ad language in its own transcript (#807).
+    EVIDENCE_GATE_STAGES = frozenset({'claude', 'verification'})
+    # Patterns any one of which in the span transcript is ad language.
+    TRANSCRIPT_EVIDENCE_RES = (COMMERCIAL_CONTEXT_RE, SPONSOR_FRAMING_RE, SPONSOR_THANKS_RE,
+                               SPONSOR_IS_SPONSOR_RE, BRAND_LINK_RE, BARE_LINK_RE, CTA_LINK_RE,
+                               VANITY_LINK_RE)
+    # "thanks to" is chat as often as a credit; the framing patterns above already cover the others.
+    EVIDENCE_TRANSITION_PHRASES = tuple(
+        p for p in AD_TRANSITION_PHRASES
+        if p != 'thanks to' and 'brought to you by' not in p and 'sponsored by' not in p)
+    # Transcript-detected stages whose long cuts need audio evidence.
+    VETO_STAGES = ('claude', 'text_pattern')
+
     VAGUE_REASONS: ClassVar[list[str]] = [
         'advertisement', 'ad detected', 'sponsor', 'promotional content',
         'possible ad', 'likely ad', 'advertisement segment'
@@ -126,16 +304,18 @@ class AdValidator:
     # The second branch only matches "(show|episode|regular|actual) content" when
     # preceded by assertion verbs (is, appears to be, etc.) or at start-of-string.
     # This avoids false positives on phrases like "transition from show content".
+    # The "no"/"not" branches start at a word boundary: without it "Casino ad"
+    # and "Casino sponsorship" match "no ad" / "no sponsor".
     NOT_AD_PATTERNS = re.compile(
-        r'not\s+an?\s+(ad|advertisement|sponsor|promo|commercial)|'
+        r'\bnot\s+an?\s+(ad|advertisement|sponsor|promo|commercial)|'
         r'(?:^|(?:is|appears\s+to\s+be|seems\s+like|contains)\s+)(episode|show|regular|actual)\s+content|'
         r'this\s+is\s+(not|n\'t)\s+|'
         r'does\s+not\s+appear\s+to\s+be|'
-        r'no\s+(ad|advertisement|sponsor)|'
+        r'\bno\s+(ad|advertisement|sponsor)|'
         # The model also denies ad content in prose: "no promotional copy is
         # present in the transcript for this gap". A content noun is required
         # so a real read described as having "no promotional code" survives.
-        r'no\s+promotional\s+(?:copy|content|language|material|pitch)|'
+        r'\bno\s+promotional\s+(?:copy|content|language|material|pitch)|'
         r'false\s+positive',
         re.IGNORECASE
     )
@@ -161,7 +341,8 @@ class AdValidator:
                  differential_corr_max: float = 0.60,
                  sponsor_service=None,
                  max_ad_duration: float = MAX_AD_DURATION,
-                 max_ad_duration_confirmed: float = MAX_AD_DURATION_CONFIRMED):
+                 max_ad_duration_confirmed: float = MAX_AD_DURATION_CONFIRMED,
+                 podcast_name: str = None):
         """Initialize validator.
 
         Args:
@@ -193,13 +374,12 @@ class AdValidator:
             max_ad_duration_confirmed: Length above which even a confirmed
                 sponsor does not help.
         """
+        self.podcast_name = podcast_name
+        self._show_key = squash_brand(podcast_name or '')
         self.episode_duration = episode_duration
         self.segments = segments or []
         self.episode_description = episode_description or ""
-        self.description_sponsors = self._extract_sponsors_from_description()
-        # One alternation for the whole set: _is_sponsor_confirmed otherwise
-        # recompiled a regex per sponsor per ad.
-        self._description_sponsor_re = word_boundary_re(self.description_sponsors)
+        self._description_sponsor_re = description_sponsor_re(self.episode_description)
         self.false_positive_corrections = false_positive_corrections or []
         self.confirmed_corrections = confirmed_corrections or []
         self.min_cut_confidence = min_cut_confidence
@@ -222,6 +402,7 @@ class AdValidator:
         self.max_ad_duration = min(max_ad_duration, max_ad_duration_confirmed)
         self.max_ad_duration_confirmed = max_ad_duration_confirmed
         self._audio_analysis = None
+        self._variant_index = None
 
         if self.false_positive_corrections:
             logger.info(f"Loaded {len(self.false_positive_corrections)} false positive corrections")
@@ -231,95 +412,140 @@ class AdValidator:
             logger.info(f"Using learned positional prior: "
                         f"{len(self.positional_prior.zones)} zones")
 
-    def _extract_sponsors_from_description(self) -> set:
-        """Extract sponsor names from episode description.
-
-        Looks for sponsors in:
-        - <strong>Sponsors:</strong> sections with <a href="..."> links
-        - URL patterns like domain.com/code
-        - Known sponsor patterns
-
-        Returns:
-            Set of lowercase sponsor names
-        """
-        sponsors = set()
-        if not self.episode_description:
-            return sponsors
-
-        description = self.episode_description.lower()
-
-        # Extract domains from href URLs (e.g., "bitwarden.com/twit" -> "bitwarden")
-        href_pattern = re.compile(r'href=["\']?(?:https?://)?(?:www\.)?([a-z0-9-]+)\.(?:com|io|co|net|org)', re.IGNORECASE)
-        for match in href_pattern.finditer(self.episode_description):
-            domain = match.group(1).lower()
-            # A description links to its host, its apps, and its socials next
-            # to its sponsors, and a short outlet token matches normal speech.
-            if domain in NON_SPONSOR_LINK_DOMAINS or not is_brand_token(domain):
-                continue
-            sponsors.add(domain)
-
-        # Check for known sponsor patterns in description text. Both the
-        # spoken form and the squashed one are kept, so "liquid iv" confirms
-        # against a transcript however the brand is written.
-        for match in self.SPONSOR_PATTERNS.finditer(description):
-            sponsor = match.group(0).lower()
-            sponsors.add(sponsor)
-            sponsors.add(sponsor.replace(' ', ''))
-
-        if sponsors:
-            logger.info(f"Extracted sponsors from description: {sponsors}")
-
-        return sponsors
-
-    def _registry_confirms(self, ad: dict) -> bool:
+    def _registry_confirms(self, ad: dict, texts: list[str]) -> bool:
         """Whether the ad's own audio names a sponsor from the registry.
 
-        The transcript is the evidence, not the model's reason. One brand must
-        be named twice: a passing mention of two unrelated brands inside a span
-        of several minutes is conversation, not a read.
+        A repeated name confirms only the marker's advertiser, and only when
+        the same candidate also contains promotional language.
         """
         if not self.sponsor_service:
             return False
-        ad_text = self._get_text_in_range(ad['start'], ad['end'])
+        ad_text = ' '.join(texts)
         if not ad_text:
             return False
         try:
-            offsets = self.sponsor_service.brand_mention_offsets(ad_text)
+            found, mentions, confirmed = registry_sponsor(
+                self.sponsor_service, texts, names_sponsor=self._names_sponsor,
+                matches_expected=self._matches_expected_sponsor, expected=ad.get('sponsor'))
         except Exception as e:
             logger.debug(f"Sponsor registry lookup failed: {e}")
             return False
-        if not offsets:
+        if found is None:
             return False
-        found = max(offsets, key=lambda name: (len(offsets[name]),
-                                               -offsets[name][0]))
-        mentions = len(offsets[found])
-        if mentions < 2:
+        if mentions < SPONSOR_MIN_MENTIONS:
             logger.info(
                 f"No registry sponsor named twice in "
-                f"{ad['start']:.1f}s-{ad['end']:.1f}s ({len(offsets)} named once); "
-                f"not treating as confirmed")
+                f"{ad['start']:.1f}s-{ad['end']:.1f}s; not treating as confirmed")
+            return False
+        if not confirmed:
+            logger.info(
+                f"Registry sponsor '{found}' repeated without commercial "
+                f"language in {ad['start']:.1f}s-{ad['end']:.1f}s")
             return False
         logger.info(
             f"Registry sponsor '{found}' named {mentions}x in the ad audio "
             f"({ad['start']:.1f}s-{ad['end']:.1f}s); treating as confirmed")
         return True
 
+    def _sponsor_variant_index(self) -> dict[str, list[set[str]]]:
+        """Squashed name or alias to the variant sets of the registry rows carrying it."""
+        if self._variant_index is None:
+            index = {}
+            for sponsor in self.sponsor_service.get_sponsors():
+                variants = {squash_brand(name) for name in brand_match_candidates(sponsor)}
+                for variant in variants:
+                    index.setdefault(variant, []).append(variants)
+            self._variant_index = index
+        return self._variant_index
+
+    def _matches_expected_sponsor(self, found: str, expected: str) -> bool:
+        labels = {squash_brand(part) for part in _SPONSOR_SEPARATOR_RE.split(expected)}
+        if squash_brand(found) in labels:
+            return True
+        if not self.sponsor_service or not hasattr(self.sponsor_service, 'get_sponsors'):
+            return False
+        return any(labels & variants
+                   for variants in self._sponsor_variant_index().get(squash_brand(found), ()))
+
+    def _named_sponsors(self, ad: dict) -> tuple[list[str], bool]:
+        """(names, from_reason): the detection's sponsor field, else names its reason frames or labels."""
+        def usable(names):
+            return [name for name in names if name and not is_non_brand_name(name)
+                    and is_brand_token(squash_brand(name))]
+        field = usable(part.strip() for part in _SPONSOR_SEPARATOR_RE.split(ad.get('sponsor') or ''))
+        if field:
+            return field, False
+        reason = ad.get('reason')
+        names = (usable(framed_sponsor_names(reason))
+                 or usable((SponsorService.extract_sponsor_from_reason(reason),)))
+        return [name for name in names if not self._is_audience_or_show(name)], True
+
+    def _is_audience_or_show(self, name: str) -> bool:
+        key = ' '.join(name.lower().split())
+        words = key.split()
+        if key in _AUDIENCE_PHRASES or words[0] in _AUDIENCE_WORDS or words[-1] in _AUDIENCE_WORDS:
+            return True
+        show = self._show_key
+        squashed = squash_brand(name)
+        if not show or not squashed:
+            return False
+        # A long name the show title starts with is a truncated title; one brand word is not.
+        return (show in squashed
+                or (len(words) >= 3 and show.startswith(squashed)))
+
+    def _bounded_text_segments(self, ad: dict) -> list[str]:
+        return bounded_segment_texts(self.segments, ad['start'], ad['end'])
+
+    def _names_sponsor(self, text: str, sponsor: str) -> bool:
+        name_re = _sponsor_name_re(sponsor)
+        if name_re and name_re.search(text):
+            return True
+        if self.sponsor_service:
+            try:
+                return self.sponsor_service.mentions_brand(text, sponsor)
+            except Exception as e:
+                logger.debug(f"Sponsor registry lookup failed: {e}")
+        return False
+
     def _sponsor_confirmation_source(self, ad: dict) -> str | None:
         """Where the ad's sponsor was confirmed: 'transcript' (a description
-        sponsor is spoken in the span), 'registry' (see _registry_confirms),
-        'reason' (only the detection model's own prose names it), or None.
+        sponsor or one the detection named is advertised in the span),
+        'registry' (see _registry_confirms), 'reason' (only the detection
+        model's own prose names it), or None.
         Prose is checked last: it is the one source the model wrote itself.
         """
+        texts = self._bounded_text_segments(ad)
         if self._description_sponsor_re is not None:
-            named = self._description_sponsor_re.search(
-                self._get_text_in_range(ad['start'], ad['end']))
-            if named:
+            named = self._description_sponsor_re.search(' '.join(texts))
+            if (named and (not ad.get('sponsor') or self._matches_expected_sponsor(
+                    named.group(0), ad['sponsor']))
+                    and local_commercial_context(
+                        texts, named.group(0), names_sponsor=self._names_sponsor,
+                        matches_expected=self._matches_expected_sponsor)):
                 logger.info(f"Sponsor '{named.group(0)}' found in ad transcript, "
                             f"confirmed in description")
                 return 'transcript'
 
-        if self._registry_confirms(ad):
+        if self._registry_confirms(ad, texts):
             return 'registry'
+
+        # A brand the detection named, advertised in the span, even when no registry row knows it.
+        names, from_reason = self._named_sponsors(ad)
+        for name in names:
+            # Model prose is weaker than its label: the span must frame the name and read a link or offer.
+            if from_reason:
+                advertised = framed_with_link_or_offer(
+                    texts, name, names_sponsor=self._names_sponsor,
+                    matches_expected=self._matches_expected_sponsor)
+            else:
+                advertised = (local_commercial_context(
+                    texts, name, names_sponsor=self._names_sponsor,
+                    matches_expected=self._matches_expected_sponsor)
+                    or (names_vanity_link(texts, name)
+                        and self._names_sponsor(' '.join(texts), name)))
+            if advertised:
+                logger.info(f"Sponsor '{name}' named by the detection is advertised in the span")
+                return 'transcript'
 
         if self._description_sponsor_re is not None:
             named = self._description_sponsor_re.search(ad.get('reason', ''))
@@ -329,11 +555,6 @@ class AdValidator:
                 return 'reason'
 
         return None
-
-    def _is_sponsor_confirmed(self, ad: dict) -> bool:
-        """Whether the ad names a confirmed sponsor at all; the duration
-        allowance takes any source, including the model's own reason."""
-        return self._sponsor_confirmation_source(ad) is not None
 
     def _overlaps_corrections(self, corrections: list[dict], start: float, end: float,
                                overlap_threshold: float = CORRECTION_MATCH_MIN_COVERAGE) -> bool:
@@ -370,36 +591,12 @@ class AdValidator:
         """Check if a time range overlaps with any user-marked false positive."""
         return self._overlaps_corrections(self.false_positive_corrections, start, end, overlap_threshold)
 
-    def _overlaps_confirmed(self, start: float, end: float,
-                            overlap_threshold: float = CORRECTION_MATCH_MIN_COVERAGE) -> bool:
-        """Check if a time range overlaps with any user-confirmed correction."""
-        return self._overlaps_corrections(self.confirmed_corrections, start, end, overlap_threshold)
-
     def _matching_confirmed(self, start: float, end: float,
-                            overlap_threshold: float = CORRECTION_MATCH_MIN_COVERAGE) -> dict | None:
-        """Return a user-confirmed correction covering >= threshold of the
-        range, or None. Mirrors _overlaps_confirmed but yields the match so
-        the caller can honor an exact ``confirmed_span``. Corrections arrive
-        newest first, so the latest overlapping user decision is authoritative.
-        """
-        segment_duration = end - start
-        if segment_duration < 0.001:
-            return None
-        for corr in self.confirmed_corrections:
-            confirmed_span = corr.get('confirmed_span')
-            matches_original = (
-                overlap_ratio(corr['start'], corr['end'], start, end)
-                >= overlap_threshold
-            )
-            matches_approved = (
-                confirmed_span
-                and overlap_ratio(
-                    confirmed_span['start'], confirmed_span['end'], start, end)
-                >= overlap_threshold
-            )
-            if matches_original or matches_approved:
-                return corr
-        return None
+                            skip_auto_filed: bool = False) -> dict | None:
+        """Newest confirm covering the range, so callers can honor its confirmed_span."""
+        return covering_confirm(
+            start, end, self.confirmed_corrections,
+            where=(lambda c: not c.get('auto_filed')) if skip_auto_filed else None)
 
     def validate(self, ads: list[dict],
                  audio_analysis: dict | None = None,
@@ -420,6 +617,8 @@ class AdValidator:
             ValidationResult with validated ads and statistics
         """
         self._audio_analysis = audio_analysis
+        # Rebuilt per run so a registry edit between runs is seen.
+        self._variant_index = None
 
         if not ads:
             return ValidationResult(ads=[])
@@ -430,6 +629,36 @@ class AdValidator:
         # this staying shallow: _validate_verification_ads attaches an
         # _orig_twin reference that must survive into the validated output.
         ads = [ad.copy() for ad in ads]
+        for ad in ads:
+            ad.pop('_user_kept_by_trim', None)
+            # Stamped before the trim split so carved fragments inherit it.
+            if reviewer_reject_stands(ad, self.confirmed_corrections):
+                ad['_reviewer_rejected'] = True
+        self._trim_ranges = user_trimmed_keep_ranges(self.confirmed_corrections)
+        for protected in self._trim_ranges:
+            split_ads = []
+            for ad in ads:
+                lo = max(ad['start'], protected['start'])
+                hi = min(ad['end'], protected['end'])
+                if hi <= lo:
+                    split_ads.append(ad)
+                    continue
+                matched = self._matching_confirmed(ad['start'], ad['end'])
+                if matched is not None and matched.get('confirmed_span'):
+                    split_ads.append(ad)
+                    continue
+                if ad['start'] < lo:
+                    split_ads.append(carve_fragment(ad, ad['start'], lo))
+                kept = carve_fragment(ad, lo, hi)
+                kept['_user_kept_by_trim'] = True
+                kept['_skip_pattern_learning'] = True
+                kept.pop('_measured_split_fragment', None)
+                split_ads.append(kept)
+                if hi < ad['end']:
+                    split_ads.append(carve_fragment(ad, hi, ad['end']))
+            ads = split_ads
+
+        ads = self._split_multi_release_holds(ads)
 
         # Human false-positive decisions apply to the detected span the user
         # actually reviewed. Preserve that match before measured DAI bounds
@@ -437,19 +666,36 @@ class AdValidator:
         # non-matching markers separate so a nearby real ad is not rejected
         # as collateral damage during the tiny-gap merge below.
         confirmed_candidates = {}
+        plain_candidates = {}
         for ad in ads:
             ad['_matches_false_positive_correction'] = (
                 self._overlaps_false_positive(ad['start'], ad['end']))
-            confirmed = self._matching_confirmed(ad['start'], ad['end'])
+            pinned = ad.pop('_pinned_release_confirm', None)
+            if ad.get('_user_kept_by_trim'):
+                continue
+            # An auto-filed confirm never outranks a standing reviewer reject.
+            confirmed = (pinned if pinned is not None and not ad.get('_reviewer_rejected')
+                         else self._matching_confirmed(
+                             ad['start'], ad['end'],
+                             skip_auto_filed=ad.get('_reviewer_rejected', False)))
             if confirmed is None:
                 continue
             span = confirmed.get('confirmed_span')
+            plain_key = None
             if span is None:
-                # A plain confirmation names no exact sub-span, so there is
-                # nothing to deduplicate against: every matching fragment
-                # keeps its own auto-accept, as before span-bearing dedup.
-                ad['_confirmed_correction'] = confirmed
-                continue
+                if (confirmed.get('correction_type') != 'boundary_adjustment'
+                        and not ad['_matches_false_positive_correction']):
+                    start = max(ad['start'], confirmed['start'])
+                    end = min(ad['end'], confirmed['end'])
+                    if end > start:
+                        plain_key = id(confirmed)
+                        confirmed = dict(confirmed, confirmed_span={
+                            'start': start, 'end': end})
+                        span = confirmed['confirmed_span']
+                if span is None:
+                    # Multiple in-bounds fragments can share a plain approval.
+                    ad['_confirmed_correction'] = confirmed
+                    continue
             if not (ad['start'] < span['end']
                     and ad['end'] > span['start']):
                 # Fragment lies wholly in trimmed-out (user-kept) content:
@@ -476,17 +722,43 @@ class AdValidator:
                 restored_end = min(restored_end, self.episode_duration)
             if self._overlaps_false_positive(restored_start, restored_end):
                 continue
+            if plain_key is not None:
+                plain_candidates.setdefault(plain_key, []).append((confirmed, ad))
+                continue
             existing = confirmed_candidates.get(id(confirmed))
             if (existing is None
                     or (ad['start'], ad['end']) < (
                         existing[1]['start'], existing[1]['end'])):
                 confirmed_candidates[id(confirmed)] = (confirmed, ad)
 
-        for confirmed, ad in confirmed_candidates.values():
+        selected_candidates = list(confirmed_candidates.values())
+        plain_sources = []
+        extra_approved_ads = []
+        for candidates in plain_candidates.values():
+            selected = []
+            for confirmed, ad in sorted(candidates, key=lambda pair: pair[1]['start']):
+                plain_sources.append((confirmed, ad))
+                span = confirmed['confirmed_span']
+                available = subtract_spans([(span['start'], span['end'])],
+                                           [(prior['start'], prior['end']) for prior in selected])
+                if available == [(span['start'], span['end'])]:
+                    selected.append(span)
+                    selected_candidates.append((confirmed, ad))
+                    continue
+                for lo, hi in available:
+                    fragment = carve_fragment(ad, lo, hi)
+                    fragment['_has_confirmed_correction_candidate'] = True
+                    narrowed = dict(confirmed, confirmed_span={
+                        'start': lo, 'end': hi})
+                    selected.append(narrowed['confirmed_span'])
+                    selected_candidates.append((narrowed, fragment))
+                    extra_approved_ads.append(fragment)
+
+        for confirmed, ad in selected_candidates:
             ad['_confirmed_correction'] = confirmed
 
         residue_ads = []
-        for confirmed, ad in confirmed_candidates.values():
+        for confirmed, ad in list(confirmed_candidates.values()) + plain_sources:
             if confirmed.get('confirmed_span') is None or '_orig_twin' in ad:
                 continue
             # The clamp below discards audio outside the approved span. The
@@ -497,20 +769,32 @@ class AdValidator:
             span = confirmed['confirmed_span']
             seen_start = min(confirmed['start'], span['start'])
             seen_end = max(confirmed['end'], span['end'])
+            reason = ad.get('hold_reason') or confirmed.get('hold_reason')
+            if confirmed.get('auto_filed') and reason:
+                residue_ads.extend(self._held_remainders(
+                    ad, span, seen_start, seen_end, reason))
             for lo, hi in ((ad['start'], seen_start),
                            (seen_end, ad['end'])):
-                if hi - lo < MIN_AD_DURATION:
+                if hi <= lo:
                     continue
-                residue = carve_fragment(ad, lo, hi)
+                if hi - lo < MIN_AD_DURATION:
+                    logger.info(
+                        f"Dropping {lo:.1f}s-{hi:.1f}s beyond a confirmed span: "
+                        f"too short to validate on its own")
+                    continue
+                # Clipped members let the estimated-remainder split judge it.
+                residue = self._narrowed(
+                    ad, lo, hi, keep_members=self._has_estimated_edge(ad))
                 for key in ('_confirmed_correction',
                             '_has_confirmed_correction_candidate',
                             '_matches_false_positive_correction'):
                     residue.pop(key, None)
                 residue['reason'] = (
                     f"{ad.get('reason', 'ad')} (beyond reviewed bounds)")
+                residue['_skip_pattern_learning'] = True
                 residue_ads.append(residue)
-        if residue_ads:
-            ads.extend(residue_ads)
+        if residue_ads or extra_approved_ads:
+            ads.extend(residue_ads + extra_approved_ads)
             ads.sort(key=lambda a: a['start'])
 
         for ad in ads:
@@ -539,18 +823,30 @@ class AdValidator:
         # Step 3.5: Extend trailing ad to end of episode if close
         ads = self._extend_trailing_ad(ads, result)
 
-        # Step 4: Validate each ad
-        for ad in ads:
-            validated = self._validate_ad(ad)
+        # Step 3.6: Cut measured audio, hold only an estimated remainder
+        ads = self._split_estimated_remainders(ads, result)
+
+        # Step 4: Validate each ad; silent remainders join only an accepted measured cut
+        pending = list(ads)
+        while pending:
+            validated = self._validate_ad(pending.pop(0))
+            if validated.get('_reviewer_rejected'):
+                self._preserve_reviewer_reject(validated)
             result.ads.append(validated)
 
             decision = validated.get('validation', {}).get('decision', 'REVIEW')
+            silent = validated.pop('_silent_absorbed', None)
+            if silent and decision == Decision.ACCEPT.value:
+                self._absorb_silent_remainders(validated, silent)
+            elif silent:
+                pending[:0] = silent
             if decision == Decision.ACCEPT.value:
                 result.accepted += 1
             elif decision == Decision.REVIEW.value:
                 result.reviewed += 1
             else:
                 result.rejected += 1
+        result.ads.sort(key=lambda a: a['start'])
 
         # Step 5: Check overall density
         self._check_ad_density(result)
@@ -568,6 +864,20 @@ class AdValidator:
 
         return result
 
+    @staticmethod
+    def _preserve_reviewer_reject(ad: dict) -> None:
+        """Force a standing reviewer reject to an uncut REJECT."""
+        ad.pop('_saved_was_cut', None)
+        ad.pop('held_for_review', None)
+        ad.pop('hold_reason', None)
+        validation = ad.setdefault('validation', {})
+        validation['decision'] = Decision.REJECT.value
+        validation.pop('user_confirmed', None)
+        validation.pop('confirmed_span', None)
+        flags = validation.setdefault('flags', [])
+        if REVIEWER_REJECT_PRESERVED_FLAG not in flags:
+            flags.append(REVIEWER_REJECT_PRESERVED_FLAG)
+
     def _validate_ad(self, ad: dict) -> dict:
         """Validate a single ad marker.
 
@@ -582,12 +892,13 @@ class AdValidator:
         confidence = ad.get('confidence', 1.0)
 
         # Pop stale held/corroboration state -- re-derived on every pass.
+        remainder_reason = (ad.get('hold_reason') if ad.get('pass2_hold_remainder')
+                            else None)
         ad.pop('held_for_review', None)
         ad.pop('hold_reason', None)
         ad.pop('corroborated_by', None)
 
-        duration = ad['end'] - ad['start']
-        position = ad['start'] / self.episode_duration if self.episode_duration > 0 else 0
+        duration, position = self._measured_extent(ad)
 
         # Check for user-marked false positives first (highest priority).
         # The internal flag records a match before DAI-core restoration; pop
@@ -599,6 +910,15 @@ class AdValidator:
         confirmed = ad.pop('_confirmed_correction', None)
         duplicate_confirmed = ad.pop(
             '_has_confirmed_correction_candidate', False) and confirmed is None
+        if ad.get('_user_kept_by_trim'):
+            ad['validation'] = {
+                'decision': Decision.REJECT.value,
+                'adjusted_confidence': 0.0,
+                'original_confidence': ad.get('confidence', 1.0),
+                'flags': ['INFO: User excluded from ad boundary'],
+                'corrections': corrections,
+            }
+            return ad
         if (matched_false_positive
                 or self._overlaps_false_positive(ad['start'], ad['end'])):
             flags.append("INFO: User marked as false positive")
@@ -629,7 +949,9 @@ class AdValidator:
 
         # Check for user-confirmed corrections (second priority)
         confirmed = (pre_restore_confirmed or confirmed
-                     or self._matching_confirmed(ad['start'], ad['end']))
+                     or self._matching_confirmed(
+                         ad['start'], ad['end'],
+                         skip_auto_filed=ad.get('_reviewer_rejected', False)))
         if confirmed is not None:
             # A trimmed approval confirms exactly one sub-span as ad. A later
             # detection can be wider, but that must neither authorize the new
@@ -660,14 +982,14 @@ class AdValidator:
                     # have been clipped to the wider detected bounds earlier;
                     # keep it inside the approved span so the reviewer cannot
                     # later widen the marker back into user-kept content.
-                    clip_dai_core_spans(ad, approved_start, approved_end)
                     clip_merge_spans(ad, approved_start, approved_end)
             if auto_accept:
                 approved = span or confirmed
-                tolerance = 0.01
+                # Allow drift below the displayed precision, then clamp to approved bounds.
+                tolerance = EDGE_TOLERANCE
                 fully_authorized = (
-                    ad['start'] >= approved['start'] - tolerance
-                    and ad['end'] <= approved['end'] + tolerance
+                    ad['start'] >= approved['start'] - tolerance - 1e-9
+                    and ad['end'] <= approved['end'] + tolerance + 1e-9
                 )
                 if not fully_authorized:
                     # A new detection may extend beyond the confirmed ad even
@@ -677,6 +999,14 @@ class AdValidator:
                     flags.append(
                         "INFO: User confirmation covers only part of segment")
             if auto_accept:
+                approved_start = max(0.0, approved['start'])
+                approved_end = approved['end']
+                if self.episode_duration > 0:
+                    approved_end = min(approved_end, self.episode_duration)
+                ad['start'] = max(ad['start'], approved_start)
+                ad['end'] = min(ad['end'], approved_end)
+                invalidate_tail_provenance(ad, ad['end'])
+                clip_merge_spans(ad, ad['start'], ad['end'])
                 flags.append("INFO: User confirmed as ad")
                 logger.info(
                     f"Auto-accepting segment {ad['start']:.1f}s-{ad['end']:.1f}s: "
@@ -696,21 +1026,15 @@ class AdValidator:
                     # loop: its stored bounds can go stale on a DAI feed
                     # whose ad timing drifts between fetches.
                     validation['user_confirmed'] = True
-                if span:
-                    # Carry the exact approved bounds through late reviewer
-                    # and tail mutations. Re-matching against a marker after
-                    # it has grown can fall below the correction overlap
-                    # threshold and lose the user's trim.
-                    validation['confirmed_span'] = {
-                        'start': approved_start,
-                        'end': approved_end,
-                    }
+                # Carry the exact approved bounds through late reviewer and
+                # tail mutations, including plain confirmations.
+                validation['confirmed_span'] = {
+                    'start': approved_start if span else ad['start'],
+                    'end': approved_end if span else ad['end'],
+                }
                 ad['validation'] = validation
                 return ad
-            duration = ad['end'] - ad['start']
-            position = (
-                ad['start'] / self.episode_duration
-                if self.episode_duration > 0 else 0)
+            duration, position = self._measured_extent(ad)
 
         # Duration checks
         if duration < MIN_AD_DURATION:
@@ -750,8 +1074,21 @@ class AdValidator:
         # Make decision based on adjusted confidence and flags
         decision = self._make_decision(confidence, flags, duration)
 
+        # Measured on every long transcript-detected cut, held or not, so calibration sees them all.
+        long_llm = (decision == Decision.ACCEPT and duration >= self.veto_min_cut_seconds
+                    and ad.get('detection_stage') in self.VETO_STAGES
+                    and isinstance((self._audio_analysis or {}).get('splice_evidence'), dict))
+        corroboration = self._audio_corroboration_source(ad) if long_llm else None
+
         # Apply per-feed hold rules after the base decision.
-        decision = self._apply_hold_rules(ad, decision, confidence, flags, duration)
+        decision = self._apply_hold_rules(ad, decision, confidence, flags, duration,
+                                          confirmation_source, corroboration)
+        # Only a human decides what an auto-approval left of a hold.
+        if remainder_reason and decision != Decision.REJECT:
+            if not ad.get('held_for_review'):
+                self._mark_held(ad, flags, remainder_reason)
+            ad['hold_reason'] = remainder_reason
+            decision = Decision.REVIEW
 
         ad['validation'] = {
             'decision': decision.value,
@@ -762,8 +1099,10 @@ class AdValidator:
             # Read by the reviewer's reject floor: evidence only when the
             # transcript or the registry named the sponsor. The detection
             # model's own reason is not evidence against that same model.
-            'sponsor_confirmed': confirmation_source in ('transcript', 'registry'),
+            'sponsor_confirmed': confirmation_source in self.SPAN_CONFIRMATION_SOURCES,
         }
+        if long_llm:
+            ad['validation']['audio_corroboration'] = corroboration or 'none'
 
         return ad
 
@@ -849,7 +1188,7 @@ class AdValidator:
         """
         if not self.segments:
             # No segments: check vad_gap corroboration early. Untranscribed
-            # audio can never show transcript signals (TWiT 1091 catch-22).
+            # audio can never show transcript signals (catch-22).
             if ad.get('detection_stage') == 'vad_gap':
                 source = self._audio_corroboration_source(ad)
                 if source is not None:
@@ -908,9 +1247,16 @@ class AdValidator:
 
     def _splice_calibrated(self) -> bool:
         """True when this feed's splice calibration status is 'calibrated'
-        (spec 2.3c); cold-start feeds corroborate but never veto."""
+        (spec 2.3c); cold-start and host_read feeds corroborate but never veto."""
         payload = (self._audio_analysis or {}).get('splice_evidence') or {}
         return payload.get('calibration', {}).get('status') == 'calibrated'
+
+    def _cross_fetch_identical_coverage(self, ad: dict) -> float:
+        """Identical coverage of the ad on a no_differential cross-fetch, else 0.0."""
+        payload = (self._audio_analysis or {}).get('dai_differential')
+        if not isinstance(payload, dict) or payload.get('status') != 'no_differential':
+            return 0.0
+        return identical_coverage(payload, ad['start'], ad['end'])
 
     def _audio_corroboration_source(self, ad: dict) -> str | None:
         """Return the strongest stored-audio evidence source near the ad's
@@ -1026,7 +1372,9 @@ class AdValidator:
             return Decision.REVIEW
 
     def _apply_hold_rules(self, ad: dict, decision: Decision, confidence: float,
-                          flags: list[str], duration: float) -> Decision:
+                          flags: list[str], duration: float,
+                          confirmation_source: str | None,
+                          corroboration: str | None) -> Decision:
         """Apply per-feed hold rules after the base decision.
 
         A held ad gets decision=REVIEW with held_for_review=True so the gate
@@ -1039,6 +1387,11 @@ class AdValidator:
         if (ad.get('detection_stage') == 'vad_gap'
                 and ad.get('vad_gap_requires_review')):
             self._mark_held(ad, flags, HOLD_REASON_LARGE_VAD_GAP)
+            return Decision.REVIEW
+
+        if (decision != Decision.REJECT
+                and self._estimated_pattern_needs_hold(ad)):
+            self._mark_held(ad, flags, HOLD_REASON_ESTIMATED_PATTERN)
             return Decision.REVIEW
 
         # Rule 1a: per-feed cap holds an ad that would otherwise be cut.
@@ -1065,6 +1418,19 @@ class AdValidator:
                 and ad.get('detection_stage') == 'dai_differential'
                 and ad.get('differential_uncorroborated')):
             self._mark_held(ad, flags, HOLD_REASON_DIFFERENTIAL_UNCORROBORATED)
+            return Decision.REVIEW
+
+        # Rule 7: an uncategorised or audio-only LLM span needs ad language in its transcript; skipped
+        # without a transcript. Ordered before the cue gate and splice veto so the hold names the real fault.
+        if (decision == Decision.ACCEPT and self.segments
+                and ad.get('detection_stage') in self.EVIDENCE_GATE_STAGES
+                and confirmation_source not in self.SPAN_CONFIRMATION_SOURCES
+                and self._evidence_gate_triggered(ad)
+                and not self._has_transcript_ad_evidence(ad)
+                and not self._evidence_gate_exempt(ad)):
+            logger.info(f"Holding {ad['start']:.1f}-{ad['end']:.1f}s: no ad language in the span "
+                        f"transcript (category={ad.get('category')}, reason={(ad.get('reason') or '')[:80]!r})")
+            self._mark_held(ad, flags, HOLD_REASON_NO_TRANSCRIPT_EVIDENCE)
             return Decision.REVIEW
 
         # Rule 2: cue-gated approval. Only applies to ACCEPT after rule 1.
@@ -1099,11 +1465,23 @@ class AdValidator:
         # only: cold-start evidence corroborates but never vetoes.
         if (self.splice_veto_enabled and decision == Decision.ACCEPT
                 and duration >= self.veto_min_cut_seconds
-                and ad.get('detection_stage') in ('claude', 'text_pattern')
+                and ad.get('detection_stage') in self.VETO_STAGES
                 and self._splice_calibrated()
-                and self._audio_corroboration_source(ad) is None):
-            self._mark_held(ad, flags, HOLD_REASON_NO_SPLICE)
-            return Decision.REVIEW
+                and corroboration is None):
+            # A sponsor the span itself names stands in for audio evidence; model prose does not.
+            if confirmation_source in self.SPAN_CONFIRMATION_SOURCES:
+                flags.append(f"INFO: Splice veto waived, sponsor confirmed by {confirmation_source}")
+                logger.info(f"Splice veto waived for {ad['start']:.1f}s-{ad['end']:.1f}s: "
+                            f"sponsor confirmed by {confirmation_source}")
+            # Nothing was inserted in this fetch pair, so baked-in audio cannot show a splice.
+            elif ((coverage := self._cross_fetch_identical_coverage(ad))
+                  >= SPLICE_VETO_IDENTICAL_MIN_COVERAGE):
+                flags.append("INFO: Splice veto skipped, cross-fetch shows baked-in audio")
+                logger.info(f"Splice veto skipped for {ad['start']:.1f}s-{ad['end']:.1f}s: "
+                            f"cross-fetch found no inserted audio ({coverage:.0%} identical)")
+            else:
+                self._mark_held(ad, flags, HOLD_REASON_NO_SPLICE)
+                return Decision.REVIEW
 
         # Rule 4: an uncorroborated vad_gap marker at the episode tail must
         # surface in the pending-review queue instead of shipping silently.
@@ -1123,13 +1501,286 @@ class AdValidator:
 
         return decision
 
+    @staticmethod
+    def _has_estimated_edge(ad: dict) -> bool:
+        """Whether an auto pattern guessed part of this ad's span."""
+        return bool(ad.get('has_estimated_pattern_member')
+                    or (ad.get('span_estimated') and not ad.get('pattern_defined')))
+
+    @classmethod
+    def _evidence_gate_triggered(cls, ad: dict) -> bool:
+        """A missing or unknown category, or a reason that only echoes audio signals."""
+        reason = ad.get('reason') or ''
+        audio_only = (bool(AUDIO_ECHO_RE.search(reason)) and not mentions_advertising(reason)
+                      and 'based on transcript' not in reason.lower())
+        return repair_segment_category(ad.get('category')) is None or audio_only
+
+    def _has_transcript_ad_evidence(self, ad: dict) -> bool:
+        """A registry brand, link, promo code, or sponsor or transition phrase in the span transcript."""
+        text = ' '.join(self._bounded_text_segments(ad))
+        if not text.strip():
+            return False
+        lowered = text.lower()
+        if (any(pattern.search(text) for pattern in self.TRANSCRIPT_EVIDENCE_RES)
+                or self.AD_SIGNAL_PATTERNS.search(text)
+                or any(phrase in lowered for phrase in self.EVIDENCE_TRANSITION_PHRASES)):
+            return True
+        if self.sponsor_service:
+            try:
+                # One passing mention of a common-word brand is conversation, not a read.
+                return self.sponsor_service.count_sponsor_mentions(text) >= SPONSOR_MIN_MENTIONS
+            except Exception as e:
+                logger.debug(f"Sponsor registry lookup failed: {e}")
+        return False
+
+    def _evidence_gate_exempt(self, ad: dict) -> bool:
+        """Measured audio that stands in for transcript evidence: DAI core, a measured member, a differential."""
+        start, end = ad['start'], ad['end']
+        covered = _covered_seconds(dai_core_spans(ad), start, end)
+        if end > start and covered / (end - start) >= EVIDENCE_GATE_DAI_CORE_MIN_COVERAGE:
+            return True
+        if measured_evidence(ad):
+            return True
+        return bool(differential_region_overlapping(
+            (self._audio_analysis or {}).get('dai_differential'), start, end,
+            self.differential_corr_max))
+
+    @classmethod
+    def _estimated_pattern_needs_hold(cls, ad: dict) -> bool:
+        """An auto pattern's guessed edge needs full independent coverage."""
+        if not cls._has_estimated_edge(ad):
+            return False
+        start = finite_number(ad.get('start'))
+        end = finite_number(ad.get('end'))
+        if start is None or end is None or end <= start:
+            return True
+        return union_cover(dai_core_spans(ad), start, end,
+                           gap_tol=EDGE_TOLERANCE) != (start, end)
+
+    def _gap_merges(self, left_end: float, right_start: float) -> bool:
+        """Whether the merge step folds two ads across this gap."""
+        gap = right_start - left_end
+        return gap < MERGE_GAP_THRESHOLD or (
+            gap < MAX_SILENT_GAP
+            and not self._has_speech_in_range(left_end, right_start))
+
+    def _measured_cover(self, spans: list[tuple[float, float]],
+                        anchors: list[tuple[float, float]], start: float,
+                        end: float) -> tuple[float | None, float | None]:
+        """First anchored measured run, bridging gaps the merge step folds."""
+        runs = merge_runs([(max(a, start), min(b, end)) for a, b in spans
+                           if min(b, end) > max(a, start)],
+                          gap=COVERAGE_GAP_TOLERANCE, joins=self._gap_merges)
+        lo, hi = next(((lo, hi) for lo, hi in runs
+                       if any(a < hi and b > lo for a, b in anchors)),
+                      (None, None))
+        if lo is None:
+            return None, None
+        if lo <= start + EDGE_TOLERANCE:
+            lo = start
+        if hi >= end - EDGE_TOLERANCE:
+            hi = end
+        return lo, hi
+
+    def _narrowed(self, ad: dict, lo: float, hi: float, keep_members: bool) -> dict:
+        """Copy of ad narrowed to [lo, hi], with stale edge provenance dropped."""
+        piece = dict(ad)
+        # A rejection of one piece must not reject the rest on a re-detection.
+        if piece.get('_matches_false_positive_correction'):
+            piece['_matches_false_positive_correction'] = (
+                self._overlaps_false_positive(lo, hi))
+        invalidate_tail_provenance(piece, hi)
+        if keep_members:
+            piece['start'], piece['end'] = lo, hi
+            clip_merge_spans(piece, lo, hi)
+        # Without surviving members the parent's merge records describe nothing here.
+        if not keep_members or not recorded_member_spans(piece):
+            piece = carve_fragment(piece, lo, hi)
+        invalidate_quote_alignment(piece)
+        invalidate_word_timed_edges(piece)
+        return piece
+
+    def _split_multi_release_holds(self, ads: list[dict]) -> list[dict]:
+        """Give each auto-filed release of one hold its own piece of the marker."""
+        # Releases of one hold share its id; rows filed before hold ids share its exact bounds.
+        by_bounds, by_id = {}, {}
+        for c in self.confirmed_corrections:
+            if c.get('auto_filed') and c.get('confirmed_span'):
+                by_bounds.setdefault((c['start'], c['end']), []).append(c)
+                if c.get('hold_id'):
+                    by_id.setdefault(c['hold_id'], []).append(c)
+        out = []
+        for ad in ads:
+            if ad.get('_reviewer_rejected') or ad.get('_user_kept_by_trim'):
+                out.append(ad)
+                continue
+            newest = self._matching_confirmed(ad['start'], ad['end'])
+            if newest is None:
+                out.append(ad)
+                continue
+            # Reused by the confirm matching in validate() instead of a second scan.
+            ad['_pinned_release_confirm'] = newest
+            if not newest.get('auto_filed'):
+                out.append(ad)
+                continue
+            group = {id(c): c for c in [*by_bounds.get((newest['start'], newest['end']), []),
+                                        *by_id.get(newest.get('hold_id'), [])]}
+            releases = sorted(
+                (c for c in group.values()
+                 if c['confirmed_span']['start'] < ad['end']
+                 and c['confirmed_span']['end'] > ad['start']),
+                key=lambda c: c['confirmed_span']['start'])
+            if len(releases) == 1:
+                ad['_pinned_release_confirm'] = releases[0]
+            if len(releases) < 2 or any(
+                    a['confirmed_span']['end'] > b['confirmed_span']['start']
+                    for a, b in pairwise(releases)):
+                out.append(ad)
+                continue
+            # Cut at each release's end, so the gap before the next stays in one held piece.
+            edges = [ad['start'], *(c['confirmed_span']['end'] for c in releases[:-1]), ad['end']]
+            keep_members = self._has_estimated_edge(ad)
+            for confirm, (lo, hi) in zip(releases, pairwise(edges), strict=True):
+                piece = self._narrowed(ad, lo, hi, keep_members=keep_members)
+                piece['_pinned_release_confirm'] = confirm
+                out.append(piece)
+        return out
+
+    def _held_remainders(self, ad: dict, span: dict, seen_start: float,
+                         seen_end: float, reason: str) -> list[dict]:
+        """The audio an auto-filed confirm trimmed off a hold, kept held."""
+        pieces = []
+        for lo, hi in ((max(ad['start'], seen_start), span['start']),
+                       (span['end'], min(ad['end'], seen_end))):
+            if hi - lo < MIN_AD_DURATION:
+                continue
+            piece = self._narrowed(ad, lo, hi, keep_members=self._has_estimated_edge(ad))
+            for key in _REMAINDER_DROPPED_KEYS:
+                piece.pop(key, None)
+            piece['held_for_review'] = True
+            piece['hold_reason'] = reason
+            piece['pass2_hold_remainder'] = True
+            piece['_skip_pattern_learning'] = True
+            pieces.append(piece)
+        return pieces
+
+    def _split_estimated_remainders(self, ads: list[dict],
+                                    result: ValidationResult) -> list[dict]:
+        """Cut what members measured; only the estimate's unmeasured remainder stays held."""
+        out = []
+        barriers = [(c['start'], c['end']) for c in (
+            *self.false_positive_corrections,
+            *self._trim_ranges)]
+        for ad in ads:
+            # Without recorded members the whole span is the estimate; a pass-two
+            # ad's original-coords twin cannot follow a split.
+            if (not self._has_estimated_edge(ad)
+                    or not recorded_member_spans(ad)
+                    or ad.get('_confirmed_correction') is not None
+                    or '_orig_twin' in ad):
+                out.append(ad)
+                continue
+            measured = measured_member_spans(ad, self.min_cut_confidence)
+            spans = [(a, b) for a, b, _ in measured]
+            anchors = [(a, b) for a, b, anchor in measured if anchor]
+            lo, hi = self._measured_cover(spans, anchors, ad['start'], ad['end'])
+            # No run holds independent evidence: the whole span stays one estimate.
+            if lo is None:
+                out.append(ad)
+                continue
+            if (lo, hi) == (ad['start'], ad['end']):
+                cut = ad
+            else:
+                remainder_spans = []
+                silent = []
+                # Each remainder shares an edge with the measured cut by construction.
+                for a, b in ((ad['start'], lo), (hi, ad['end'])):
+                    if b - a < MIN_AD_DURATION:
+                        continue
+                    remainder = self._narrowed(ad, a, b, keep_members=False)
+                    remainder['_skip_pattern_learning'] = True
+                    remainder['_estimated_remainder'] = True
+                    remainder['reason'] = (
+                        f"{ad.get('reason', 'ad')} (estimated pattern remainder)")
+                    # Silence joins the cut only after the measured cut is accepted.
+                    if self._silent_remainder(a, b, barriers):
+                        silent.append(remainder)
+                        continue
+                    out.append(remainder)
+                    remainder_spans.append(f"{a:.1f}s-{b:.1f}s")
+                cut = self._narrowed(ad, lo, hi, keep_members=True)
+                if silent:
+                    cut['_silent_absorbed'] = silent
+                silent_spans = ''.join(f", silent {r['start']:.1f}s-{r['end']:.1f}s"
+                                       for r in silent)
+                result.corrections.append(
+                    f"Split estimated pattern span {ad['start']:.1f}s-"
+                    f"{ad['end']:.1f}s at measured {lo:.1f}s-{hi:.1f}s")
+                logger.info(
+                    f"Split estimated pattern span {ad['start']:.1f}s-"
+                    f"{ad['end']:.1f}s: cut {lo:.1f}s-{hi:.1f}s, "
+                    f"held {', '.join(remainder_spans) or 'none'}{silent_spans}"
+                )
+            cut.pop('has_estimated_pattern_member', None)
+            cut.pop('span_estimated', None)
+            out.append(cut)
+        out.sort(key=lambda a: a['start'])
+        return out
+
+    def _measured_extent(self, ad: dict) -> tuple[float, float]:
+        """(duration, position) of the ad without the silence it absorbed."""
+        lo, hi = learning_bounds(ad)
+        position = lo / self.episode_duration if self.episode_duration > 0 else 0
+        return hi - lo, position
+
+    @staticmethod
+    def _absorb_silent_remainders(ad: dict, silent: list[dict]) -> None:
+        """Extend an accepted measured cut over its silent remainders, in place."""
+        lo, hi = ad['start'], ad['end']
+        for remainder in silent:
+            a, b = remainder['start'], remainder['end']
+            ad['validation']['flags'].append(
+                f"INFO: Silent estimated remainder cut with the ad ({b - a:.1f}s)")
+            logger.info(f"Cut silent estimated remainder {a:.1f}s-{b:.1f}s "
+                        f"with ad {lo:.1f}s-{hi:.1f}s")
+        new_end = max([hi, *(r['end'] for r in silent)])
+        invalidate_tail_provenance(ad, new_end)
+        ad['start'], ad['end'] = min([lo, *(r['start'] for r in silent)]), new_end
+        # learning_bounds derives the measured extent from these, so patterns never grow the silence.
+        ad[SILENT_ABSORBED_SPANS] = [{'start': r['start'], 'end': r['end']} for r in silent]
+        invalidate_quote_alignment(ad)
+        invalidate_word_timed_edges(ad)
+
+    def _silent_remainder(self, start: float, end: float,
+                          barriers: list[tuple[float, float]]) -> bool:
+        """Whether audio analysis measured the remainder as silence, with no show cue or barrier in it."""
+        # Untranscribed audio can be music, so only measured silence counts; no analysis holds.
+        analysis = self._audio_analysis or {}
+        if any(a < end and b > start for a, b in barriers):
+            return False
+        for sig in analysis.get('signals') or []:
+            if (sig.get('signal_type') == 'audio_cue'
+                    and (sig.get('details') or {}).get('role') == AUDIO_CUE_ROLE_NON_AD
+                    and sig.get('start', end) < end and sig.get('end', start) > start):
+                return False
+        lo, hi = start + EDGE_TOLERANCE, end - EDGE_TOLERANCE
+        spans = [(a, b) for a, b in ((finite_number(span.get('start')), finite_number(span.get('end')))
+                                     for span in analysis.get('silence_spans') or [])
+                 if a is not None and b is not None]
+        return hi > lo and _covered_seconds(spans, lo, hi) >= SILENT_REMAINDER_MIN_COVERAGE * (hi - lo)
+
     def _mark_held(self, ad: dict, flags: list[str], reason: str) -> None:
         """Set held_for_review state on the ad dict and append a flag entry."""
         ad['held_for_review'] = True
         ad['hold_reason'] = reason
+        ensure_hold_id(ad)
         flags.append(f"INFO: Held for review ({reason})")
+        # Split remainders keep the same hold_reason; tag the log line only.
+        log_reason = reason
+        if ad.get('_estimated_remainder'):
+            log_reason = f"{reason} (remainder)"
         logger.info(
-            f"Holding ad {ad['start']:.1f}s-{ad['end']:.1f}s for review: {reason}"
+            f"Holding ad {ad['start']:.1f}s-{ad['end']:.1f}s for review: {log_reason}"
         )
 
     def _clamp_boundaries(self, ads: list[dict],
@@ -1151,12 +1802,14 @@ class AdValidator:
             # authoritative and clips the core in _validate_ad.
             core_start, core_end = dai_core_bounds(ad)
             if core_start is not None:
-                if core_start < ad['start']:
+                if (core_start < ad['start']
+                        and not precise_edge(ad, 'start')):
                     result.corrections.append(
                         f"Restored start {ad['start']:.1f}s to measured DAI "
                         f"core {core_start:.1f}s")
                     ad['start'] = core_start
-                if core_end > ad['end']:
+                if (core_end > ad['end']
+                        and not precise_edge(ad, 'end')):
                     result.corrections.append(
                         f"Restored end {ad['end']:.1f}s to measured DAI "
                         f"core {core_end:.1f}s")
@@ -1174,6 +1827,8 @@ class AdValidator:
                 result.corrections.append(
                     f"Clamped end {original:.1f}s to duration {self.episode_duration:.1f}s"
                 )
+            invalidate_quote_alignment(ad)
+            invalidate_word_timed_edges(ad)
             # Merge records written before this clamp must not let the
             # reviewer re-expand an edge past the file.
             file_end = (self.episode_duration if self.episode_duration > 0
@@ -1208,7 +1863,11 @@ class AdValidator:
 
         # A held marker has not been approved for cutting. Extending it could
         # absorb post-gap speech that was not part of the reviewed span.
-        if last_ad.get('held_for_review') or last_ad.get('vad_gap_requires_review'):
+        if (last_ad.get('_user_kept_by_trim') or last_ad.get('held_for_review')
+                or last_ad.get('vad_gap_requires_review')):
+            return ads
+
+        if precise_edge(last_ad, 'end'):
             return ads
 
         gap_to_end = self.episode_duration - last_ad['end']
@@ -1271,6 +1930,7 @@ class AdValidator:
             note_fold(original, current_original)
             original['start'] = min(original['start'], current_original['start'])
             original['end'] = max(original['end'], current_original['end'])
+            drop_stale_reviewer_locks(original)
             if current.get('_measured_split_fragment'):
                 original['_measured_split_fragment'] = True
 
@@ -1288,7 +1948,9 @@ class AdValidator:
             # describing exactly the span the human rejected. A confirmed
             # correction on either marker also blocks the merge: even a
             # shared correction must not authorize the adjacent audio.
-            if (last.get('held_for_review')
+            if (last.get('_user_kept_by_trim')
+                    or current.get('_user_kept_by_trim')
+                    or last.get('held_for_review')
                     or current.get('held_for_review')
                     or last.get('vad_gap_requires_review')
                     or current.get('vad_gap_requires_review')
@@ -1305,18 +1967,18 @@ class AdValidator:
             # a merged span could only be cut or kept as a whole, silently
             # applying one category's action to the other's audio.
             if actions_map is not None:
-                a_last = actions_map.get(
-                    normalize_segment_category(last.get('category')), DEFAULT_SEGMENT_ACTION)
-                a_cur = actions_map.get(
-                    normalize_segment_category(current.get('category')), DEFAULT_SEGMENT_ACTION)
+                a_last = effective_resolved_action(last, actions_map)
+                a_cur = effective_resolved_action(current, actions_map)
                 if a_last != a_cur:
                     merged.append(current.copy())
                     continue
 
-            # Recut path: never fold a previously-cut ad into a marker that
-            # was not cut (or vice versa); the keep partition runs after
-            # this merge and would swallow the cut.
-            if bool(last.get('_saved_was_cut')) != bool(current.get('_saved_was_cut')):
+            # Recut path: never fold a previously-cut ad or a reviewer reject
+            # into a marker without the same stamp; the fold would decide both
+            # spans' fate as one.
+            if (bool(last.get('_saved_was_cut')) != bool(current.get('_saved_was_cut'))
+                    or bool(last.get('_reviewer_rejected'))
+                    != bool(current.get('_reviewer_rejected'))):
                 merged.append(current.copy())
                 continue
 
@@ -1330,8 +1992,14 @@ class AdValidator:
                 merged.append(current.copy())
                 continue
 
-            if 0 <= gap < MERGE_GAP_THRESHOLD:
-                # Always merge small gaps (< 5s)
+            # A gap past a reviewer-locked edge stays in the audio.
+            if gap > 0 and (reviewer_edge_locked(last, 'end')
+                            or reviewer_edge_locked(current, 'start')):
+                merged.append(current.copy())
+                continue
+
+            # Small gaps always merge; larger ones only across silence.
+            if 0 <= gap and self._gap_merges(last['end'], current['start']):
                 mark_distinct_merge(last, current)
                 merge_original_twins(last, current)
                 _adopt_later_marker_end(last, current)
@@ -1345,23 +2013,9 @@ class AdValidator:
                     last['pattern_defined'] = True
                 if current.get('_measured_split_fragment'):
                     last['_measured_split_fragment'] = True
-                result.corrections.append(f"Merged ads with {gap:.1f}s gap")
-            elif 0 <= gap < MAX_SILENT_GAP and not self._has_speech_in_range(last['end'], current['start']):
-                # Merge larger gaps if no speech in between
-                mark_distinct_merge(last, current)
-                merge_original_twins(last, current)
-                _adopt_later_marker_end(last, current)
-                if adjacency_extension:
-                    last['vad_gap_adjacency_extension_seconds'] = adjacency_extension
-                if current.get('reason') and current['reason'] != last.get('reason'):
-                    last['reason'] = f"{last.get('reason', '')} + {current['reason']}"
-                if current.get('confidence', 0) > last.get('confidence', 0):
-                    last['confidence'] = current['confidence']
-                if current.get('pattern_defined'):
-                    last['pattern_defined'] = True
-                if current.get('_measured_split_fragment'):
-                    last['_measured_split_fragment'] = True
-                result.corrections.append(f"Merged ads across {gap:.1f}s silent gap")
+                result.corrections.append(
+                    f"Merged ads with {gap:.1f}s gap" if gap < MERGE_GAP_THRESHOLD
+                    else f"Merged ads across {gap:.1f}s silent gap")
             else:
                 merged.append(current.copy())
 

@@ -2,6 +2,7 @@
 import feedparser
 import logging
 import hashlib
+import math
 import os
 import re
 import threading
@@ -88,6 +89,8 @@ _TRUNCATION_MARKERS = (
     # A body cut mid-character leaves a partial multibyte sequence, which
     # expat reports as an invalid token rather than a missing element.
     'not well-formed (invalid token)',
+    # A body cut inside a CDATA block reports this instead of a missing element.
+    'unclosed cdata section',
 )
 
 
@@ -265,6 +268,8 @@ def _podcast_localname(elem) -> str:
 
 
 _ENCLOSURE_PREFIX_RE = re.compile(r'<enclosure url="([^"]+)/episodes/')
+RSS_RENDER_VERSION = 2
+_RENDER_VERSION_RE = re.compile(r'<!-- minuspod-rss-render-version:(\d+) -->')
 _ENCLOSURE_KEY_RE = re.compile(
     r'<enclosure url="[^"]+/episodes/[^"]*\?key=([0-9a-f]{64})"')
 # Cover fallback so episode-less feeds (no enclosures) still self-heal: the
@@ -282,6 +287,12 @@ def extract_cached_base_url(cached_rss: str) -> str | None:
     """
     m = _ENCLOSURE_PREFIX_RE.search(cached_rss)
     return m.group(1) if m else None
+
+
+def extract_cached_render_version(cached_rss: str) -> int | None:
+    """Return the renderer version embedded in a cached RSS document."""
+    m = _RENDER_VERSION_RE.search(cached_rss)
+    return int(m.group(1)) if m else None
 
 
 def extract_cached_feed_auth_key(cached_rss: str) -> str | None:
@@ -429,7 +440,13 @@ class RSSParser:
                     return None
                 finally:
                     response.close()
-                logger.info(f"Successfully fetched RSS feed (uncompressed), size: {len(body)} bytes")
+                logger.info(
+                    "Identity retry after gzip failure: url=%s bytes=%d content_length=%s "
+                    "transfer_encoding=%s content_encoding=%s",
+                    safe_url_for_log(url), len(body),
+                    response.headers.get('Content-Length') or 'none',
+                    response.headers.get('Transfer-Encoding') or 'none',
+                    response.headers.get('Content-Encoding') or 'none')
                 breaker.record_success(token=probe_token)
                 return body.decode('utf-8', errors='replace')
             except (requests.RequestException, SSRFError) as retry_e:
@@ -564,6 +581,13 @@ class RSSParser:
                     return None, None, None
                 finally:
                     response.close()
+                logger.info(
+                    "Identity retry after gzip failure: url=%s bytes=%d content_length=%s "
+                    "transfer_encoding=%s content_encoding=%s",
+                    safe_url_for_log(url), len(body),
+                    response.headers.get('Content-Length') or 'none',
+                    response.headers.get('Transfer-Encoding') or 'none',
+                    response.headers.get('Content-Encoding') or 'none')
                 breaker.record_success(token=probe_token)
                 return (
                     body.decode('utf-8', errors='replace'),
@@ -1000,6 +1024,7 @@ class RSSParser:
         # Build modified RSS with Podcasting 2.0 namespace
         lines = []
         lines.append('<?xml version="1.0" encoding="UTF-8"?>')
+        lines.append(f'<!-- minuspod-rss-render-version:{RSS_RENDER_VERSION} -->')
         lines.append('<rss version="2.0" '
                      'xmlns:itunes="http://www.itunes.com/dtds/podcast-1.0.dtd" '
                      f'xmlns:podcast="{_PODCAST_NS_CANONICAL}">')
@@ -1082,6 +1107,11 @@ class RSSParser:
 
         # Process each episode from RSS
         included_episode_ids = set()
+        processed_durations = {
+            ep.get('episode_id'): ep.get('new_duration')
+            for ep in (extra_episodes or [])
+            if ep.get('episode_id')
+        }
         for entry in entries:
             episode_url = None
             # Find audio URL in enclosures
@@ -1121,8 +1151,15 @@ class RSSParser:
             # Modified enclosure URL
             lines.append(f'  <enclosure url="{modified_url}" type="audio/mpeg" />')
 
-            # iTunes specific tags (validate to avoid outputting None as string)
-            if 'itunes_duration' in entry:
+            # Processed enclosures need the duration of the served file.
+            processed_duration = processed_durations.get(episode_id)
+            try:
+                processed_duration = float(processed_duration)
+            except (TypeError, ValueError):
+                processed_duration = None
+            if processed_duration is not None and math.isfinite(processed_duration) and processed_duration > 0:
+                lines.append(f'  <itunes:duration>{int(processed_duration)}</itunes:duration>')
+            elif 'itunes_duration' in entry:
                 duration = entry.itunes_duration
                 if duration and str(duration).strip():
                     lines.append(f'  <itunes:duration>{duration}</itunes:duration>')

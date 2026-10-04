@@ -12,7 +12,7 @@ info:
     - Monitor system status and trigger cleanup operations
     - Manage cross-episode ad patterns with network and podcast scope
     - Submit corrections to improve ad detection accuracy
-  version: 2.97.15
+  version: 2.97.45
   contact:
     name: MinusPod
   license:
@@ -890,7 +890,7 @@ paths:
                     - 'null'
                   description: >-
                     Per-feed splice check. Tri-state: null inherits the global
-                    splice_veto_enabled setting, true forces the check on, false lets
+                    spliceVetoEnabled setting, true forces the check on, false lets
                     long cuts through without splice evidence.
                 maxAdDurationOverride:
                   type:
@@ -2059,8 +2059,9 @@ paths:
         - Episodes
       summary: Force reprocess an episode
       description: |
-        Deletes cached data and reprocesses the episode.
-        Supports three modes:
+        Queues an episode for reprocessing. Full and default reprocesses retain
+        the saved transcript until fresh transcription begins.
+        Supports four modes:
         - `reprocess` (default): Uses learned patterns from the pattern database plus AI analysis
         - `full`: Skips the pattern database entirely for a fresh AI-only analysis
         - `llm`: Re-runs ad detection and re-cut using the SAVED transcript,
@@ -2101,6 +2102,8 @@ paths:
                 type: object
                 properties:
                   message:
+                    type: string
+                  episodeId:
                     type: string
                   mode:
                     type: string
@@ -2295,15 +2298,26 @@ paths:
         - Processing
       summary: Force reprocess an episode (legacy)
       description: |
-        Legacy reprocess endpoint. Prefer `/episodes/{slug}/{episode_id}/reprocess`,
-        which supports `mode=reprocess`, `mode=full`, and `mode=llm`.
+        Legacy URL for the mode-aware reprocess endpoint. Accepts the same modes
+        as `/episodes/{slug}/{episode_id}/reprocess`; the default is `reprocess`.
       operationId: reprocessEpisodeLegacy
       parameters:
         - $ref: '#/components/parameters/slug'
         - $ref: '#/components/parameters/episode_id'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                mode:
+                  type: string
+                  enum: [reprocess, full, llm, recut]
+                  default: reprocess
       responses:
-        '200':
-          description: Episode reprocess queued
+        '202':
+          description: Reprocessing started or queued
           content:
             application/json:
               schema:
@@ -2313,8 +2327,18 @@ paths:
                     type: string
                   episodeId:
                     type: string
-                  slug:
+                  mode:
                     type: string
+                  status:
+                    type: string
+                    enum: [processing, queued]
+                  reason:
+                    type: string
+                  jobState:
+                    type: string
+                    enum: [queued, processing]
+        '400':
+          $ref: '#/components/responses/BadRequest'
         '404':
           $ref: '#/components/responses/NotFound'
         '409':
@@ -2323,6 +2347,8 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '500':
+          $ref: '#/components/responses/ServerError'
 
   /feeds/{slug}/episodes/{episode_id}/original.mp3:
     get:
@@ -2871,6 +2897,7 @@ paths:
                       adjust: { type: integer }
                       reject: { type: integer }
                       resurrect: { type: integer }
+                      inconclusive: { type: integer }
                       failure: { type: integer }
                   pass1AdjustmentCount:
                     type: integer
@@ -3213,7 +3240,8 @@ paths:
                             - 'null'
                         status:
                           type: string
-                          description: Ledger state, e.g. success or failure.
+                          description: Ledger state. Inconclusive means the reviewer abstained and the original marker was retained.
+                          enum: [success, failure, inconclusive]
                         inputTokens:
                           type:
                             - integer
@@ -3327,10 +3355,26 @@ paths:
             default: all
         - name: active_only
           in: query
-          description: Only return active patterns
+          description: Only return active patterns. Accepts the legacy `active` query param as an alias.
           schema:
             type: boolean
             default: false
+        - name: podcast_id
+          in: query
+          description: Filter to patterns scoped to this podcast slug
+          schema:
+            type: string
+        - name: network_id
+          in: query
+          description: Filter to patterns scoped to this network id
+          schema:
+            type: string
+        - name: source
+          in: query
+          description: Filter by pattern source
+          schema:
+            type: string
+            enum: [local, community, imported]
       responses:
         '200':
           description: List of patterns
@@ -3516,7 +3560,11 @@ paths:
               properties:
                 is_active:
                   type: boolean
-                  description: Whether the pattern is active
+                  description: >-
+                    Whether the pattern is active. False stamps disabled_at
+                    (an already disabled pattern keeps its original time);
+                    true clears disabled_at, and disabled_reason too unless
+                    the request sends one.
                 sponsor:
                   type: string
                   description: Sponsor name for this pattern
@@ -3631,6 +3679,13 @@ paths:
       summary: Export patterns
       description: Export all patterns as JSON for backup or transfer
       operationId: exportPatterns
+      parameters:
+        - name: include_corrections
+          in: query
+          description: Attach each pattern's pattern_corrections rows as `corrections`. Rows are exported whole, including `origin` (user or auto_pass2).
+          schema:
+            type: boolean
+            default: false
       responses:
         '200':
           description: Exported patterns
@@ -4674,6 +4729,14 @@ paths:
           schema:
             type: string
             enum: [adjusted, unadjusted]
+        - name: holdReason
+          in: query
+          description: >-
+            Keep only pending-review detections held for this reason. Omit for
+            no filter.
+          schema:
+            type: string
+            enum: [max_duration, no_cue_evidence, uncorroborated_tail, reviewer_contradiction, reviewer_boundary_conflict, reviewer_inconclusive_bounds, estimated_pattern_bounds, reviewer_reject_conflict, reviewer_failed, no_splice_evidence, verification_miss, verification_kept_conflict, differential_uncorroborated, large_vad_gap_extension, cue_template_unproven, cue_low_confidence, no_transcript_evidence]
       responses:
         '200':
           description: Paginated detection list
@@ -4701,6 +4764,14 @@ paths:
                       accepted: { type: integer }
                       confirmed: { type: integer }
                       dismissed: { type: integer }
+                      pendingByHoldReason:
+                        type: object
+                        description: >-
+                          Pending-review detections per hold reason. Counts follow
+                          only the feed and status filters; the q, reviewer,
+                          holdReason and category filters do not narrow them. Holds
+                          with no recorded reason are not counted.
+                        additionalProperties: { type: integer }
                   cutSummary:
                     type: object
                     description: >-
@@ -6089,6 +6160,12 @@ paths:
                     keep. Audio that differs between two fetches of the same
                     enclosure was inserted, whatever the category says
                     (default true).
+                spliceVetoEnabled:
+                  type: boolean
+                  description: >-
+                    Hold a long cut found only in the transcript for review
+                    unless the audio shows an edit point at its edges. A feed's
+                    own spliceVetoEnabled overrides this (default true).
                 differentialMeasuredCorrMax:
                   type: number
                   format: float
@@ -7062,6 +7139,83 @@ paths:
                       type: object
                   system:
                     type: object
+        '401':
+          description: Authentication required
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '429':
+          description: Rate limit exceeded
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /system/diagnostic-export:
+    get:
+      tags: [System]
+      summary: Download bounded operational diagnostics
+      description: >-
+        Downloads payload-free structured diagnostics for an optional UTC ISO
+        8601 start/end range. The range is limited to 24 hours and the export
+        omits prompts, transcripts, descriptions, responses, identifiers,
+        secrets, URLs, and exception text. Rate limited to 6/hour.
+      operationId: exportDiagnosticLog
+      parameters:
+        - name: start
+          in: query
+          schema:
+            type: string
+            format: date-time
+        - name: end
+          in: query
+          schema:
+            type: string
+            format: date-time
+      responses:
+        '200':
+          description: Structured diagnostic metadata file download
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [events, truncated, start, end, coverage]
+                properties:
+                  events:
+                    type: array
+                    items:
+                      type: object
+                  truncated:
+                    type: boolean
+                  start:
+                    type: string
+                    format: date-time
+                  end:
+                    type: string
+                    format: date-time
+                  coverage:
+                    type: object
+                    required: [description, firstEvent, lastEvent, version]
+                    properties:
+                      description:
+                        type: string
+                      firstEvent:
+                        type: string
+                        format: date-time
+                        nullable: true
+                      lastEvent:
+                        type: string
+                        format: date-time
+                        nullable: true
+                      version:
+                        type: string
+        '400':
+          description: Invalid or oversized time range
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
         '401':
           description: Authentication required
           content:
@@ -11251,8 +11405,9 @@ components:
             - boolean
             - 'null'
           description: >-
-            Per-feed splice check. null inherits the global setting, true forces the
-            check on, false lets long cuts through without splice evidence.
+            Per-feed splice check. null inherits the global spliceVetoEnabled
+            setting, true forces the check on, false lets long cuts through
+            without splice evidence.
         maxAdDurationOverride:
           type:
             - number
@@ -11480,6 +11635,7 @@ components:
           nullable: true
         adsRemoved:
           type: integer
+          description: Rendered cuts in the output audio. Markers merged into one cut count once.
         timeSaved:
           type: number
           description: Seconds saved by removing ads
@@ -11561,6 +11717,11 @@ components:
               description: Template cue detections for this episode (advisory telemetry; never changes the cut)
               items:
                 $ref: '#/components/schemas/CueDetection'
+            corrections:
+              type: array
+              description: Corrections recorded for this episode, newest first.
+              items:
+                $ref: '#/components/schemas/EpisodeCorrection'
             daiDifferential:
               type:
                 - object
@@ -11592,6 +11753,30 @@ components:
                   type:
                     - string
                     - 'null'
+            spliceCalibration:
+              type:
+                - object
+                - 'null'
+              description: The feed's splice calibration when this episode's audio was analyzed, or null when no audio analysis is stored. status host_read means most of the feed's recent long transcript-only cuts showed no edit point in the audio, so the splice check does not hold them. long_cut_corroboration counts those cuts over recent episodes.
+              properties:
+                status:
+                  type: string
+                  enum: [cold_start, calibrated, host_read]
+                episodes_considered:
+                  type: integer
+                long_cut_corroboration:
+                  type: object
+                  properties:
+                    episodes:
+                      type: integer
+                    cuts:
+                      type: integer
+                    corroborated:
+                      type: integer
+                    fraction:
+                      type:
+                        - number
+                        - 'null'
             transcriptAvailable:
               type: boolean
             chaptersRegenerating:
@@ -11610,7 +11795,7 @@ components:
               description: Number of ads detected by first pass (includes merged)
             adsRemovedVerification:
               type: integer
-              description: Number of ads detected by verification pass
+              description: Rendered cuts in the output audio that hold a verification-pass marker
             inputTokens:
               type: integer
               description: Total LLM input tokens used to process this episode
@@ -12053,6 +12238,42 @@ components:
             How the cost was arrived at. mixed means the grouped calls did
             not agree on one source; unknown pairs with a null costUsd.
 
+    EpisodeCorrection:
+      type: object
+      properties:
+        id:
+          type: integer
+        correction_type:
+          type: string
+          enum: [false_positive, boundary_adjustment, confirm, promotion, auto_promotion, create]
+        original_bounds:
+          type:
+            - object
+            - 'null'
+          description: Bounds of the marker the correction applies to; null for create.
+          properties:
+            start:
+              type: number
+            end:
+              type: number
+        corrected_bounds:
+          type:
+            - object
+            - 'null'
+          description: User-set bounds for create, boundary_adjustment and trimmed confirms.
+          properties:
+            start:
+              type: number
+            end:
+              type: number
+        created_at:
+          type: string
+          format: date-time
+        origin:
+          type: string
+          enum: [user, auto_pass2]
+          description: user for a decision made in the UI or API; auto_pass2 for a confirm the verification pass filed when it re-detected a held ad.
+
     EpisodeProcessingRun:
       type: object
       description: One processing run of an episode, with its pipeline stats.
@@ -12130,6 +12351,11 @@ components:
                 - boolean
                 - 'null'
               description: True when the run skipped transcription; no transcript, generated chapters, or subtitles.
+            normalizationSkipped:
+              type:
+                - boolean
+                - 'null'
+              description: True when the run did not apply the optional loudness normalization pass.
             downloadedDuration:
               type: number
               description: ffprobe duration of the downloaded copy, in seconds
@@ -12203,9 +12429,20 @@ components:
               type:
                 - integer
                 - 'null'
-              description: Ads the second scan of the output audio found and cut. 0 means the scan ran and came back clean. Absent or null means the scan did not run, either because it was skipped (see verificationSkipped and detectionSkipped) or because it failed.
+              description: Rendered cuts holding an ad the second scan of the output audio found. 0 means the scan ran and came back clean. Absent or null means the scan did not run, either because it was skipped (see verificationSkipped and detectionSkipped) or because it failed.
             secondsRemoved:
               type: number
+              description: Net seconds removed, original duration minus output duration. Replacement beeps count against it. When the output duration cannot be measured this is estimated as sourceSecondsRemoved minus replacementSecondsAdded.
+            sourceSecondsRemoved:
+              type:
+                - number
+                - 'null'
+              description: Seconds of source audio inside the rendered cuts. Absent on runs recorded before this field existed.
+            replacementSecondsAdded:
+              type:
+                - number
+                - 'null'
+              description: Seconds of replacement audio (beeps) inserted in place of the rendered cuts. secondsRemoved is about sourceSecondsRemoved minus this value.
             timings:
               type:
                 - object
@@ -12516,15 +12753,103 @@ components:
         held_for_review:
           type: boolean
           description: True when this marker remains in the audio pending a human decision.
+        carved_from:
+          type: object
+          description: Set on a fragment of a marker the render removed only in part; names the detected span.
+          properties:
+            start:
+              type: number
+            end:
+              type: number
+        silent_absorbed_spans:
+          type: array
+          description: Measured silence cut with this accepted ad; excluded from its duration checks.
+          items:
+            type: object
+            properties:
+              start:
+                type: number
+              end:
+                type: number
         hold_reason:
           type: string
           nullable: true
-          enum: [max_duration, no_cue_evidence, uncorroborated_tail, reviewer_contradiction, reviewer_boundary_conflict, reviewer_reject_conflict, no_splice_evidence, verification_miss, verification_kept_conflict, differential_uncorroborated, large_vad_gap_extension, cue_template_unproven, cue_low_confidence, null]
-          description: Why the marker requires review. reviewer_boundary_conflict means a reviewer proposal crossed protected merged-ad evidence; reviewer_reject_conflict means the reviewer rejected a span backed by measured evidence or a confirmed sponsor.
+          enum: [max_duration, no_cue_evidence, uncorroborated_tail, reviewer_contradiction, reviewer_boundary_conflict, reviewer_inconclusive_bounds, estimated_pattern_bounds, reviewer_reject_conflict, reviewer_failed, no_splice_evidence, verification_miss, verification_kept_conflict, differential_uncorroborated, large_vad_gap_extension, cue_template_unproven, cue_low_confidence, no_transcript_evidence, null]
+          description: Why the marker requires review. reviewer_boundary_conflict means a reviewer proposal crossed protected merged-ad evidence; reviewer_reject_conflict means the reviewer rejected a span backed by measured evidence or a confirmed sponsor; reviewer_failed means the review call failed and no independent evidence backs the bounds.
         reviewer_reasoning:
           type: string
           nullable: true
           description: Reviewer explanation when the reviewer evaluated this marker.
+        reviewer_verdict:
+          type: string
+          enum: [confirmed, adjust, reject, resurrect, inconclusive, failure]
+          description: Ad reviewer verdict on this marker; absent when the reviewer did not review it.
+        reviewer_locked_start:
+          type: number
+          description: Start the reviewer validated; later steps may move the start inward but not before it.
+        reviewer_locked_end:
+          type: number
+          description: End the reviewer validated; later steps may move the end inward but not past it.
+        hold_id:
+          type: string
+          description: >-
+            Identity a held marker gets when first held. Copies, carved fragments
+            and recuts keep it, and pass-2 auto-approval confirms record it so
+            releases of one hold stay grouped.
+        pass2_corroborated:
+          type: boolean
+          description: Set on a held marker when pass 2 independently detected an ad inside it.
+        pass2_corroborated_span:
+          type: object
+          description: Part of the hold pass 2 attested as ad; the auto-approval confirm is trimmed to it.
+          properties:
+            start:
+              type: number
+            end:
+              type: number
+        pass2_reviewed_release:
+          type: object
+          description: First pass-2 span inside the hold that review released.
+          properties:
+            start:
+              type: number
+            end:
+              type: number
+        pass2_released_spans:
+          type: array
+          description: Every pass-2 span inside the hold that review released, in start order. Filed as separate confirms when there are several; a single release files the hold's own confirm span; spans overlapping a standing reviewer reject are skipped.
+          items:
+            type: object
+            properties:
+              start:
+                type: number
+              end:
+                type: number
+        pass2_outcome:
+          type: string
+          description: >-
+            Set on a marker pass 2 ended with: cut, kept, or held:<hold_reason>.
+            Spans pass 2 discarded are only logged and counted in the stored run
+            stats, which the API does not return.
+          example: cut
+        pass2_hold_review:
+          type: object
+          nullable: true
+          description: Set on a held marker when review of a pass-2 span inside it did not release the hold. The hold stays pending; cleared when a later review releases it. Diagnostic only, separate from reviewer_reasoning.
+          properties:
+            span:
+              type: array
+              items:
+                type: number
+              minItems: 2
+              maxItems: 2
+              description: Reviewed pass-2 span [start, end] in original-audio seconds.
+            verdict:
+              type: string
+              enum: [confirmed, adjust, reject, resurrect, failure, inconclusive]
+            reason:
+              type: string
+              description: Reviewer reasoning, or the abstain reason for an inconclusive review.
         reviewer_proposed_start:
           type: number
           nullable: true
@@ -12557,6 +12882,10 @@ components:
               items:
                 type: string
               description: Auto-corrections applied (merged ads, clamped boundaries)
+            audio_corroboration:
+              type: string
+              enum: [transition_pair, template_cue, volume_anomaly, splice_evidence, dai_differential, none]
+              description: Audio evidence found at the edges of a long cut detected from the transcript, or none. Set only on those cuts, in the first pass.
 
     ReviewDetection:
       type: object
@@ -12592,10 +12921,12 @@ components:
           nullable: true
           description: >-
             Ad reviewer verdict on this marker, or null when the reviewer did
-            not run. adjust alone does not mean the span moved: a held
+            not run. inconclusive means the reviewer abstained: the marker keeps
+            its bounds when measured evidence supports them and is otherwise held
+            as reviewer_inconclusive_bounds. adjust alone does not mean the span moved: a held
             contradiction keeps the pass-1 bounds and a split piece drops the
             originals, and neither records reviewerOriginalStart/End.
-          enum: [confirmed, adjust, reject, resurrect, failure, null]
+          enum: [confirmed, adjust, reject, resurrect, inconclusive, failure, null]
         reviewerOriginalStart:
           type: number
           nullable: true
@@ -12610,6 +12941,11 @@ components:
             Whether the span was moved from its pass-1 bounds, by the
             reviewer or by a human approving a trimmed boundary. Use this
             instead of inferring a move from reviewerVerdict/reviewerOriginalStart/End.
+        holdReason:
+          type: string
+          nullable: true
+          description: Why the detection is held for review; null unless status is pending
+          enum: [max_duration, no_cue_evidence, uncorroborated_tail, reviewer_contradiction, reviewer_boundary_conflict, reviewer_inconclusive_bounds, estimated_pattern_bounds, reviewer_reject_conflict, reviewer_failed, no_splice_evidence, verification_miss, verification_kept_conflict, differential_uncorroborated, large_vad_gap_extension, cue_template_unproven, cue_low_confidence, no_transcript_evidence, null]
         status:
           type: string
           enum: [accepted, rejected, pending]
@@ -13254,6 +13590,16 @@ components:
             A marker overlapping a measured differential region is cut even
             when segmentCategoryActions maps its category to keep
             (default true).
+          properties:
+            value:
+              type: boolean
+            isDefault:
+              type: boolean
+        spliceVetoEnabled:
+          type: object
+          description: >-
+            Hold long transcript-only cuts that show no edit point in the
+            audio. A feed's own spliceVetoEnabled overrides this (default true).
           properties:
             value:
               type: boolean
@@ -13956,8 +14302,10 @@ components:
         stageTunables:
           type: object
           description: |
-            Per-stage LLM tunables (temperature, max_tokens, reasoning) and
-            global Ollama context window. Each field carries the resolved
+            Per-stage LLM tunables (temperature, max_tokens, reasoning), chapter
+            density, detection window geometry and the global Ollama context
+            window, keyed by the same names as the PUT
+            /settings/ad-detection body. Each field carries the resolved
             value (env > DB > default), an isDefault flag, and the name of
             any environment variable that is overriding the stored value.
           additionalProperties:
@@ -14017,6 +14365,8 @@ components:
               type: string
               enum: [auto, float16, int8_float16, int8, float32]
             positionalPriorEnabled:
+              type: boolean
+            spliceVetoEnabled:
               type: boolean
             vadGapDetectionEnabled:
               type: boolean
@@ -14349,6 +14699,12 @@ components:
                 episode after episode is visible instead of silent. On the
                 API backend, false when no base URL is configured, and
                 otherwise the last cached probe result.
+            reason:
+              type: string
+              description: >-
+                Local backend only, and present only when the faster-whisper
+                or ctranslate2 package is missing. Says what to install or
+                which backend to switch to.
             device:
               type: string
               enum: [cpu, cuda]
@@ -14572,11 +14928,20 @@ components:
         is_active:
           type: boolean
           description: Whether the pattern is currently active
+        can_split:
+          type: boolean
+          description: Whether the active pattern has at least two usable text pieces for splitting
         disabled_reason:
           type:
             - string
             - 'null'
           description: Reason for disabling the pattern
+        disabled_at:
+          type:
+            - string
+            - 'null'
+          format: date-time
+          description: When the pattern was deactivated; null while it is active.
         confirmation_count:
           type: integer
           description: Number of times pattern was confirmed correct

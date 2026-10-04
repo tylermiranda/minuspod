@@ -92,6 +92,9 @@ function timingValue(run: EpisodeProcessingRun, key: typeof TIMING_STAGES[number
   if ((key === 'detectionSeconds' || key === 'verificationSeconds') && run.stats?.cueOnly) {
     return 'Not applicable';
   }
+  if (key === 'normalizationSeconds' && run.stats?.normalizationSkipped === true) {
+    return 'Skipped';
+  }
   const value = timings?.[key];
   if (value != null) return formatDuration(value);
   if (!timings) return 'Timing unavailable';
@@ -199,8 +202,15 @@ const COLUMNS: Column[] = [
   },
   {
     label: 'Removed',
-    title: 'Ad time cut from the audio',
-    render: (run) => (run.stats?.secondsRemoved != null ? formatDuration(run.stats.secondsRemoved) : '-'),
+    title: 'Net time removed: ad audio cut minus any beeps inserted in its place',
+    render: (run) => {
+      const s = run.stats;
+      if (s?.secondsRemoved == null) return '-';
+      const net = formatDuration(s.secondsRemoved);
+      return s.replacementSecondsAdded && s.sourceSecondsRemoved != null
+        ? `${net} (${formatDuration(s.sourceSecondsRemoved)} cut)`
+        : net;
+    },
   },
   {
     label: 'Second scan',

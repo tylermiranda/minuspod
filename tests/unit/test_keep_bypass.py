@@ -7,6 +7,7 @@ input, the reviewer input, the cut list, or held-for-review routing.
 Markers resolving to 'remove' (the default) flow through byte-identical
 to before.
 """
+import json
 import logging
 import os
 import sys
@@ -25,12 +26,13 @@ from unittest.mock import patch
 
 import main_app.processing as processing
 from api.patterns import _matches_held_marker
+from audio_analysis.base import AudioAnalysisResult
 from audio_processor import AudioProcessor
 from config import count_pending_review, HOLD_REASON_VERIFICATION_KEPT_CONFLICT
-
-SEGMENTS = [{'start': 0.0, 'end': 5.0, 'text': 'hello'},
-            {'start': 5.0, 'end': 10.0, 'text': 'world'}]
-
+from tests.unit.marker_test_utils import applied_cut
+from utils.markers import mark_distinct_merge
+from tests.unit.pipeline_test_utils import SEGMENTS, _run_pipeline
+from tests.unit.recut_test_utils import _recut_render_call
 
 def _sponsor_ad():
     return {'start': 10.0, 'end': 20.0, 'category': 'sponsor',
@@ -40,113 +42,6 @@ def _sponsor_ad():
 def _cross_promo_ad():
     return {'start': 30.0, 'end': 40.0, 'category': 'cross_promo',
            'confidence': 0.95, 'detection_stage': 'llm'}
-
-
-def _run_pipeline(first_pass_ads, segment_actions, late_synthesized_ad=None,
-                  real_sweeps=False, audio_analysis_result=None, segments=None,
-                  verification_return=None, held_categories=None):
-    """Drive process_episode's full pass-1 flow with every stage but the
-    partition itself mocked out. Returns the recorded mocks for inspection.
-
-    ``late_synthesized_ad``: a marker added inside _refine_and_validate
-    after the keep partition already ran, appended to the mocked stage's
-    return value, not its input. ``real_sweeps=True`` leaves
-    _snap_terminal_starts/_complete_cut_tails unpatched, to prove the late
-    keep-partition wiring against the real sweep functions.
-    ``audio_analysis_result`` feeds the mocked _run_audio_analysis return
-    value; ``segments`` overrides the module-level SEGMENTS fixture.
-    ``verification_return`` overrides the mocked _run_verification_pass
-    return tuple, to drive the pass-2 merge seam; ``held_categories`` names
-    categories the fake validator holds instead of cutting, so a pass-1 held
-    marker reaches that seam.
-    """
-    podcast_row = {'id': 1, 'slug': 'keep-feed', 'description': None,
-                   'tags': None, 'dai_platform': None,
-                   'passthrough_enabled': None, 'skip_ad_detection': None,
-                   'detection_mode': None}
-    segments = SEGMENTS if segments is None else segments
-
-    held = set(held_categories or ())
-
-    def _fake_refine_and_validate(slug, episode_id, all_ads, *a, **k):
-        for ad in all_ads:
-            if segment_actions.get(ad.get('category')) == 'keep':
-                raise AssertionError(
-                    'validator was called with a keep-action marker')
-        for ad in all_ads:
-            ad['was_cut'] = ad.get('category') not in held
-            if not ad['was_cut']:
-                ad['held_for_review'] = True
-                ad.setdefault('hold_reason', 'max_duration')
-        result = list(all_ads)
-        if late_synthesized_ad is not None:
-            late_synthesized_ad['was_cut'] = True
-            result = result + [late_synthesized_ad]
-        return [ad for ad in result if ad['was_cut']], result
-
-    def _fake_run_ad_reviewer(slug, episode_id, podcast_id, ads_to_remove,
-                              all_ads_with_validation, *a, **k):
-        return ads_to_remove, all_ads_with_validation
-
-    def _pass_through_ads(slug, episode_id, ads_to_remove, *a, **k):
-        return ads_to_remove
-
-    with ExitStack() as stack:
-        p = lambda *a, **k: stack.enter_context(patch.object(*a, **k))
-        db = p(processing, 'db')
-        p(processing, 'status_service')
-        storage = p(processing, 'storage')
-        audio_processor = p(processing, 'audio_processor')
-        p(processing.ad_detector, 'get_model', return_value='test-model')
-        p(processing.ad_detector, 'get_verification_model', return_value='test-model')
-        p(processing, 'start_episode_token_tracking')
-        p(processing, 'get_available_memory_gb', return_value=None)
-        p(processing, 'get_min_cut_confidence', return_value=0.8)
-        p(processing, '_download_and_transcribe',
-          return_value=('/tmp/keep.mp3', segments))
-        p(processing, '_run_differential_fetch', return_value=None)
-        p(processing, '_run_audio_analysis', return_value=audio_analysis_result)
-        p(processing, 'load_positional_prior', return_value=None)
-        detect = p(processing, '_detect_ads_first_pass',
-                  return_value=(first_pass_ads, len(first_pass_ads), {}))
-        refine = p(processing, '_refine_and_validate',
-                  side_effect=_fake_refine_and_validate)
-        reviewer = p(processing, '_run_ad_reviewer',
-                    side_effect=_fake_run_ad_reviewer)
-        if not real_sweeps:
-            p(processing, '_snap_terminal_starts', side_effect=_pass_through_ads)
-            p(processing, '_complete_cut_tails', side_effect=_pass_through_ads)
-        local_ap_cls = p(processing, 'AudioProcessor')
-        p(processing, '_run_verification_pass',
-          return_value=(verification_return
-                        or (0, [], [], [], '/tmp/cut.mp3', 0, True, 0)))
-        generate_assets = p(processing, '_generate_assets')
-        finalize = p(processing, '_finalize_episode')
-        p(processing.shutil, 'move')
-        p(processing.os, 'unlink')
-        p(processing.os.path, 'exists', return_value=False)
-
-        db.get_episode.return_value = {}
-        db.get_podcast_by_slug.return_value = podcast_row
-        db.get_setting.return_value = 'false'
-        db.get_setting_float.side_effect = lambda key, default=None: default
-        db.get_all_settings.return_value = {}
-        db.resolve_segment_actions.return_value = segment_actions
-        audio_processor.get_audio_duration.return_value = 100.0
-        local_ap = local_ap_cls.return_value
-        local_ap.process_episode.side_effect = (
-            lambda audio_path, ads_to_remove, cut_barriers=None:
-            ('/tmp/cut.mp3', list(ads_to_remove)))
-        local_ap.get_audio_duration.return_value = 100.0
-        storage.get_episode_path.return_value = '/tmp/final.mp3'
-
-        result = processing.process_episode(
-            'keep-feed', 'ep1', 'https://example.com/ep1.mp3')
-
-    return {'result': result, 'db': db, 'storage': storage,
-            'detect': detect, 'refine': refine, 'reviewer': reviewer,
-            'generate_assets': generate_assets, 'finalize': finalize,
-            'local_ap': local_ap}
 
 
 class TestKeepBypass:
@@ -176,6 +71,219 @@ class TestKeepBypass:
         sponsor_marker = by_span[(sponsor['start'], sponsor['end'])]
         assert sponsor_marker['was_cut'] is True
         assert sponsor_marker['action_applied'] == 'remove'
+
+
+    def test_pass1_cut_over_a_keep_is_carved_before_render(self):
+        sponsor = dict(_sponsor_ad(), start=10.0, end=60.0)
+        keep = dict(_cross_promo_ad(), start=30.0, end=40.0)
+        segment_actions = {'sponsor': 'remove', 'cross_promo': 'keep'}
+
+        m = _run_pipeline([sponsor, keep], segment_actions)
+
+        call = m['local_ap'].process_episode.call_args
+        assert [(a['start'], a['end']) for a in call.args[1]] == [
+            (10.0, 30.0), (40.0, 60.0)]
+        assert (30.0, 40.0) in {(b['start'], b['end'])
+                                for b in call.kwargs['hard_barriers']}
+        saved = m['storage'].save_combined_ads.call_args.args[2]
+        assert sorted((a['start'], a['end'], a.get('action_applied'))
+                      for a in saved) == [
+            (10.0, 30.0, 'remove'), (30.0, 40.0, 'keep'), (40.0, 60.0, 'remove')]
+
+    def test_silent_estimated_remainder_cut_is_carved_around_a_keep(self):
+        # The validator never sees keeps; the render carve still protects one in cut silence.
+        sponsor = {'start': 100.0, 'end': 160.0, 'category': 'sponsor', 'confidence': 0.95,
+                   'detection_stage': 'claude', 'reason': 'Acme sponsor read'}
+        mark_distinct_merge(sponsor, {'start': 150.0, 'end': 200.0, 'confidence': 0.95,
+                                      'detection_stage': 'text_pattern', 'span_estimated': True,
+                                      'text_start': 150.0, 'text_end': 160.0,
+                                      'has_estimated_pattern_member': True})
+        sponsor['end'] = 200.0
+        keep = dict(_cross_promo_ad(), start=180.0, end=190.0)
+        segments = [{'start': 100.0, 'end': 160.0, 'text': 'brought to you by Acme'},
+                    {'start': 210.0, 'end': 240.0, 'text': 'back to the show'}]
+        analysis = AudioAnalysisResult(
+            silence_spans=[{'start': 160.0, 'end': 200.0, 'duration': 40.0}])
+
+        m = _run_pipeline([sponsor, keep], {'sponsor': 'remove', 'cross_promo': 'keep'},
+                          segments=segments, real_refine_reviewer=True, duration=300.0,
+                          audio_analysis_result=analysis,
+                          reviewer_side_effect=lambda cuts, markers: (cuts, markers))
+
+        call = m['local_ap'].process_episode.call_args
+        assert [(a['start'], a['end']) for a in call.args[1]] == [
+            (100.0, 180.0), (190.0, 200.0)]
+        assert (180.0, 190.0) in {(b['start'], b['end'])
+                                  for b in call.kwargs['hard_barriers']}
+        saved = m['storage'].save_combined_ads.call_args.args[2]
+        kept = [a for a in saved if a.get('action_applied') == 'keep']
+        assert [(a['start'], a['end'], a['was_cut']) for a in kept] == [(180.0, 190.0, False)]
+        assert not any(a.get('held_for_review') for a in saved)
+
+    def test_pass1_reviewer_gets_keeps_as_hard_barriers(self):
+        keep = _cross_promo_ad()
+        m = _run_pipeline([_sponsor_ad(), keep],
+                          {'sponsor': 'remove', 'cross_promo': 'keep'})
+
+        assert keep in m['reviewer'].call_args.kwargs['keep_ads']
+
+    def test_pass1_user_rejections_are_hard_for_reviewer_and_render(self):
+        fp = {'start': 70.0, 'end': 80.0}
+        m = _run_pipeline([_sponsor_ad()], {'sponsor': 'remove'},
+                          false_positive_corrections=[fp])
+
+        assert fp in m['reviewer'].call_args.kwargs['user_rejects']
+        assert fp in m['local_ap'].process_episode.call_args.kwargs['hard_barriers']
+
+    def test_corrections_are_read_once_per_run(self):
+        fp = {'start': 70.0, 'end': 80.0}
+        m = _run_pipeline([_sponsor_ad()], {'sponsor': 'remove'},
+                          real_refine_reviewer=True, false_positive_corrections=[fp])
+
+        assert m['result'] is True
+        assert m['db'].get_false_positive_corrections.call_count == 1
+        assert m['db'].get_confirmed_corrections.call_count == 1
+
+    def test_reviewer_trim_learns_only_after_final_applied_cut(self):
+        marker = dict(_sponsor_ad(), sponsor='Acme Tools',
+                      detection_stage='claude')
+        seen_verification = []
+
+        def trim(cuts, markers):
+            adjusted = dict(cuts[0], start=12.0, end=28.0)
+            return [adjusted], [adjusted]
+
+        def verify(ctx, processed_path, applied_cuts, *args, **kwargs):
+            seen_verification.append(True)
+            assert [(cut['start'], cut['end']) for cut in applied_cuts] == [
+                (12.0, 28.0)]
+            return 0, [], [], [], processed_path, 0, True, 0
+
+        def learn(ads, segments, slug, episode_id, audio_path=None):
+            assert seen_verification == [True]
+            assert [(ad['start'], ad['end']) for ad in ads] == [(12.0, 28.0)]
+            assert audio_path == '/tmp/keep.mp3'
+            return 1
+
+        with patch.object(processing.ad_detector, 'learn_from_detections',
+                          side_effect=learn) as learning:
+            result = _run_pipeline(
+                [marker], {'sponsor': 'remove'},
+                reviewer_side_effect=trim,
+                verification_side_effect=verify)
+
+        assert result['result'] is True
+        learning.assert_called_once()
+
+    def test_reviewer_reject_does_not_learn(self):
+        marker = dict(_sponsor_ad(), sponsor='Acme Tools',
+                      detection_stage='claude')
+
+        def reject(cuts, markers):
+            markers[0]['was_cut'] = False
+            return [], markers
+
+        with patch.object(processing.ad_detector, 'learn_from_detections') as learning:
+            result = _run_pipeline(
+                [marker], {'sponsor': 'remove'},
+                reviewer_side_effect=reject)
+
+        assert result['result'] is True
+        learning.assert_not_called()
+
+    def test_failed_render_does_not_learn(self):
+        marker = dict(_sponsor_ad(), sponsor='Acme Tools',
+                      detection_stage='claude')
+        with patch.object(processing.ad_detector, 'learn_from_detections') as learning:
+            result = _run_pipeline([marker], {'sponsor': 'remove'},
+                                   render_fails=True)
+        assert result['result'] is False
+        learning.assert_not_called()
+
+    def test_failed_render_leaves_saved_markers_unchanged(self):
+        saved = [{'start': 50.0, 'end': 70.0, 'confidence': 0.9, 'was_cut': True}]
+        marker = dict(_sponsor_ad(), sponsor='Acme Tools')
+
+        def save_mid_run(cuts, markers):
+            processing.storage.save_combined_ads('keep-feed', 'ep1', markers)
+            return cuts, markers
+
+        m = _run_pipeline([marker], {'sponsor': 'remove'}, render_fails=True,
+                          reviewer_side_effect=save_mid_run,
+                          episode_row={'ad_markers_json': json.dumps(saved)})
+
+        assert m['result'] is False
+        assert m['storage'].save_combined_ads.call_args.args[2] == saved
+
+    def test_failure_after_the_row_is_persisted_keeps_the_new_markers(self):
+        saved = [{'start': 50.0, 'end': 70.0, 'confidence': 0.9, 'was_cut': True}]
+
+        def finalize(*args, on_persisted=None, **kwargs):
+            on_persisted()
+            raise RuntimeError('history write failed')
+
+        m = _run_pipeline([_sponsor_ad()], {'sponsor': 'remove'},
+                          finalize_side_effect=finalize,
+                          episode_row={'ad_markers_json': json.dumps(saved)})
+
+        assert m['result'] is False
+        assert m['storage'].save_combined_ads.call_args.args[2] != saved
+
+    def test_cancelled_run_restores_markers_saved_mid_run(self):
+        saved = [{'start': 50.0, 'end': 70.0, 'confidence': 0.9, 'was_cut': True}]
+        storages = []
+
+        def save_mid_run(cuts, markers):
+            storages.append(processing.storage)
+            processing.storage.save_combined_ads('keep-feed', 'ep1', markers)
+            return cuts, markers
+
+        with pytest.raises(processing.ProcessingCancelled):
+            _run_pipeline([dict(_sponsor_ad(), sponsor='Acme Tools')], {'sponsor': 'remove'},
+                          reviewer_side_effect=save_mid_run,
+                          verification_side_effect=processing.ProcessingCancelled,
+                          episode_row={'ad_markers_json': json.dumps(saved)})
+
+        [storage] = storages
+        assert storage.save_combined_ads.call_count == 2
+        assert storage.save_combined_ads.call_args.args[2] == saved
+
+    def test_finalize_reports_persistence_before_the_summary_can_fail(self):
+        persisted = []
+        with patch.object(processing, '_persist_episode_state'), \
+             patch.object(processing, '_refresh_rss_for_slug'), \
+             patch.object(processing, '_log_completion_summary',
+                          side_effect=RuntimeError('credit failed')), \
+             pytest.raises(RuntimeError):
+            processing._finalize_episode(
+                'keep-feed', 'ep1', 'Episode', 'Podcast', 1, 0, 1, 100.0, 90.0,
+                0.0, on_persisted=lambda: persisted.append(True))
+        assert persisted == [True]
+
+    def test_cancelled_verification_does_not_learn(self):
+        marker = dict(_sponsor_ad(), sponsor='Acme Tools',
+                      detection_stage='claude')
+        with patch.object(processing.ad_detector, 'learn_from_detections') as learning:
+            with pytest.raises(processing.ProcessingCancelled):
+                _run_pipeline(
+                    [marker], {'sponsor': 'remove'},
+                    verification_side_effect=processing.ProcessingCancelled)
+        learning.assert_not_called()
+
+    def test_pass2_recut_must_still_cover_final_pass1_marker(self):
+        marker = dict(_sponsor_ad(), sponsor='Acme Tools',
+                      detection_stage='claude')
+
+        def verify(ctx, processed_path, applied_cuts, *args, **kwargs):
+            applied_cuts[:] = [{'start': 11.0, 'end': 19.0}]
+            return 0, [], [], [], processed_path, 0, True, 0
+
+        with patch.object(processing.ad_detector, 'learn_from_detections') as learning:
+            result = _run_pipeline(
+                [marker], {'sponsor': 'remove'},
+                verification_side_effect=verify)
+        assert result['result'] is True
+        learning.assert_not_called()
 
     def test_pass2_rediscovery_of_a_kept_span_persists_one_marker(self):
         """Pass 2 rescans audio the keep left in place, so it can re-detect a
@@ -251,6 +359,19 @@ class TestKeepBypass:
         assert ('INFO: Pass 2 also held this span (cue_unproven)'
                 in marker['validation']['flags'])
 
+    def test_pass1_holds_are_render_cut_barriers(self):
+        sponsor = _sponsor_ad()
+        held = dict(_cross_promo_ad(), start=50.0, end=90.0)
+        segment_actions = {'sponsor': 'remove', 'cross_promo': 'remove',
+                           'self_promo': 'remove', 'interaction': 'remove',
+                           'intro': 'remove', 'outro': 'remove', 'recap': 'remove'}
+
+        m = _run_pipeline([sponsor, held], segment_actions,
+                          held_categories=['cross_promo'])
+
+        barriers = m['local_ap'].process_episode.call_args.kwargs['cut_barriers']
+        assert [(b['start'], b['end']) for b in barriers] == [(50.0, 90.0)]
+
     def test_all_remove_is_byte_identical(self):
         sponsor = _sponsor_ad()
         cross_promo = _cross_promo_ad()
@@ -276,6 +397,115 @@ class TestKeepBypass:
         }
         audio_segments = m['local_ap'].process_episode.call_args.args[1]
         assert all(s['beep'] is False for s in audio_segments)
+
+
+class TestAppliedCutsAreTheFinalAuthority:
+    ACTIONS = {'sponsor': 'remove', 'cross_promo': 'keep', 'interaction': 'beep'}
+
+    def test_two_markers_merged_into_one_render_count_once(self):
+        a = dict(_sponsor_ad(), start=10.0, end=20.0)
+        b = dict(_sponsor_ad(), start=20.5, end=30.0)
+
+        m = _run_pipeline([a, b], self.ACTIONS,
+                          render=lambda ads: [applied_cut(10.0, 30.0)])
+
+        args = m['finalize'].call_args.args
+        assert args[4] + args[5] == 1
+        assert m['finalize'].call_args.kwargs['run_stats']['markers']['cut'] == 2
+        saved = m['storage'].save_combined_ads.call_args.args[2]
+        assert all(marker['was_cut'] for marker in saved)
+
+    def test_marker_outside_the_applied_cuts_persists_not_cut(self):
+        a = dict(_sponsor_ad(), start=10.0, end=20.0)
+        b = dict(_sponsor_ad(), start=50.0, end=55.0)
+
+        m = _run_pipeline([a, b], self.ACTIONS,
+                          render=lambda ads: [applied_cut(10.0, 20.0)])
+
+        saved = m['storage'].save_combined_ads.call_args.args[2]
+        by_span = {(x['start'], x['end']): x['was_cut'] for x in saved}
+        assert by_span == {(10.0, 20.0): True, (50.0, 55.0): False}
+        args = m['finalize'].call_args.args
+        assert args[4] + args[5] == 1
+
+    def test_paid_tail_beside_a_kept_neighbor_is_cut_and_the_keep_is_not(self):
+        sponsor = dict(_sponsor_ad(), start=10.0, end=60.0)
+        keep = dict(_cross_promo_ad(), start=10.0, end=40.0)
+
+        m = _run_pipeline([sponsor, keep], self.ACTIONS)
+
+        call = m['local_ap'].process_episode.call_args
+        assert (10.0, 40.0) in {(b['start'], b['end']) for b in call.kwargs['hard_barriers']}
+        saved = m['storage'].save_combined_ads.call_args.args[2]
+        by_span = {(x['start'], x['end']): x['was_cut'] for x in saved}
+        assert by_span == {(10.0, 40.0): False, (40.0, 60.0): True}
+
+    def test_duration_fields_follow_the_rendered_cuts(self):
+        remove = dict(_sponsor_ad(), start=10.0, end=20.0)
+        beep = dict(_sponsor_ad(), start=50.0, end=60.0, category='interaction')
+
+        m = _run_pipeline(
+            [remove, beep], self.ACTIONS, new_duration=91.0,
+            render=lambda ads: [applied_cut(10.0, 20.0, 1.0), applied_cut(50.0, 60.0, 10.0)])
+
+        stats = m['finalize'].call_args.kwargs['run_stats']
+        assert stats['seconds_removed'] == 9.0
+        assert stats['source_seconds_removed'] == 20.0
+        assert stats['replacement_seconds_added'] == 11.0
+        assert stats['seconds_removed'] == pytest.approx(
+            stats['source_seconds_removed'] - stats['replacement_seconds_added'])
+
+    def test_pass2_cut_counts_as_one_verification_cut(self):
+        pass1 = dict(_sponsor_ad(), start=10.0, end=20.0)
+        pass2 = {'start': 50.0, 'end': 60.0, 'category': 'sponsor', 'confidence': 0.95,
+                 'detection_stage': 'verification', 'was_cut': True,
+                 'action_applied': 'remove'}
+
+        m = _run_pipeline(
+            [pass1], self.ACTIONS,
+            verification_return=(1, [pass2], [applied_cut(50.0, 60.0)], [],
+                                 '/tmp/cut.mp3', 0, True, 0))
+
+        args = m['finalize'].call_args.args
+        assert (args[4], args[5]) == (1, 1)
+        stats = m['finalize'].call_args.kwargs['run_stats']
+        assert stats['verification_ads_cut'] == 1
+        assert stats['markers']['cut'] == 2
+
+    def test_pass2_cut_joining_a_pass1_cut_is_one_rendered_cut(self):
+        pass1 = dict(_sponsor_ad(), start=10.0, end=20.0)
+        pass2 = {'start': 20.0, 'end': 30.0, 'category': 'sponsor', 'confidence': 0.95,
+                 'detection_stage': 'verification', 'was_cut': True,
+                 'action_applied': 'remove'}
+
+        m = _run_pipeline(
+            [pass1], self.ACTIONS,
+            verification_return=(1, [pass2], [applied_cut(20.0, 30.0)], [],
+                                 '/tmp/cut.mp3', 0, True, 0))
+
+        args = m['finalize'].call_args.args
+        assert args[4] + args[5] == 1
+        assert m['finalize'].call_args.kwargs['run_stats']['verification_ads_cut'] == 1
+
+    def test_assets_see_the_list_saved_after_them(self):
+        a = dict(_sponsor_ad(), start=10.0, end=20.0)
+        b = dict(_sponsor_ad(), start=50.0, end=55.0)
+        seen = {}
+
+        def assets(*args, **kwargs):
+            seen['markers'] = kwargs['markers']
+            seen['was_cut'] = [x['was_cut'] for x in kwargs['markers']]
+            seen['cuts'] = args[3]
+            seen['saves'] = processing.storage.save_combined_ads.call_count
+
+        m = _run_pipeline([a, b], self.ACTIONS, assets_side_effect=assets,
+                          render=lambda ads: [applied_cut(10.0, 20.0)])
+
+        save = m['storage'].save_combined_ads
+        assert save.call_count == seen['saves'] + 1
+        assert save.call_args.args[2] is seen['markers']
+        assert [x['was_cut'] for x in save.call_args.args[2]] == seen['was_cut'] == [True, False]
+        assert seen['cuts'] == [applied_cut(10.0, 20.0)]
 
 
 class TestKeepMarkersBlockTerminalSnap:
@@ -450,15 +680,21 @@ class TestKeepMarkersBlockTerminalSnap:
         storage.save_combined_ads.assert_not_called()
 
     def test_tail_completion_clamp_still_stops_at_kept_marker(self):
-        # _complete_cut_tails' next_start clamp treats every marker in
-        # all_ads_with_validation as a hard stop, kept or not. Promo-phrase
-        # segments after the cut would otherwise extend its end to 45.0;
-        # the kept marker's start at 35.0 must cap it there instead.
-        segments = [
-            {'start': 20.0, 'end': 25.0, 'text': 'use promo code SAVE10 today'},
-            {'start': 25.0, 'end': 45.0,
-             'text': 'use promo code SAVE10 again and again'},
-        ]
+        # A kept marker caps a timed CTA extension at its start.
+        def timed_cta(start, end):
+            text = 'Visit acme.com for the listener offer.'
+            tokens = text.split()
+            step = (end - start) / len(tokens)
+            return {
+                'start': start, 'end': end, 'text': text,
+                'words': [
+                    {'word': token, 'start': start + index * step,
+                     'end': start + (index + 1) * step}
+                    for index, token in enumerate(tokens)
+                ],
+            }
+
+        segments = [timed_cta(20.0, 25.0), timed_cta(25.0, 45.0)]
         terminal_ad = {'start': 10.0, 'end': 20.0, 'reason': 'Acme sponsor read',
                        'detection_stage': 'text_pattern', 'confidence': 0.9,
                        'was_cut': True}
@@ -764,20 +1000,23 @@ class TestExcludeKeptSpansFromVerification:
         orig_overlap = {'start': 504.0, 'end': 514.0, 'confidence': 0.95,
                         'sponsor': 'Acme'}
 
+        ledger = processing.Pass2Ledger()
         with patch.object(processing, 'get_replacement_duration', return_value=1.0), \
                 caplog.at_level(logging.DEBUG, logger='podcast.audio'):
             out_proc, out_orig, conflicts = processing._exclude_kept_spans_from_verification(
-                [proc_overlap], [orig_overlap], [self.KEPT_MARKER], self.PASS1_CUTS)
+                [proc_overlap], [orig_overlap], [self.KEPT_MARKER], self.PASS1_CUTS,
+                ledger=ledger)
+            ledger.emit('example-podcast', 'a1b2c3d4e5f6')
 
         assert out_proc == []
         assert out_orig == []
         assert conflicts == []
         assert 'held_for_review' not in orig_overlap
-        assert any('the category action keeps' in r.message
+        assert any('Pass-2 span 504.0s-514.0s: dropped:inside_kept' in r.message
                    for r in caplog.records)
 
         # Nothing routes to a cut: the kept span is never cut through.
-        v_ads_to_cut, v_ads_for_ui, v_ads_held, n = processing._gate_verification_ads_by_confidence(
+        v_ads_to_cut, v_ads_for_ui, v_ads_held, n, _rel = processing._gate_verification_ads_by_confidence(
             out_proc, out_orig, min_cut_confidence=0.5)
         assert v_ads_to_cut == []
         assert n == 0
@@ -798,7 +1037,7 @@ class TestExcludeKeptSpansFromVerification:
 
         # Confidence 0.95 >= min_cut_confidence 0.5: confirmed-cut path,
         # unaffected since this finding never overlapped a kept span.
-        v_ads_to_cut, v_ads_for_ui, v_ads_held, _n = processing._gate_verification_ads_by_confidence(
+        v_ads_to_cut, v_ads_for_ui, v_ads_held, _n, _rel = processing._gate_verification_ads_by_confidence(
             out_proc, out_orig, min_cut_confidence=0.5)
         assert v_ads_to_cut == [proc_clear]
         assert v_ads_for_ui == [orig_clear]
@@ -815,43 +1054,66 @@ class TestExcludeKeptSpansFromVerification:
         assert out_orig is orig
         assert conflicts == []
 
-    def test_false_positive_match_is_dropped_not_held(self, caplog):
-        """A span the user already rejected must not resurface in the
-        review queue as a kept-conflict (exclusion runs before validation,
-        so it screens corrections itself)."""
-        proc_overlap = {'start': 405.0, 'end': 415.0, 'confidence': 0.95,
-                        'validation': {'decision': 'ACCEPT', 'adjusted_confidence': 0.95}}
-        orig_overlap = {'start': 504.0, 'end': 514.0, 'confidence': 0.95,
-                        'sponsor': 'Acme'}
+    def _exclude(self, proc, orig, kept=None, cuts=None):
+        with patch.object(processing, 'get_replacement_duration', return_value=1.0):
+            return processing._exclude_kept_spans_from_verification(
+                [proc], [orig], kept or [self.KEPT_MARKER],
+                self.PASS1_CUTS if cuts is None else cuts)
 
-        with patch.object(processing, 'get_replacement_duration', return_value=1.0), \
-                caplog.at_level(logging.DEBUG, logger='podcast.audio'):
-            out_proc, out_orig, conflicts = processing._exclude_kept_spans_from_verification(
-                [proc_overlap], [orig_overlap], [self.KEPT_MARKER], self.PASS1_CUTS,
-                false_positive_corrections=[{'start': 503.0, 'end': 515.0}])
-
-        assert out_proc == []
-        assert out_orig == []
-        assert conflicts == []
-        assert 'held_for_review' not in orig_overlap
-        assert any('false-positive rejection' in r.message for r in caplog.records)
-
-    def test_a_finding_reaching_past_the_kept_span_is_held_for_review(self):
-        """A 90 s read that clips a 20 s keep by a second is mostly audio the
-        operator never ruled on: hold it rather than drop it with the keep."""
+    def test_a_finding_reaching_past_the_kept_span_is_split(self):
+        """A 90 s read that clips a 20 s keep by a second keeps its outside
+        residual as a removable fragment instead of a whole-span hold."""
         proc_overlap = {'start': 420.0, 'end': 510.0, 'confidence': 0.95}
         orig_overlap = {'start': 519.0, 'end': 609.0, 'confidence': 0.95}
 
-        with patch.object(processing, 'get_replacement_duration', return_value=1.0):
-            out_proc, out_orig, conflicts = processing._exclude_kept_spans_from_verification(
-                [proc_overlap], [orig_overlap], [self.KEPT_MARKER], self.PASS1_CUTS)
+        out_proc, out_orig, conflicts = self._exclude(proc_overlap, orig_overlap)
 
-        assert out_proc == []
-        assert out_orig == []
-        assert conflicts == [orig_overlap]
-        assert orig_overlap['held_for_review'] is True
-        assert orig_overlap['was_cut'] is False
-        assert orig_overlap['hold_reason'] == HOLD_REASON_VERIFICATION_KEPT_CONFLICT
+        assert [(a['start'], a['end']) for a in out_proc] == [(421.0, 510.0)]
+        assert [(a['start'], a['end']) for a in out_orig] == [(520.0, 609.0)]
+        assert conflicts == []
+        assert not out_orig[0].get('held_for_review')
+        assert out_proc[0]['_measured_split_fragment'] is True
+        assert 'held_for_review' not in orig_overlap
+
+    def test_split_fragments_map_across_a_pass1_cut(self):
+        """Edges carve in processed time and each maps back on its own side of the cut."""
+        cuts = [{'start': 100.0, 'end': 200.0, 'replacement_duration': 1.0}]
+        # Original 210-220 sits at processed 111-121.
+        kept = [{'start': 210.0, 'end': 220.0, 'action_applied': 'keep'}]
+        proc = {'start': 80.0, 'end': 140.0, 'confidence': 0.95}
+        orig = {'start': 80.0, 'end': 239.0, 'confidence': 0.95}
+
+        out_proc, out_orig, conflicts = self._exclude(proc, orig, kept, cuts)
+
+        assert [(a['start'], a['end']) for a in out_proc] == [
+            (80.0, 111.0), (121.0, 140.0)]
+        assert [(a['start'], a['end']) for a in out_orig] == [
+            (80.0, 210.0), (220.0, 239.0)]
+        assert conflicts == []
+
+    def test_only_a_fragment_inside_a_replacement_beep_is_held(self):
+        # A 0.5 s cut rendered as a 3 s beep: processed 101-103 maps to no original audio.
+        cuts = [{'start': 100.0, 'end': 100.5, 'replacement_duration': 3.0}]
+        kept = [{'start': 100.5, 'end': 120.0, 'action_applied': 'keep'}]
+        proc = {'start': 101.0, 'end': 150.0, 'confidence': 0.95}
+        orig = {'start': 100.5, 'end': 147.5, 'confidence': 0.95}
+
+        with patch.object(processing, 'get_replacement_duration', return_value=3.0):
+            out_proc, out_orig, conflicts = processing._exclude_kept_spans_from_verification(
+                [proc], [orig], kept, cuts)
+
+        assert [(a['start'], a['end']) for a in out_orig] == [(120.0, 147.5)]
+        assert [(a['start'], a['end']) for a in out_proc] == [(122.5, 150.0)]
+        assert [(c['start'], c['end'], c['hold_reason']) for c in conflicts] == [
+            (100.5, 101.0, 'verification_kept_conflict')]
+        assert 'held_for_review' not in orig
+
+    def test_a_short_untrusted_residual_is_dropped(self):
+        proc = {'start': 415.0, 'end': 423.0, 'confidence': 0.95}
+        orig = {'start': 514.0, 'end': 522.0, 'confidence': 0.95}
+
+        assert self._exclude(proc, orig) == ([], [], [])
+        assert 'held_for_review' not in orig
 
 
 class TestContainmentIsMeasuredAgainstEveryOverlappingKeep:
@@ -877,15 +1139,16 @@ class TestContainmentIsMeasuredAgainstEveryOverlappingKeep:
         assert (out_proc, out_orig, conflicts) == ([], [], [])
         assert 'held_for_review' not in orig
 
-    def test_a_finding_the_union_only_half_covers_is_held(self):
+    def test_a_finding_the_union_only_half_covers_keeps_one_tail(self):
         proc = {'start': 421.0, 'end': 461.0, 'confidence': 0.95}
         orig = {'start': 520.0, 'end': 560.0, 'confidence': 0.95}
 
         out_proc, out_orig, conflicts = self._exclude(proc, orig)
 
-        assert (out_proc, out_orig) == ([], [])
-        assert conflicts == [orig]
-        assert orig['hold_reason'] == HOLD_REASON_VERIFICATION_KEPT_CONFLICT
+        assert [(a['start'], a['end']) for a in out_proc] == [(441.0, 461.0)]
+        assert [(a['start'], a['end']) for a in out_orig] == [(540.0, 560.0)]
+        assert conflicts == []
+        assert 'hold_reason' not in orig
 
 
 class TestStampPass2MarkerCategories:
@@ -962,7 +1225,7 @@ class TestPartitionPass2CategoryActions:
         assert 'action_applied' not in processed
         assert 'action_applied' not in original
 
-        processing._stamp_pass2_cut_actions(out_p, out_o, self.ACTIONS)
+        processing._partition_cut_actions([*out_p, *out_o], self.ACTIONS)
 
         assert processed['action_applied'] == expected
         assert original['action_applied'] == expected
@@ -981,7 +1244,7 @@ class TestPartitionPass2CategoryActions:
             assert 'action_applied' not in marker
             assert marker['keep_overridden_by_pattern'] is True
 
-        processing._stamp_pass2_cut_actions(out_p, out_o, self.ACTIONS)
+        processing._partition_cut_actions([*out_p, *out_o], self.ACTIONS)
         assert processed['action_applied'] == 'remove'
         assert original['action_applied'] == 'remove'
 
@@ -999,7 +1262,7 @@ class TestPartitionPass2CategoryActions:
         assert 'action_applied' not in processed
         assert 'action_applied' not in original
 
-        processing._stamp_pass2_cut_actions(out_p, out_o, self.ACTIONS)
+        processing._partition_cut_actions([*out_p, *out_o], self.ACTIONS)
         assert processed['action_applied'] == 'remove'
         assert original['action_applied'] == 'remove'
 
@@ -1034,20 +1297,15 @@ class TestPartitionPass2CategoryActions:
         assert out_p == []
         assert out_o == []
 
-    def test_pass1_and_pass2_keeps_share_processed_barrier_list(self):
+    def test_pass1_keeps_map_to_processed_barriers(self):
         pass1_keep = {'start': 100.0, 'end': 120.0, 'action_applied': 'keep'}
-        pass2_keep = {'start': 200.0, 'end': 220.0, 'action_applied': 'keep'}
         pass1_cuts = [
             {'start': 20.0, 'end': 40.0, 'replacement_duration': 1.0},
         ]
 
-        barriers = processing._pass2_keep_barriers_processed(
-            [pass1_keep], pass1_cuts, [pass2_keep])
+        barriers = processing._pass2_keep_barriers_processed([pass1_keep], pass1_cuts)
 
-        assert [(marker['start'], marker['end']) for marker in barriers] == [
-            (81.0, 101.0), (200.0, 220.0),
-        ]
-        assert barriers[1] is pass2_keep
+        assert [(marker['start'], marker['end']) for marker in barriers] == [(81.0, 101.0)]
         assert (pass1_keep['start'], pass1_keep['end']) == (100.0, 120.0)
 
     def test_remove_candidate_splits_around_beep_candidate(self):
@@ -1140,6 +1398,7 @@ class TestPartitionPass2CategoryActions:
             result = processing._run_verification_pass(
                 ctx, '/tmp/pass2-actions.mp3', [], False, 0.8,
                 audio_processor, None, segment_actions=self.ACTIONS,
+                false_positive_corrections=[]
             )
 
         assert result[0] == 0
@@ -1185,6 +1444,7 @@ class TestPartitionPass2CategoryActions:
                     'action_applied': 'keep',
                 }],
                 segment_actions=self.ACTIONS,
+                false_positive_corrections=[]
             )
 
         # Dropped before the pass-2 category partition can stamp it: the
@@ -1229,3 +1489,78 @@ def test_a_finding_inside_a_kept_span_leaves_the_surviving_lists():
     assert surv_orig == [orig_clear]
     assert surv_proc == [proc_clear]
     assert conflicts == []
+
+
+REJECTED = (10.0, 60.0)
+KEPT_CUT = (70.0, 80.0)
+USER_CONFIRM = {'start': 10.0, 'end': 20.0, 'correction_type': 'confirm'}
+AUTO_CONFIRM = dict(USER_CONFIRM, auto_filed=True)
+# (confirmed corrections, expected rendered cuts, expected reject barriers)
+CONFIRM_CASES = [
+    pytest.param([USER_CONFIRM], [(10.0, 20.0), KEPT_CUT], [(20.0, 60.0)], id='user'),
+    pytest.param([AUTO_CONFIRM], [KEPT_CUT], [REJECTED], id='auto_filed'),
+]
+
+
+def _reject_the_first_marker(ads_to_remove, all_ads):
+    rejected = next(a for a in all_ads if (a['start'], a['end']) == REJECTED)
+    rejected.update(was_cut=False, source='reviewer', reviewer_verdict='reject')
+    return [a for a in ads_to_remove if a is not rejected], all_ads
+
+
+def _run_with_reviewer_reject(confirmed, verification_side_effect=None):
+    ads = [dict(_sponsor_ad(), start=REJECTED[0], end=REJECTED[1]),
+           dict(_sponsor_ad(), start=KEPT_CUT[0], end=KEPT_CUT[1])]
+    return _run_pipeline(ads, {'sponsor': 'remove'},
+                         reviewer_side_effect=_reject_the_first_marker,
+                         confirmed_corrections=[dict(c) for c in confirmed],
+                         verification_side_effect=verification_side_effect,
+                         duration=1000.0)
+
+
+def _recut_render(tmp_path, confirmed):
+    """The render call a real _recut_episode makes over the saved full-run state."""
+    saved = [{'start': REJECTED[0], 'end': REJECTED[1], 'confidence': 0.95,
+              'category': 'sponsor', 'detection_stage': 'llm', 'was_cut': False,
+              'source': 'reviewer', 'reviewer_verdict': 'reject'},
+             {'start': KEPT_CUT[0], 'end': KEPT_CUT[1], 'confidence': 0.95,
+              'category': 'sponsor', 'detection_stage': 'llm', 'was_cut': True}]
+    return _recut_render_call(tmp_path, saved, [dict(c) for c in confirmed])
+
+
+def _render_spans(call):
+    return (sorted((a['start'], a['end']) for a in call.args[1]),
+            sorted((b['start'], b['end']) for b in call.kwargs['hard_barriers']))
+
+
+@pytest.mark.parametrize('confirmed, cuts, barriers', CONFIRM_CASES)
+def test_full_run_renders_a_reviewer_reject_only_where_no_user_confirm(confirmed, cuts, barriers):
+    m = _run_with_reviewer_reject(confirmed)
+
+    call = m['local_ap'].process_episode.call_args
+    assert sorted((a['start'], a['end']) for a in call.args[1]) == cuts
+    hard = {(b['start'], b['end']) for b in call.kwargs['hard_barriers']}
+    assert set(barriers) <= hard
+    assert REJECTED not in hard or barriers == [REJECTED]
+
+
+@pytest.mark.parametrize('confirmed, cuts, barriers', CONFIRM_CASES)
+def test_full_run_and_recut_render_the_same_cuts_around_a_reviewer_reject(
+        tmp_path, confirmed, cuts, barriers):
+    m = _run_with_reviewer_reject(confirmed)
+
+    full_run = _render_spans(m['local_ap'].process_episode.call_args)
+    assert full_run == _render_spans(_recut_render(tmp_path, confirmed))
+    assert full_run[0] == cuts and set(barriers) <= set(full_run[1])
+
+
+def test_pass2_receives_the_reviewer_reject_minus_the_user_confirm():
+    seen = {}
+
+    def verification(*args, **kwargs):
+        seen.update(kwargs)
+        return (0, [], [], [], '/tmp/cut.mp3', 0, True, 0)
+
+    _run_with_reviewer_reject([USER_CONFIRM], verification_side_effect=verification)
+
+    assert [(r['start'], r['end']) for r in seen['pass1_reviewer_rejects']] == [(20.0, 60.0)]

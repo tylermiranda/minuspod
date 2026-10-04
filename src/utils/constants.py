@@ -159,7 +159,7 @@ def sanitize_sponsor_label(text, show_name: str | None = None) -> str | None:
     if not text:
         return None
     label = str(text).strip()
-    if is_sponsor_reasoning_rationale(label):
+    if is_sponsor_reasoning_rationale(label) or AUDIO_ECHO_RE.search(label):
         return None
     credit = _CREDIT_LEAD_IN_RE.match(label)
     if credit:
@@ -235,7 +235,7 @@ LEARNING_BRAND_ONSET_FRACTION = 0.6
 STRUCTURAL_FIELDS = frozenset({
     'start', 'end', 'start_time', 'end_time', 'start_timestamp', 'end_timestamp',
     'ad_start_timestamp', 'ad_end_timestamp', 'start_time_seconds', 'end_time_seconds',
-    'confidence', 'end_text', 'is_ad', 'type', 'classification',
+    'confidence', 'start_text', 'end_text', 'is_ad', 'type', 'classification',
     'start_seconds', 'end_seconds', 'duration', 'duration_seconds',
     'music_bed', 'music_bed_confidence',
     # 'category' and its aliases: the sponsor scan falls back to any short
@@ -764,6 +764,19 @@ AD_LANGUAGE_WORDS = frozenset({
 })
 
 
+# Audio telemetry the detection prompt shows the model; a reason quoting it describes the audio, not an ad.
+AUDIO_ECHO_RE = re.compile(
+    r'\bsplice_\d+(?:\.\d+)?\b|\bdai transition pair\b|\bvolume (?:anomaly|increase|decrease)\b'
+    r'|\b\d+(?:\.\d+)?\s*db\b|\bsplice evidence\b|\bloudness step\b|\bspectral step\b'
+    r'|\bdigital silence\b',
+    re.IGNORECASE)
+# Words an echo couples to the audio: "ad boundary", "ad transition", and "DAI" beside an echo token.
+_ECHO_MARK = '\x00'
+_ECHO_COUPLED_RE = re.compile(
+    r'\bad\s+(?:break\s+)?(?:boundar(?:y|ies)|transitions?)\b'
+    rf'|\bdai\W*(?={_ECHO_MARK})|(?<={_ECHO_MARK})\W*dai\b', re.IGNORECASE)
+
+
 def mentions_advertising(text) -> bool:
     """True if `text` calls the span an ad, the positive evidence the detection
     gate needs. Separate from the sponsor labeler, which answers what the
@@ -771,7 +784,11 @@ def mentions_advertising(text) -> bool:
     """
     if not text:
         return False
-    words = re.findall(r'[a-z]+', str(text).lower())
+    text = str(text)
+    if AUDIO_ECHO_RE.search(text):
+        # The echo describes the splice; a standalone "ad" or "ads" beside it still counts.
+        text = _ECHO_COUPLED_RE.sub(' ', AUDIO_ECHO_RE.sub(_ECHO_MARK, text))
+    words = re.findall(r'[a-z]+', text.lower())
     # A negated mention is the model saying the span is not an ad, so it is not
     # evidence that it is. Two tokens back covers "not a sponsor read".
     return any(w in AD_LANGUAGE_WORDS

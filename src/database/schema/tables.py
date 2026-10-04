@@ -208,6 +208,7 @@ TABLE_DDL['episode_details'] = """CREATE TABLE IF NOT EXISTS episode_details (
     original_segments_json TEXT,
     final_segments_json TEXT,
     applied_cuts_json TEXT,
+    repair_holes_json TEXT,
     created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
     FOREIGN KEY (episode_id) REFERENCES episodes(id) ON DELETE CASCADE
 )"""
@@ -281,7 +282,9 @@ TABLE_DDL['pattern_corrections'] = """CREATE TABLE IF NOT EXISTS pattern_correct
     created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
     sponsor_id INTEGER REFERENCES known_sponsors(id),
     source_hold_reason TEXT,
-    fp_suppressed INTEGER DEFAULT 0
+    fp_suppressed INTEGER DEFAULT 0,
+    origin TEXT NOT NULL DEFAULT 'user',
+    hold_id TEXT
 )"""
 
 TABLE_DDL['processing_runs'] = """CREATE TABLE IF NOT EXISTS processing_runs (

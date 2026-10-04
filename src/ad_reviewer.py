@@ -1,32 +1,44 @@
 """Opt-in LLM ad reviewer."""
+import json
 import logging
 import math
 import re
 import time
+from bisect import bisect_left, bisect_right
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
+from itertools import accumulate
 from typing import Literal
 from collections.abc import Callable
 
 from config import (
     resolve_stage_tunables,
+    UNREVIEWABLE_GAP_SECONDS,
     AD_REVIEWER_PARALLEL_ADS_DEFAULT,
     AD_REVIEWER_PARALLEL_ADS_MIN,
     AD_REVIEWER_PARALLEL_ADS_MAX,
     resolve_env_backed_default,
     HOLD_REASON_REVIEWER_CONTRADICTION,
     HOLD_REASON_REVIEWER_BOUNDARY_CONFLICT,
+    HOLD_REASON_REVIEWER_FAILED,
+    HOLD_REASON_REVIEWER_INCONCLUSIVE_BOUNDS,
     HOLD_REASON_REVIEWER_REJECT_CONFLICT,
     AUDIO_CUE_ROLE_DEFAULT,
     AUDIO_CUE_ROLE_NON_AD,
     AUDIO_CUE_TYPE_CONTENT_TRANSITION,
+    AUDIO_CUE_SOURCE_TEMPLATE,
+    is_edge_cue_snapped,
     is_template_cue,
     measured_evidence,
     MIN_AD_DURATION_FOR_REMOVAL,
+    MIN_CUT_CONFIDENCE,
     coerce_bool_setting,
     resolve_max_boundary_shift,
 )
 from audio_enforcer import content_anchors
+from ad_detector.boundaries import timed_line_segments
+from ad_detector.cue_boundary_snap import SNAP_GAP_SECONDS
+from text_pattern_matcher import is_defined_pattern
 from database import DEFAULT_REVIEW_PROMPT, DEFAULT_RESURRECT_PROMPT
 from llm_capabilities import PASS_REVIEWER_1, PASS_REVIEWER_2
 from llm_route import (
@@ -35,16 +47,20 @@ from llm_route import (
 )
 from run_context import route_for_phase, run_in_worker_thread
 from llm_client import (
+    extract_error_body,
     get_effective_provider,
     get_llm_max_retries, get_llm_timeout, is_rate_limit_error,
-    ProviderRateLimitedError, StructuralRateLimitError,
+    is_review_inconclusive_error, ProviderRateLimitedError,
+    StructuralRateLimitError,
 )
 from utils.llm_call import call_llm, call_llm_for_window, schema_format_for
 from utils.llm_response import extract_json_ads_array, extract_json_object
 from utils.markers import (
-    COARSE_MEMBER_STAGES, dai_core_bounds, finite_number,
-    invalidate_tail_provenance, protected_member_spans, span_bounds,
-    spans_match,
+    COARSE_MEMBER_STAGES, EDGE_TOLERANCE, clip_merge_spans,
+    dai_core_bounds, dai_core_spans, dai_probe_spans, edge_support,
+    finite_number, hard_member_spans, hard_members, invalidate_tail_provenance,
+    member_spans, reviewer_independent_spans, set_reviewer_locks, span_bounds, spans_match,
+    silent_absorbed_spans, TimedWords, timed_span, union_cover,
 )
 from utils.prompt import (
     format_sponsor_block, render_prompt, apply_override,
@@ -54,10 +70,12 @@ from utils.text import (
     BOUNDARY_SNAP_TOLERANCE_S,
     get_timestamped_transcript_for_range,
     get_timestamped_words_for_range,
+    transcript_gaps,
 )
+from utils.time import overlap_seconds
 
 
-Verdict = Literal["confirmed", "adjust", "reject", "resurrect", "failure"]
+Verdict = Literal["confirmed", "adjust", "reject", "resurrect", "inconclusive", "failure"]
 
 # Structured-output schema for review calls (#694), gated like detection.
 # Wrapped under "ads" so extract_json_ads_array parses the envelope unchanged.
@@ -99,6 +117,117 @@ def _review_failure_reason(error: Exception) -> str:
     return "Review unavailable: LLM call failed"
 
 
+_INCONCLUSIVE_REASONS = frozenset({
+    'transcript_gap', 'ambiguous_spans', 'insufficient_evidence',
+    'no_valid_pairs', 'choice_inconclusive', 'invalid_pair',
+    'proposed_range_not_confirmed', 'original_range_not_confirmed',
+    'missing_boundary_coverage',
+})
+_INCONCLUSIVE_STAGES = frozenset({
+    'context', 'evidence', 'choice_rank', 'focused_validation',
+    'boundary_coverage',
+})
+
+
+def _review_inconclusive_reason(error: Exception) -> str:
+    """Return a bounded, allowlisted reason from an inconclusive response."""
+    body = extract_error_body(error)
+    if isinstance(body, str):
+        try:
+            body = json.loads(body)
+        except (TypeError, ValueError):
+            body = None
+    if not isinstance(body, dict):
+        return "Review inconclusive"
+    details = body.get('error') if isinstance(body.get('error'), dict) else body
+    reason = details.get('reason')
+    if not isinstance(reason, str) or reason not in _INCONCLUSIVE_REASONS:
+        reason = None
+    parts = [
+        f"Reviewer abstained: {reason.replace('_', ' ')}."
+        if reason else "Reviewer abstained."
+    ]
+    for key in ('stage', 'score', 'threshold'):
+        value = details.get(key)
+        if key == 'stage':
+            value = value if isinstance(value, str) and value in _INCONCLUSIVE_STAGES else None
+            if value:
+                parts.append(f"Stage: {value.replace('_', ' ')};")
+        elif isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
+            parts.append(f"{key}: {value};")
+        else:
+            value = None
+    parts.append("Original marker retained.")
+    return " ".join(parts).replace('; Original', ". Original")
+
+
+REVIEWER_FAILED_SUPPORTED_FLAG = 'INFO: Reviewer failed; bounds supported'
+
+
+def abstain_hold_reason(verdict) -> str:
+    """Hold reason for a review that abstained or failed on unsupported bounds."""
+    if verdict.verdict == "failure":
+        return HOLD_REASON_REVIEWER_FAILED
+    return HOLD_REASON_REVIEWER_INCONCLUSIVE_BOUNDS
+
+
+def inconclusive_bounds_supported(ad: dict, db) -> bool:
+    """Whether independent evidence covers both edges of an abstained cut."""
+    start = finite_number(ad.get('start'))
+    end = finite_number(ad.get('end'))
+    if start is None or end is None or end <= start:
+        return False
+    if (ad.get('validation') or {}).get('user_confirmed'):
+        return True
+
+    # A core counts only once a probe measured it; legacy cores fall back to the leading window.
+    if (dai_probe_spans(ad) and union_cover(dai_core_spans(ad), start, end,
+                                            gap_tol=EDGE_TOLERANCE) == (start, end)):
+        return True
+
+    pair = ad.get('cue_pair') or {}
+    if (finite_number((pair.get('start') or {}).get('cue_end')) is not None
+            and finite_number((pair.get('end') or {}).get('cue_start')) is not None
+            and abs(start - (pair['start']['cue_end'] + 0.05)) <= EDGE_TOLERANCE
+            and abs(end - (pair['end']['cue_start'] - 0.05)) <= EDGE_TOLERANCE):
+        return True
+
+    snap = ad.get('cue_snap') or {}
+    if (all(is_edge_cue_snapped(ad, edge)
+            and (snap[edge].get('template_id') is not None)
+            and snap[edge].get('source') == AUDIO_CUE_SOURCE_TEMPLATE
+            and finite_number((snap.get(edge) or {}).get('original')) is not None
+            and finite_number((snap.get(edge) or {}).get('shift_seconds')) is not None
+            for edge in ('start', 'end'))
+            and abs(start - snap['start']['original']
+                    - snap['start']['shift_seconds']) <= EDGE_TOLERANCE
+            and abs(end - snap['end']['original']
+                    - snap['end']['shift_seconds']) <= EDGE_TOLERANCE):
+        return True
+
+    pattern_id = ad.get('pattern_id')
+    # A merge reaching past the match is unmeasured; an absorbed detection inside it is not.
+    protected_start = finite_number(ad.get('merged_protected_start'))
+    protected_end = finite_number(ad.get('merged_protected_end'))
+    if (pattern_id is None or db is None
+            or ad.get('detection_stage') != 'fingerprint'
+            or ad.get('merged_distinct_ads')
+            or finite_number(ad.get('fingerprint_match_start')) is None
+            or finite_number(ad.get('fingerprint_match_end')) is None
+            or abs(start - ad['fingerprint_match_start']) > EDGE_TOLERANCE
+            or abs(end - ad['fingerprint_match_end']) > EDGE_TOLERANCE
+            or (protected_start is not None and protected_start
+                < ad['fingerprint_match_start'] - EDGE_TOLERANCE)
+            or (protected_end is not None and protected_end
+                > ad['fingerprint_match_end'] + EDGE_TOLERANCE)):
+        return False
+    try:
+        pattern = db.get_ad_pattern_by_id(pattern_id)
+    except Exception:
+        return False
+    return bool(pattern and pattern.get('is_active') and is_defined_pattern(pattern))
+
+
 # Verdict/reasoning contradiction guard (spec 1.4). Verdicts come from
 # boundary arithmetic, so an unchanged span with not-an-ad reasoning ships
 # as "confirmed" -- hold those for review, never auto-reject. Patterns are
@@ -130,7 +259,7 @@ _CONTRADICTION_RES = tuple(re.compile(p) for p in REVIEWER_CONTRADICTION_PATTERN
 # a contradiction hold, even when a negation appears later in the same
 # prose. Boundary notes like "that interview material is not advertising"
 # refer to a sub-span the reviewer wants trimmed, not the candidate
-# (tosh-show 6e9f8a115e24, daily-tech-news-show 0b79e6e6c143 both held
+# (example-podcast a1b2c3d4e5f6, another-podcast f6e5d4c3b2a1 both held
 # real ad breaks this way). Assertion-shaped, like the negations above.
 #
 # TODO(structural): this affirmation/negation/trim-language regex triad is a
@@ -278,7 +407,7 @@ def reasoning_contradicts_cut(reasoning: str | None) -> bool:
 def _adjusted_ad_copy(ad: dict, start: float, end: float,
                       original_start: float, original_end: float,
                       reasoning: str | None, confidence: float | None,
-                      model: str | None) -> dict:
+                      model: str | None, locked_edges=()) -> dict:
     """Copy of ``ad`` with adjusted bounds and the reviewer bookkeeping
     fields every adjust application must stamp. Single seam so the two
     adjust paths (boundary-delta adjust, affirmed-confirm trim recovery)
@@ -287,6 +416,9 @@ def _adjusted_ad_copy(ad: dict, start: float, end: float,
     invalidate_tail_provenance(updated, end)
     updated["start"] = start
     updated["end"] = end
+    set_reviewer_locks(updated, locked_edges)
+    # Persist the trim so re-validation cannot restore dropped core or member evidence.
+    clip_merge_spans(updated, start, end)
     updated["reviewer_verdict"] = "adjust"
     updated["reviewer_moved"] = True
     updated["reviewer_original_start"] = original_start
@@ -297,18 +429,36 @@ def _adjusted_ad_copy(ad: dict, start: float, end: float,
     return updated
 
 
+def stamp_reviewer_fields(ad: dict, verdict: "ReviewVerdict", replace: bool = False) -> None:
+    """Copy the verdict fields onto an ad in place; replace also writes empty values over old ones."""
+    ad['reviewer_verdict'] = verdict.verdict
+    if replace or verdict.reasoning is not None:
+        ad['reviewer_reasoning'] = verdict.reasoning
+    if replace or verdict.confidence is not None:
+        ad['reviewer_confidence'] = verdict.confidence
+    if replace or verdict.model_used:
+        ad['reviewer_model'] = verdict.model_used
+    if verdict.verdict == 'failure' and not verdict.inconclusive_hold:
+        flags = ad.setdefault('validation', {}).setdefault('flags', [])
+        if REVIEWER_FAILED_SUPPORTED_FLAG not in flags:
+            flags.append(REVIEWER_FAILED_SUPPORTED_FLAG)
+
+
+def mark_reviewer_hold(ad: dict, verdict: "ReviewVerdict", reason: str,
+                       replace: bool = False) -> None:
+    """Hold an ad dict for review on a reviewer verdict, in place."""
+    stamp_reviewer_fields(ad, verdict, replace=replace)
+    ad['was_cut'] = False
+    ad['held_for_review'] = True
+    ad['hold_reason'] = reason
+    ad['source'] = 'reviewer'
+
+
 def _boundary_conflict_hold(ad: dict, verdict: "ReviewVerdict") -> dict:
     """Keep the original span when a proposed trim crosses protected evidence."""
     held = dict(ad)
-    held['was_cut'] = False
-    held['held_for_review'] = True
-    held['hold_reason'] = HOLD_REASON_REVIEWER_BOUNDARY_CONFLICT
+    mark_reviewer_hold(held, verdict, HOLD_REASON_REVIEWER_BOUNDARY_CONFLICT)
     held['reviewer_boundary_conflict'] = True
-    held['reviewer_verdict'] = verdict.verdict
-    held['reviewer_reasoning'] = verdict.reasoning
-    held['reviewer_confidence'] = verdict.confidence
-    held['reviewer_model'] = verdict.model_used
-    held['source'] = 'reviewer'
     held['reviewer_proposed_start'] = verdict.adjusted_start
     held['reviewer_proposed_end'] = verdict.adjusted_end
     return held
@@ -402,6 +552,226 @@ def _clamp_overrode(new_start, new_end, original_start, original_end,
                                       new_start, new_end))
 
 
+# Silence a supported edge needs before the next (or after the previous) speech.
+_SUPPORTED_EDGE_GAP_S = 0.3
+
+
+def _speech_units(segments) -> list[tuple[float, float]]:
+    """(start, end) of every timed word, or of the segment when it has none."""
+    spans = (timed_span(unit) for seg in segments or [] for unit in seg.get('words') or [seg])
+    return [span for span in spans if span]
+
+
+def _edge_matches(value: float, new: float) -> bool:
+    return abs(value - new) <= EDGE_TOLERANCE
+
+
+class _EdgeIndex:
+    """Speech units and timed words in one direction, sorted for end-edge queries."""
+
+    def __init__(self, units, words):
+        self.units = sorted(units)
+        self.los = [lo for lo, _hi in self.units]
+        self.max_his = list(accumulate((hi for _lo, hi in self.units), max))
+        self.unit_his = sorted(hi for _lo, hi in self.units)
+        self.words = set(words)
+        self.word_his = sorted(hi for _lo, hi in self.words)
+
+
+class TranscriptIndex:
+    """A transcript's speech units and timed words, indexed once per review for edge lookups."""
+
+    def __init__(self, segments):
+        units, words = _speech_units(segments), TimedWords(segments).spans
+        self.end = _EdgeIndex(units, words)
+        # Start edges are end edges on the negated timeline.
+        self.start = _EdgeIndex(_negated(units), _negated(words))
+        self.gaps = transcript_gaps([{'start': lo, 'end': hi} for lo, hi in self.end.units],
+                                    UNREVIEWABLE_GAP_SECONDS)
+
+
+def _edge_transcript_supported(index: TranscriptIndex, edge: str, new: float, old: float) -> bool:
+    """Whether an inward edge lands on a timed word edge with a pause past it."""
+    if edge == 'start':
+        return _end_edge_supported(index.start, -new, -old)
+    return _end_edge_supported(index.end, new, old)
+
+
+def _matching_ends(sorted_his: list[float], new: float) -> list[float]:
+    """Sorted ends within EDGE_TOLERANCE of new, decided by _edge_matches like the old scan."""
+    # Widened bisect window, then the exact abs() test: float rounding differs at the boundary.
+    lo_i = bisect_left(sorted_his, new - 2 * EDGE_TOLERANCE)
+    hi_i = bisect_right(sorted_his, new + 2 * EDGE_TOLERANCE)
+    return [hi for hi in sorted_his[lo_i:hi_i] if _edge_matches(hi, new)]
+
+
+def _end_edge_supported(ix: _EdgeIndex, new: float, old: float) -> bool:
+    matched = _matching_ends(ix.word_his, new)
+    if new >= old - EDGE_TOLERANCE or not matched:
+        return False
+    at = matched[-1]
+    after = bisect_right(ix.los, at - EDGE_TOLERANCE)
+    gap = (ix.los[after] if after < len(ix.los) else math.inf) - at
+    before = bisect_left(ix.los, at - EDGE_TOLERANCE)
+    crossed = before > 0 and ix.max_his[before - 1] > at + EDGE_TOLERANCE
+    return not crossed and gap >= _SUPPORTED_EDGE_GAP_S
+
+
+def _supported_edge_floor(ad: dict, independent, edge: str, value: float,
+                          lo_bound: float, hi_bound: float) -> float:
+    """Where a supported edge stops: short of any independent span it would enter."""
+    spans = list(independent)
+    cores = dai_core_spans(ad)
+    for p_lo, p_hi in dai_probe_spans(ad):
+        if (p_hi > value) if edge == 'end' else (p_lo < value):
+            # The unprobed rest of an entered block is unknown, so keep its whole region.
+            spans += [(c_lo, c_hi) for c_lo, c_hi in cores if c_lo <= p_lo and p_hi <= c_hi]
+    spans = [(max(lo, lo_bound), min(hi, hi_bound)) for lo, hi in spans]
+    if edge == 'end':
+        return max([value] + [hi for lo, hi in spans if hi > max(lo, value)])
+    return min([value] + [lo for lo, hi in spans if lo < min(hi, value)])
+
+
+def _negated(spans) -> list[tuple[float, float]]:
+    return [(-hi, -lo) for lo, hi in spans]
+
+
+def _speech_capped_floor(index: TranscriptIndex, independent, edge: str, proposed: float,
+                         floor: float) -> float | None:
+    """Unsupported-edge floor stopped at the word straddling it, or None to keep the floor."""
+    if edge == 'start':
+        capped = _end_capped_floor(index.start, _negated(independent), -proposed, -floor)
+        return None if capped is None else -capped
+    return _end_capped_floor(index.end, independent, proposed, floor)
+
+
+def _end_capped_floor(ix: _EdgeIndex, independent, proposed: float, floor: float) -> float | None:
+    if floor <= proposed:
+        return None
+    first = bisect_left(ix.los, proposed - EDGE_TOLERANCE)
+    straddler = None
+    # Only units starting between the proposal and the floor can straddle the floor.
+    for unit in ix.units[first:]:
+        if unit[0] >= floor:
+            break
+        if unit[1] > floor:
+            straddler = unit
+            break
+    # A segment without word timings may merge ad and show speech, so it never caps.
+    if straddler is None or straddler not in ix.words:
+        return None
+    word_lo = straddler[0]
+    snap = (ix.units[first] == straddler and word_lo - proposed < _SUPPORTED_EDGE_GAP_S
+            and bool(_matching_ends(ix.unit_his, proposed)))
+    capped = proposed if snap else max(word_lo, proposed)
+    if any(overlap_seconds(lo, hi, capped, floor) > 0 for lo, hi in independent):
+        return None
+    return capped
+
+
+def _timestamped_with_gaps(lines: list[dict], gaps, lo: float, hi: float,
+                           closed: bool = False) -> str:
+    """Timestamped transcript for [lo, hi] plus a note for each gap centred in it."""
+    in_range = [ln for ln in lines if ln.get('end', 0.0) >= lo and ln.get('start', 0.0) <= hi]
+    mine = [(g_lo, g_hi) for g_lo, g_hi in gaps
+            if lo <= (g_lo + g_hi) / 2 < hi or (closed and (g_lo + g_hi) / 2 == hi)]
+    if not mine:
+        return get_timestamped_transcript_for_range(in_range, lo, hi)
+    starts = [ln.get('start', 0.0) for ln in in_range]
+    parts, cut = [], 0
+    for g_lo, g_hi in mine:
+        at = bisect_right(starts, g_lo)
+        parts.append(get_timestamped_transcript_for_range(in_range[cut:at], lo, hi))
+        parts.append(f"[{g_lo:.2f}s-{g_hi:.2f}s] ({g_hi - g_lo:.1f} s of audio with no transcript)")
+        cut = at
+    parts.append(get_timestamped_transcript_for_range(in_range[cut:], lo, hi))
+    return '\n'.join(part for part in parts if part)
+
+
+def _hold_inward_edges(start: float, end: float, start_limits, end_limits,
+                       barriers) -> tuple[float, float]:
+    """Keep each edge from moving inward past its limits, stopping at a hard barrier before one.
+
+    Limits are (span edge, floor) pairs: the span edge triggers and filters barriers, the edge lands on floor.
+    """
+    for edge, floor in start_limits:
+        if start > edge:
+            start = max([floor] + [min(b['end'], start) for b in barriers
+                                   if b['start'] < start and b['end'] > edge])
+    for edge, floor in end_limits:
+        if end < edge:
+            end = min([floor] + [max(b['start'], end) for b in barriers
+                                 if b['end'] > end and b['start'] < edge])
+    return start, end
+
+
+def _untranscribed_limits(index: TranscriptIndex, original_start: float,
+                          original_end: float) -> tuple[list, list]:
+    """Edge limits from untranscribed stretches of UNREVIEWABLE_GAP_SECONDS or more inside the span."""
+    gaps = list(index.gaps)
+    units = index.end.units
+    if any(lo < original_end and hi > original_start for lo, hi in units):
+        # Audio before the first and after the last speech unit is untranscribed too.
+        gaps += [(original_start, units[0][0]), (index.end.max_his[-1], original_end)]
+    inside = [(max(lo, original_start), min(hi, original_end)) for lo, hi in gaps]
+    inside = [(lo, hi) for lo, hi in inside if hi - lo >= UNREVIEWABLE_GAP_SECONDS]
+    return [(lo, lo) for lo, _hi in inside], [(hi, hi) for _lo, hi in inside]
+
+
+def _silence_limits(ad: dict, original_start: float,
+                    original_end: float) -> tuple[list, list]:
+    """Edge limits from absorbed silence touching either edge."""
+    spans = silent_absorbed_spans(ad)
+    return ([(lo, min(lo, original_start)) for lo, _hi in spans
+             if lo <= original_start + EDGE_TOLERANCE],
+            [(hi, max(hi, original_end)) for _lo, hi in spans
+             if hi >= original_end - EDGE_TOLERANCE])
+
+
+def _cue_snap_limits(ad: dict, original_start: float,
+                     original_end: float) -> tuple[list, list]:
+    """Edge limits at the labelled template cues the ad's edges were snapped to."""
+    snap = ad.get('cue_snap') if isinstance(ad.get('cue_snap'), dict) else {}
+
+    def cue_edge(edge: str, key: str) -> float | None:
+        record = snap.get(edge)
+        if not isinstance(record, dict) or not is_template_cue(record):
+            return None
+        return finite_number(record.get(key))
+
+    starts, ends = [], []
+    # A start edge sits just after the cue ends; an end edge just before the cue starts.
+    cue_end = cue_edge('start', 'cue_end')
+    if cue_end is not None:
+        lim = cue_end + SNAP_GAP_SECONDS
+        if original_start - EDGE_TOLERANCE <= lim < original_end:
+            starts.append((lim, max(lim, original_start)))
+    cue_start = cue_edge('end', 'cue_start')
+    if cue_start is not None:
+        lim = cue_start - SNAP_GAP_SECONDS
+        if original_start < lim <= original_end + EDGE_TOLERANCE:
+            ends.append((lim, min(lim, original_end)))
+    return starts, ends
+
+
+def _hold_inward_limits(ad: dict, start: float, end: float, original_start: float,
+                        original_end: float, index: TranscriptIndex,
+                        barriers) -> tuple[float, float]:
+    """Apply the transcript-gap, boundary-cue and absorbed-silence no-cross rules in one call."""
+    limits = (_untranscribed_limits(index, original_start, original_end),
+              _cue_snap_limits(ad, original_start, original_end),
+              _silence_limits(ad, original_start, original_end))
+    return _hold_inward_edges(start, end, [lim for st, _ in limits for lim in st],
+                              [lim for _, en in limits for lim in en], barriers)
+
+
+def _floor_source(floor: float, proposed: float, core_edge: float) -> str:
+    """Name what stopped a reviewer edge, for the DAI core clamp log."""
+    if floor == proposed:
+        return 'none'
+    return 'DAI core' if floor == core_edge else 'independent span'
+
+
 # How far a reviewer proposal may cut into a measured merge member before the
 # ad is held. Tuned on its own: matching BOUNDARY_SNAP_TOLERANCE_S is chance.
 _MEASURED_MEMBER_TOLERANCE_S = 3.0
@@ -423,6 +793,26 @@ def _member_conflict(member: dict, start: float, end: float) -> bool:
     else:
         floor = max(length / 2, length - _MEASURED_MEMBER_TOLERANCE_S)
     return retained < floor
+
+
+def _measured_member_floor(ad: dict, start: float, end: float, original_start: float,
+                           original_end: float, min_conf: float,
+                           members=None) -> tuple[float, float]:
+    """Widen a proposal over every measured member extent it would cut into."""
+    if members is None:
+        members = hard_member_spans(ad, original_start, original_end, min_conf)
+    # Coarse members are excluded: re-expanding to one would undo the trim just accepted.
+    hard = [m for m in members if m.get('stage') not in COARSE_MEMBER_STAGES]
+    p_start, p_end = span_bounds(hard)
+    if p_start is None:
+        return start, end
+    return min(start, p_start), max(end, p_end)
+
+
+def _meta_min_conf(episode_meta: dict) -> float:
+    """The feed's cut confidence from episode_meta, or the default."""
+    value = finite_number(episode_meta.get('min_cut_confidence'))
+    return MIN_CUT_CONFIDENCE if value is None else value
 
 
 # Prose/number consistency check on adjust verdicts: warn when the reasoning
@@ -459,7 +849,7 @@ def _warn_prose_boundary_mismatch(
     episode_id: str | None,
 ) -> None:
     """Log when adjust reasoning names a boundary figure far from the emitted
-    number (the-tim-dillon-show a55cb5b8216d: reasoning named the ad's final
+    number (example-podcast a1b2c3d4e5f6: reasoning named the ad's final
     sentence near 28.4s while the emitted end was 20.0s). Observability only:
     auto-arbitrating between two model numbers would be guesswork.
 
@@ -523,6 +913,10 @@ class ReviewVerdict:
     # Set on a reject the evidence floor turned into a hold; the apply path
     # stamps it as the marker's hold_reason instead of dropping the ad.
     reject_hold_reason: str | None = None
+    # Held because the review abstained or failed and no evidence backs the bounds.
+    inconclusive_hold: bool = False
+    # Adjust edges the model gave as numbers that survived the clamp; later stages may not widen them.
+    locked_edges: tuple = ()
 
 
 @dataclass
@@ -541,6 +935,7 @@ class ReviewResult:
     held_by_contradiction: list[dict] = field(default_factory=list)
     held_by_boundary_conflict: list[dict] = field(default_factory=list)
     held_by_reject_evidence: list[dict] = field(default_factory=list)
+    held_by_inconclusive: list[dict] = field(default_factory=list)
 
 
 def _format_cue_section(*, audio_analysis, ad_start: float, ad_end: float,
@@ -788,6 +1183,129 @@ def _format_cue_section(*, audio_analysis, ad_start: float, ad_end: float,
     return "\n".join(lines) + "\n\n"
 
 
+POLICY_LINE_CAP = 200
+POLICY_SECTION_CAP = 1500
+MAX_PROMPT_BARRIERS = 4
+MAX_PROMPT_MEMBERS = 6
+
+
+def _span_text(start, end) -> str:
+    return f"{start:.1f}-{end:.1f}s"
+
+
+def _fit_with_note(items: list[str], cap: int, sep: str, note_fmt: str,
+                   base: int = 0, omitted: int = 0) -> list[str]:
+    """Leading items that fit in cap once joined by sep, plus a note_fmt count of the rest."""
+    kept, length = [], base
+    for item in items:
+        added = len(item) + (len(sep) if kept else 0)
+        if length + added > cap:
+            break
+        kept.append(item)
+        length += added
+    # Drop items until the note fits; the note alone is kept even when it does not.
+    while True:
+        more = len(items) - len(kept) + omitted
+        if not more:
+            return kept
+        note = note_fmt.format(more)
+        if length + len(note) + (len(sep) if kept else 0) <= cap or not kept:
+            return [*kept, note]
+        popped = kept.pop()
+        length -= len(popped) + (len(sep) if kept else 0)
+
+
+def _capped_line(label: str, items: list[str], sep: str = '; ', omitted: int = 0) -> str:
+    """label plus as many whole items as fit in POLICY_LINE_CAP, with a (+N more) note for the rest.
+
+    omitted counts items the caller already left out; an oversized first item is truncated to fit.
+    """
+    prefix = f"{label}: "
+    if items and len(prefix) + len(items[0]) > POLICY_LINE_CAP:
+        more = len(items) - 1 + omitted
+        note = f"{sep}(+{more} more)" if more else ''
+        budget = max(POLICY_LINE_CAP - len(prefix) - 3 - len(note), 0)
+        return f"{prefix}{items[0][:budget]}...{note}"
+    parts = _fit_with_note(items, POLICY_LINE_CAP, sep, "(+{} more)",
+                           base=len(prefix), omitted=omitted)
+    return prefix + sep.join(parts) if parts else ''
+
+
+def _protected_item(span: dict) -> str:
+    text = _span_text(span['start'], span['end'])
+    if span.get('kind') == 'user_reject':
+        return f"user rejected {text}"
+    category = span.get('category')
+    return f"keep {text} ({category})" if category else f"keep {text}"
+
+
+def _member_item(member: dict) -> str:
+    stage = member.get('stage')
+    text = _span_text(member['start'], member['end'])
+    if stage == 'fingerprint':
+        pattern = member.get('pattern_id')
+        label = f"fingerprint pattern #{pattern}" if pattern is not None else 'fingerprint'
+        match_lo = finite_number(member.get('fingerprint_match_start'))
+        match_hi = finite_number(member.get('fingerprint_match_end'))
+        matched = (f", matched {_span_text(match_lo, match_hi)}"
+                   if match_lo is not None and match_hi is not None else '')
+        return f"{label} {text} (projected length{matched})"
+    item = f"{stage} {text}"
+    confidence = finite_number(member.get('confidence'))
+    if confidence is not None:
+        item += f" conf {confidence:.2f}"
+    if stage in COARSE_MEMBER_STAGES:
+        precise = [edge for edge in ('start', 'end') if member.get(f'precise_{edge}')]
+        item += f" precise {','.join(precise)}" if precise else ' imprecise edges'
+    return item
+
+
+def _edge_item(ad: dict, edge: str, min_conf: float, hard: list[dict]) -> str:
+    support = edge_support(ad, edge, min_conf, hard)
+    if support['source'] == 'transcript' and not support['precise']:
+        # A coarse transcript edge is not a measurement; fall back to an inner measured one.
+        support = edge_support(ad, edge, min_conf, [
+            m for m in hard if m.get('stage') not in COARSE_MEMBER_STAGES
+            or m.get(f'precise_{edge}')])
+    if support['measured'] is None:
+        return f"{edge} unmeasured"
+    precise = ', precise' if support['precise'] else ''
+    return f"{edge} {support['measured']:.1f}s ({support['source']}{precise})"
+
+
+def _format_policy_section(ad: dict, episode_meta: dict, max_shift: float) -> str:
+    """Effective category actions, nearby hard protection and member provenance for one ad."""
+    start, end = float(ad.get('start', 0.0)), float(ad.get('end', 0.0))
+    lines = []
+    actions = episode_meta.get('effective_category_actions') or {}
+    lines.append(_capped_line('Effective category actions', [
+        f"{category}={action}" for category, action in actions.items()], ', '))
+    # Only hard protection is listed; temporary holds are unresolved evidence.
+    nearby = [span for span in episode_meta.get('protected_spans') or []
+              if span['end'] >= start - max_shift and span['start'] <= end + max_shift]
+    nearby.sort(key=lambda span: max(0.0, start - span['end'], span['start'] - end))
+    listed = sorted(nearby[:MAX_PROMPT_BARRIERS], key=lambda span: span['start'])
+    lines.append(_capped_line('Protected audio (never cut, do not cross)',
+                              [_protected_item(span) for span in listed],
+                              omitted=len(nearby) - len(listed)))
+    members = [m for m in member_spans(ad) if m.get('stage')]
+    if members:
+        min_conf = _meta_min_conf(episode_meta)
+        lines.append(f"Evidence envelope: {_span_text(start, end)}")
+        lines.extend(_capped_line('Member', [_member_item(m)])
+                     for m in members[:MAX_PROMPT_MEMBERS])
+        if len(members) > MAX_PROMPT_MEMBERS:
+            lines.append(f"(+{len(members) - MAX_PROMPT_MEMBERS} more members)")
+        hard = hard_members(ad, min_conf)
+        lines.append(_capped_line('Measured edges', [
+            _edge_item(ad, 'start', min_conf, hard),
+            _edge_item(ad, 'end', min_conf, hard)], ', '))
+    # Each line costs its length plus a newline; the note tells the model the section is partial.
+    kept = _fit_with_note([line for line in lines if line], POLICY_SECTION_CAP, '\n',
+                          "(+{} more lines)", base=1)
+    return ''.join(line + '\n' for line in kept) + '\n' if kept else ''
+
+
 class AdReviewer:
     """Reviews detector + validator output before audio cuts are applied."""
 
@@ -845,9 +1363,8 @@ class AdReviewer:
 
         Returns:
             ReviewResult with the post-reviewer accepted list and the audit
-            trail. On catastrophic failure, returns the inputs unmodified with
-            a synthetic failure verdict per ad so the audit log still records
-            the attempt.
+            trail. On catastrophic failure, each accepted ad gets a synthetic
+            failure verdict and the per-ad failure rule.
         """
         try:
             return self._review_inner(
@@ -862,7 +1379,56 @@ class AdReviewer:
                 f"Reviewer pass {pass_num} hit catastrophic failure: {e}",
                 exc_info=True,
             )
-            return ReviewResult(accepted_after_review=list(accepted_ads))
+            try:
+                return self._fail_all(accepted_ads, e, episode_meta, pass_num)
+            except Exception as settle_error:
+                logger.warning(
+                    f"[{episode_meta.get('slug')}:{episode_meta.get('episode_id')}] "
+                    f"Reviewer pass {pass_num} failure rule failed ({settle_error}); "
+                    f"holding every unconfirmed ad"
+                )
+                return self._fail_all(accepted_ads, e, episode_meta, pass_num,
+                                      check_support=False)
+
+    def _fail_all(self, accepted_ads, error, episode_meta, pass_num,
+                  check_support=True) -> ReviewResult:
+        """Apply the per-ad failure rule to every accepted ad after a batch failure."""
+        result = ReviewResult()
+        for ad in accepted_ads:
+            if (ad.get("validation") or {}).get("user_confirmed"):
+                result.accepted_after_review.append(ad)
+                continue
+            verdict = ReviewVerdict(
+                pool="accepted", pass_num=pass_num, verdict="failure",
+                original_start=float(ad.get("start", 0.0)),
+                original_end=float(ad.get("end", 0.0)),
+                reasoning=_review_failure_reason(error), success=False,
+            )
+            result.verdicts.append(verdict)
+            self._settle_abstained(result, verdict, ad, episode_meta, check_support)
+        return result
+
+    def _settle_abstained(self, result, verdict, ad, episode_meta,
+                          check_support=True) -> bool:
+        """Hold an abstained or failed review on unsupported bounds; True when settled here."""
+        if verdict.verdict not in ("inconclusive", "failure"):
+            return False
+        if check_support and inconclusive_bounds_supported(ad, self.db):
+            if verdict.verdict != "failure":
+                return False
+            result.accepted_after_review.append(ad)
+            return True
+        if verdict.verdict == "failure":
+            logger.info(
+                f"[{episode_meta.get('slug')}:{episode_meta.get('episode_id')}] "
+                f"Reviewer unavailable; bounds unsupported @ "
+                f"{verdict.original_start:.1f}-{verdict.original_end:.1f}s: held"
+            )
+        verdict.inconclusive_hold = True
+        held = dict(ad)
+        mark_reviewer_hold(held, verdict, abstain_hold_reason(verdict))
+        result.held_by_inconclusive.append(held)
+        return True
 
     def _review_inner(
         self,
@@ -898,11 +1464,14 @@ class AdReviewer:
         # Accepted pool first. Position-indexed merge preserves input order so
         # verdicts list and downstream pattern-correction lookups match the
         # original sequential semantics.
+        transcript_units = TranscriptIndex(segments)
+        min_conf = _meta_min_conf(episode_meta)
         accepted_results = self._run_review_batch(
             accepted_ads,
             pool="accepted",
             pass_num=pass_num,
             segments=segments,
+            transcript_units=transcript_units,
             episode_meta=episode_meta,
             system_prompt=review_prompt,
             model=model,
@@ -924,6 +1493,8 @@ class AdReviewer:
                 verdict, model=verdict.model_used,
                 slug=episode_meta.get('slug'),
                 episode_id=episode_meta.get('episode_id'))
+            if self._settle_abstained(result, verdict, updated_ad, episode_meta):
+                continue
             if verdict.verdict == "reject":
                 evidence = reject_hold_evidence(updated_ad)
                 if evidence:
@@ -938,22 +1509,13 @@ class AdReviewer:
                         f"span carries {evidence}"
                     )
                     held = dict(updated_ad)
-                    held["was_cut"] = False
-                    held["held_for_review"] = True
-                    held["hold_reason"] = HOLD_REASON_REVIEWER_REJECT_CONFLICT
-                    held["reviewer_verdict"] = "reject"
-                    held["reviewer_reasoning"] = verdict.reasoning
-                    held["reviewer_confidence"] = verdict.confidence
-                    held["reviewer_model"] = verdict.model_used
-                    held["source"] = "reviewer"
+                    mark_reviewer_hold(held, verdict, HOLD_REASON_REVIEWER_REJECT_CONFLICT,
+                                       replace=True)
                     result.held_by_reject_evidence.append(held)
                     continue
                 marked = dict(updated_ad)
+                stamp_reviewer_fields(marked, verdict, replace=True)
                 marked["was_cut"] = False
-                marked["reviewer_verdict"] = "reject"
-                marked["reviewer_reasoning"] = verdict.reasoning
-                marked["reviewer_confidence"] = verdict.confidence
-                marked["reviewer_model"] = verdict.model_used
                 marked["source"] = "reviewer"
                 result.rejected_by_reviewer.append(marked)
             elif verdict.boundary_conflict:
@@ -963,14 +1525,8 @@ class AdReviewer:
                     verdict.verdict, verdict.reasoning,
                     verdict.structured_is_ad):
                 held = dict(updated_ad)
-                held["was_cut"] = False
-                held["held_for_review"] = True
-                held["hold_reason"] = HOLD_REASON_REVIEWER_CONTRADICTION
-                held["reviewer_verdict"] = verdict.verdict
-                held["reviewer_reasoning"] = verdict.reasoning
-                held["reviewer_confidence"] = verdict.confidence
-                held["reviewer_model"] = verdict.model_used
-                held["source"] = "reviewer"
+                mark_reviewer_hold(held, verdict, HOLD_REASON_REVIEWER_CONTRADICTION,
+                                   replace=True)
                 held["reviewer_contradiction"] = True
                 # Preserve the reviewer's proposed trim so the review UI can
                 # offer approving the trimmed span instead of all-or-nothing.
@@ -992,9 +1548,14 @@ class AdReviewer:
                         pass_num=pass_num,
                         slug=episode_meta.get('slug'),
                         episode_id=episode_meta.get('episode_id'),
+                        min_conf=min_conf,
                     )
                     if recovered is not None:
-                        verdict.adjusted_start, verdict.adjusted_end = recovered
+                        # Recovery applies the member floor; a one-tap approve must not cross untranscribed audio.
+                        verdict.adjusted_start, verdict.adjusted_end = _hold_inward_limits(
+                            updated_ad, *recovered, verdict.original_start,
+                            verdict.original_end, transcript_units,
+                            episode_meta.get('hard_barriers') or [])
                 if (verdict.adjusted_start is not None
                         and verdict.adjusted_end is not None):
                     held["reviewer_proposed_start"] = verdict.adjusted_start
@@ -1027,12 +1588,14 @@ class AdReviewer:
                     pass_num=pass_num,
                     slug=episode_meta.get('slug'),
                     episode_id=episode_meta.get('episode_id'),
+                    min_conf=min_conf,
                 )
                 if recovered is None:
                     result.accepted_after_review.append(updated_ad)
                 elif self._proposal_conflicts_with_protection(
                         updated_ad, recovered[0], recovered[1],
-                        verdict.original_start, verdict.original_end):
+                        verdict.original_start, verdict.original_end,
+                        min_conf):
                     verdict.verdict = "adjust"
                     verdict.adjusted_start, verdict.adjusted_end = recovered
                     verdict.boundary_conflict = True
@@ -1050,7 +1613,10 @@ class AdReviewer:
                         verdict.original_start, verdict.original_end,
                         max_shift,
                         episode_meta.get('slug'),
-                        episode_meta.get('episode_id'))
+                        episode_meta.get('episode_id'),
+                        segments=segments, transcript_units=transcript_units,
+                        hard_barriers=episode_meta.get('hard_barriers'),
+                        min_conf=min_conf)
                     if _bounds_unchanged(new_start, new_end,
                                          verdict.original_start,
                                          verdict.original_end):
@@ -1061,6 +1627,7 @@ class AdReviewer:
                     verdict.verdict = "adjust"
                     verdict.adjusted_start = new_start
                     verdict.adjusted_end = new_end
+                    # Prose-recovered bounds are never locked and skip the transcript clamp.
                     trimmed = _adjusted_ad_copy(
                         updated_ad, new_start, new_end,
                         verdict.original_start, verdict.original_end,
@@ -1083,6 +1650,7 @@ class AdReviewer:
             pool="resurrection",
             pass_num=pass_num,
             segments=segments,
+            transcript_units=transcript_units,
             episode_meta=episode_meta,
             system_prompt=resurrect_prompt,
             model=model,
@@ -1110,7 +1678,7 @@ class AdReviewer:
 
     def _run_review_batch(self, ads, *, pool, pass_num, segments,
                           episode_meta, system_prompt, model, max_shift,
-                          max_workers):
+                          max_workers, transcript_units=None):
         """Run _review_single across a list of ads, sequential or via thread
         pool depending on max_workers. Returns (verdict, updated_ad) pairs
         in input order regardless of completion order."""
@@ -1130,6 +1698,7 @@ class AdReviewer:
                 system_prompt=system_prompt,
                 model=model,
                 max_shift=max_shift,
+                transcript_units=transcript_units,
             )
 
         if max_workers <= 1 or len(ads) == 1:
@@ -1156,6 +1725,7 @@ class AdReviewer:
         system_prompt: str,
         model: str,
         max_shift: int,
+        transcript_units=None,
     ) -> tuple[ReviewVerdict, dict]:
         """Review one ad. Always returns (verdict, ad). On failure or
         unparseable response, verdict.verdict is 'failure' and ad is the input
@@ -1169,6 +1739,7 @@ class AdReviewer:
             episode_meta=episode_meta,
             pool=pool,
             max_shift=max_shift,
+            transcript_units=transcript_units,
         )
         slug = episode_meta.get("slug")
         episode_id = episode_meta.get("episode_id")
@@ -1207,10 +1778,20 @@ class AdReviewer:
             if isinstance(error, ProviderRateLimitedError):
                 # A held 429 must defer the episode, not skip the review.
                 raise error
+            if is_review_inconclusive_error(error):
+                return (
+                    ReviewVerdict(
+                        pool=pool, pass_num=pass_num, verdict="inconclusive",
+                        original_start=original_start, original_end=original_end,
+                        reasoning=_review_inconclusive_reason(error),
+                        model_used=model, latency_ms=latency_ms, success=True,
+                    ),
+                    ad,
+                )
             logger.warning(
                 f"[{slug}:{episode_id}] Reviewer {window_label} "
-                f"@ {original_start:.1f}s failed: {error}. Falling through "
-                f"with original ad."
+                f"@ {original_start:.1f}s failed: {error}. Original "
+                f"bounds retained."
             )
             return (
                 ReviewVerdict(
@@ -1230,7 +1811,7 @@ class AdReviewer:
             logger.warning(
                 f"[{slug}:{episode_id}] Reviewer {window_label} "
                 f"@ {original_start:.1f}s returned unparseable response "
-                f"(text head: {text[:200]!r}). Falling through with original ad."
+                f"(text head: {text[:200]!r}). Original bounds retained."
             )
             return (
                 ReviewVerdict(
@@ -1262,7 +1843,7 @@ class AdReviewer:
         if not isinstance(kept, dict):
             logger.warning(
                 f"[{slug}:{episode_id}] Reviewer {window_label} returned "
-                f"non-object array element. Falling through with original ad."
+                f"non-object array element. Original bounds retained."
             )
             return (
                 ReviewVerdict(
@@ -1291,22 +1872,29 @@ class AdReviewer:
 
         # Schema asks for start/end; fall back to corrected_/adjusted_ only when
         # the model omits them (some responses carry the correction there).
-        new_start = _first_num(
-            kept, ("start", "corrected_start", "adjusted_start"), original_start)
-        new_end = _first_num(
-            kept, ("end", "corrected_end", "adjusted_end"), original_end)
+        start_keys = ("start", "corrected_start", "adjusted_start")
+        end_keys = ("end", "corrected_end", "adjusted_end")
+        new_start = _first_num(kept, start_keys, original_start)
+        new_end = _first_num(kept, end_keys, original_end)
         reason = kept.get("reason")
         try:
             confidence = float(kept["confidence"]) if "confidence" in kept else None
         except (TypeError, ValueError):
             confidence = None
 
+        min_conf = _meta_min_conf(episode_meta)
+        members = (hard_member_spans(ad, original_start, original_end, min_conf)
+                   if ad.get('merged_distinct_ads') else None)
         boundary_conflict = self._proposal_conflicts_with_protection(
-            ad, new_start, new_end, original_start, original_end)
+            ad, new_start, new_end, original_start, original_end, min_conf,
+            members=members)
 
         clamped_start, clamped_end = self._clamp_proposed_bounds(
             ad, new_start, new_end, original_start, original_end,
-            max_shift, slug, episode_id)
+            max_shift, slug, episode_id, segments=segments,
+            transcript_units=transcript_units,
+            hard_barriers=episode_meta.get('hard_barriers'), min_conf=min_conf,
+            members=members)
 
         proposal_clamped = _clamp_overrode(
             new_start, new_end, original_start, original_end,
@@ -1359,9 +1947,15 @@ class AdReviewer:
                 original_start=original_start, original_end=original_end,
                 slug=slug, episode_id=episode_id,
             )
+            locked_edges = tuple(
+                edge for edge, keys, proposed, clamped in (
+                    ("start", start_keys, new_start, clamped_start),
+                    ("end", end_keys, new_end, clamped_end))
+                if _first_num(kept, keys, None) is not None
+                and _edge_matches(clamped, proposed))
             updated = _adjusted_ad_copy(
                 ad, clamped_start, clamped_end, original_start, original_end,
-                reason, confidence, model)
+                reason, confidence, model, locked_edges)
             return (
                 ReviewVerdict(
                     pool=pool, pass_num=pass_num, verdict="adjust",
@@ -1370,6 +1964,7 @@ class AdReviewer:
                     reasoning=reason, confidence=confidence,
                     model_used=model, latency_ms=latency_ms, success=True,
                     structured_is_ad=structured_is_ad,
+                    locked_edges=locked_edges,
                 ),
                 updated,
             )
@@ -1388,7 +1983,9 @@ class AdReviewer:
 
     def _clamp_proposed_bounds(self, ad, new_start, new_end,
                                original_start, original_end, max_shift,
-                               slug, episode_id):
+                               slug, episode_id, segments=None, transcript_units=None,
+                               hard_barriers=None, min_conf=MIN_CUT_CONFIDENCE,
+                               members=None):
         """Clamp reviewer-proposed bounds: inverted-bounds fallback, per-edge
         shift cap, merged-span floor, final validity fallback. Single seam for
         every path that turns reviewer prose or deltas into marker bounds."""
@@ -1418,15 +2015,9 @@ class AdReviewer:
         # the flag without the protected keys; those keep the old blanket
         # expand-only rule.
         if ad.get('merged_distinct_ads'):
-            # Only measured members hold the floor: re-expanding to a coarse
-            # member would undo the trim just accepted.
-            hard = [m for m in protected_member_spans(ad, original_start, original_end)
-                    if m.get('stage') not in COARSE_MEMBER_STAGES]
-            p_start, p_end = span_bounds(hard)
-            floor_start = (clamped_start if p_start is None
-                           else min(clamped_start, p_start))
-            floor_end = (clamped_end if p_end is None
-                         else max(clamped_end, p_end))
+            floor_start, floor_end = _measured_member_floor(
+                ad, clamped_start, clamped_end, original_start, original_end, min_conf,
+                members=members)
             if floor_start != clamped_start or floor_end != clamped_end:
                 logger.info(
                     f"[{slug}:{episode_id}] Reviewer inward shrink clamped "
@@ -1437,22 +2028,86 @@ class AdReviewer:
                 )
             clamped_start, clamped_end = floor_start, floor_end
 
-        # Cross-fetch evidence remains authoritative inside a merged
-        # candidate. The reviewer may trim coarse LLM/VAD extensions outside
-        # these measured regions, but cannot leave part of an inserted block
-        # in the published episode.
+        # No edge moves inward across untranscribed audio or past a labelled boundary cue it
+        # was snapped to; it stops at a hard barrier before either.
+        barriers = hard_barriers or []
+        index = transcript_units or TranscriptIndex(segments)
+        proposed = (clamped_start, clamped_end)
+        clamped_start, clamped_end = _hold_inward_edges(
+            clamped_start, clamped_end,
+            *_untranscribed_limits(index, original_start, original_end), barriers)
+        gap_start, gap_end = clamped_start, clamped_end
+        clamped_start, clamped_end = _hold_inward_edges(
+            clamped_start, clamped_end,
+            *_cue_snap_limits(ad, original_start, original_end), barriers)
+        start_held_by = ('boundary cue' if clamped_start != gap_start
+                         else 'untranscribed audio' if gap_start != proposed[0] else None)
+        end_held_by = ('boundary cue' if clamped_end != gap_end
+                       else 'untranscribed audio' if gap_end != proposed[1] else None)
+        held_logged = not (start_held_by or end_held_by)
+
+        # Probes and independent spans hold the floor; unsupported edges stop at the straddling word.
         core_start, core_end = dai_core_bounds(ad)
         if core_start is not None:
             floor_start = min(clamped_start, core_start)
             floor_end = max(clamped_end, core_end)
-            if floor_start != clamped_start or floor_end != clamped_end:
+            # Only the probe windows of a region are measured, so an edge on a
+            # transcript pause may cross the rest, stopping at independent evidence.
+            independent = reviewer_independent_spans(ad, min_conf)
+            cap_start = cap_end = None
+            if _edge_transcript_supported(index, 'start', clamped_start,
+                                          original_start):
+                floor_start = _supported_edge_floor(
+                    ad, independent, 'start', clamped_start, original_start, original_end)
+            else:
+                cap_start = _speech_capped_floor(
+                    index, independent, 'start', clamped_start, floor_start)
+                floor_start = floor_start if cap_start is None else cap_start
+            if _edge_transcript_supported(index, 'end', clamped_end,
+                                          original_end):
+                floor_end = _supported_edge_floor(
+                    ad, independent, 'end', clamped_end, original_start, original_end)
+            else:
+                cap_end = _speech_capped_floor(
+                    index, independent, 'end', clamped_end, floor_end)
+                floor_end = floor_end if cap_end is None else cap_end
+            if ((floor_start, floor_end) != (clamped_start, clamped_end)
+                    or floor_start > core_start or floor_end < core_end):
+                start_source = ('spoken word cap' if cap_start is not None
+                                else start_held_by
+                                if start_held_by and floor_start == clamped_start
+                                else _floor_source(floor_start, clamped_start, core_start))
+                end_source = ('spoken word cap' if cap_end is not None
+                              else end_held_by
+                              if end_held_by and floor_end == clamped_end
+                              else _floor_source(floor_end, clamped_end, core_end))
                 logger.info(
-                    f"[{slug}:{episode_id}] Reviewer inward shrink clamped "
-                    f"to DAI core @ {core_start:.1f}-{core_end:.1f}s: "
-                    f"{clamped_start:.1f}-{clamped_end:.1f} -> "
-                    f"{floor_start:.1f}-{floor_end:.1f}"
+                    f"[{slug}:{episode_id}] Reviewer trim vs DAI core "
+                    f"{core_start:.1f}-{core_end:.1f}s: "
+                    f"{proposed[0]:.1f}-{proposed[1]:.1f} -> "
+                    f"{floor_start:.1f}-{floor_end:.1f} "
+                    f"(start floored by {start_source}, end floored by {end_source})"
                 )
+                held_logged = True
             clamped_start, clamped_end = floor_start, floor_end
+        if not held_logged:
+            reasons = ' and '.join(dict.fromkeys(r for r in (start_held_by, end_held_by) if r))
+            logger.info(
+                f"[{slug}:{episode_id}] Reviewer trim stopped at {reasons}: "
+                f"{proposed[0]:.1f}-{proposed[1]:.1f} -> {clamped_start:.1f}-{clamped_end:.1f}")
+
+        # A widened edge never enters kept audio beyond the original span.
+        for barrier in hard_barriers or []:
+            if barrier['start'] < original_start and barrier['end'] > clamped_start:
+                clamped_start = max(clamped_start, min(barrier['end'], original_start))
+            if barrier['end'] > original_end and barrier['start'] < clamped_end:
+                clamped_end = min(clamped_end, max(barrier['start'], original_end))
+
+        # Absorbed silence stays with the cut: no edge moves inward across an edge-touching span,
+        # but the floor stops at a hard barrier between the proposal and the span edge.
+        clamped_start, clamped_end = _hold_inward_edges(
+            clamped_start, clamped_end,
+            *_silence_limits(ad, original_start, original_end), barriers)
 
         if clamped_end <= clamped_start:
             clamped_start, clamped_end = original_start, original_end
@@ -1460,12 +2115,14 @@ class AdReviewer:
 
     @staticmethod
     def _proposal_conflicts_with_protection(ad, start, end,
-                                             original_start, original_end):
-        """Return whether an inward proposal crosses protected evidence."""
+                                             original_start, original_end,
+                                             min_conf=MIN_CUT_CONFIDENCE, members=None):
+        """Return whether an inward proposal crosses measured member evidence."""
         if end <= start or not ad.get('merged_distinct_ads'):
             return False
-        return any(_member_conflict(m, start, end) for m in
-                   protected_member_spans(ad, original_start, original_end))
+        if members is None:
+            members = hard_member_spans(ad, original_start, original_end, min_conf)
+        return any(_member_conflict(m, start, end) for m in members)
 
     def _recover_contradiction_trim(
         self,
@@ -1477,13 +2134,14 @@ class AdReviewer:
         pass_num: int,
         slug: str | None,
         episode_id: str | None,
+        min_conf: float = MIN_CUT_CONFIDENCE,
     ) -> tuple[float, float] | None:
         """Recover machine-readable trim bounds from a prose-only trim.
 
         Fired only on a contradiction hold whose verdict derived as
         'confirmed': the model returned the span unchanged while its
-        reasoning described a trim in prose (the-brilliant-idiots
-        79eedd7bf2a7 shipped "the ad content ends at roughly 65.8s ... must
+        reasoning described a trim in prose (another-podcast
+        f6e5d4c3b2a1 shipped "the ad content ends at roughly 65.8s ... must
         be trimmed off the end" with boundaries 0.0-87.8s intact, so the
         hold carried no proposed bounds the UI could one-tap approve).
 
@@ -1578,7 +2236,7 @@ class AdReviewer:
         if end <= start:
             return None
         protection_conflict = self._proposal_conflicts_with_protection(
-            ad, start, end, o_start, o_end)
+            ad, start, end, o_start, o_end, min_conf)
         if not protection_conflict:
             core_start, core_end = dai_core_bounds(ad)
             if core_start is not None:
@@ -1595,13 +2253,8 @@ class AdReviewer:
             )
             return None
         if not protection_conflict and ad.get('merged_distinct_ads'):
-            # Same floor the boundary clamp applies: a stamped proposal must
-            # not cut into a measured member either.
-            hard = [m for m in protected_member_spans(ad, o_start, o_end)
-                    if m.get('stage') not in COARSE_MEMBER_STAGES]
-            p_start, p_end = span_bounds(hard)
-            if p_start is not None:
-                start, end = min(start, p_start), max(end, p_end)
+            # Same floor the boundary clamp applies.
+            start, end = _measured_member_floor(ad, start, end, o_start, o_end, min_conf)
         logger.info(
             f"[{slug}:{episode_id}] {call_label} recovered proposed trim "
             f"{start:.1f}-{end:.1f}s from span {o_start:.1f}-{o_end:.1f}s"
@@ -1625,6 +2278,7 @@ class AdReviewer:
         episode_meta: dict,
         pool: str,
         max_shift: int = 60,
+        transcript_units=None,
     ) -> str:
         """Build the per-ad user prompt.
 
@@ -1637,16 +2291,22 @@ class AdReviewer:
         """
         start = float(ad.get("start", 0.0))
         end = float(ad.get("end", 0.0))
+        context_start = max(0.0, start - 60.0)
+        context_end = end + 60.0
+        context_segments = timed_line_segments([
+            seg for seg in segments
+            if seg['end'] >= context_start and seg['start'] <= context_end
+        ])
         # Per-segment timestamps everywhere, context included (#695): the
         # system prompt's examples read trim boundaries out of context lines.
-        before_text = get_timestamped_transcript_for_range(
-            segments, max(0.0, start - 60.0), start
-        )
-        ad_text = get_timestamped_transcript_for_range(segments, start, end)
+        # Same word-level gaps the clamp enforces.
+        gaps = (transcript_units or TranscriptIndex(segments)).gaps
+        before_text = _timestamped_with_gaps(context_segments, gaps, context_start, start)
+        ad_text = _timestamped_with_gaps(context_segments, gaps, start, end, closed=True)
         if not ad_text:
             fallback = ad.get("end_text", "") or ""
             ad_text = f"[{start:.1f}s-{end:.1f}s] {fallback}" if fallback else ""
-        after_text = get_timestamped_transcript_for_range(segments, end, end + 60.0)
+        after_text = _timestamped_with_gaps(context_segments, gaps, end, context_end)
         start_words = get_timestamped_words_for_range(
             segments, max(0.0, start - max_shift), start + max_shift)
         end_words = get_timestamped_words_for_range(
@@ -1704,12 +2364,15 @@ class AdReviewer:
             bucket_radius=float(max_shift),
         )
 
+        policy_section = _format_policy_section(ad, episode_meta, max_shift)
+
         return (
             f"Podcast: {podcast_name}\n"
             f"Episode: {episode_title}\n"
             f"{description_section}\n"
             f"{framing}\n"
             f"{cue_section}"
+            f"{policy_section}"
             f"Transcript (60s before, the candidate ad, 60s after; all lines "
             f"carry [start-end] second timestamps):\n"
             f"{before_text}\n"
@@ -1912,6 +2575,8 @@ def split_resurrection_pool(
     for ad in all_ads_with_validation:
         key = (ad.get("start"), ad.get("end"))
         if key in cut_keys:
+            continue
+        if ad.get('_user_kept_by_trim'):
             continue
         # Never resurrect a held ad: a duration-hold sits in the resurrection
         # band and a resurrect verdict would silently un-hold it.
