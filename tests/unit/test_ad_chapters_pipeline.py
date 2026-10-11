@@ -6,6 +6,7 @@ _generate_assets branches (generate, publisher-preserve) and the manual
 regenerate-chapters endpoint.
 """
 import json
+import shutil
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -14,24 +15,27 @@ import pytest
 
 from tests.app_bootstrap import bootstrap
 from tests.unit.thread_fakes import SyncThread
+from tests.unit.test_id3_chapter_preservation import _long_fixture
 
 _test_data_dir = bootstrap('ad_chapters_pipeline_test_', reset_storage=True)
 
 import chapters_generator
 import run_context
-from ad_chapters import AdChapterConfig, public_chapters
-from llm_client import ProviderRateLimitedError
+from api import get_storage
+from ad_chapters import AdChapterConfig, ID3_CHAPTER_SOURCE_KEY, public_chapters
+from id3_chapters import chapter_frames, read_tag
+from llm_client import ProviderRateLimitedError, clear_settings_cache
 from main_app import processing
 from rate_limit_hold import hold_message
 from utils.time import utc_now_iso
 
 AD_CFG = AdChapterConfig(
-    enabled=True, categories={'sponsor': True}, include_held=False,
+    actions={'sponsor': 'mark'}, include_held=False,
     title_format='[mp:{category}]', held_title_format='[mp:{category}?]',
     resume_title='Show', min_confidence=0.9)
 
-KEPT_SPONSOR = [{'start': 900.0, 'end': 960.0, 'action_applied': 'keep',
-                 'category': 'sponsor', 'confidence': 0.95, 'was_cut': False}]
+MARKED_SPONSOR = [{'start': 900.0, 'end': 960.0, 'action_applied': 'mark',
+                   'category': 'sponsor', 'confidence': 0.95, 'was_cut': False}]
 
 # Chapters route a regeneration resolves to; a 429 there pauses this account.
 CHAPTERS_ROUTE = {'provider_key': 'ollama', 'configured_model': 'm-chapters',
@@ -86,7 +90,7 @@ def _run(monkeypatch, db, publisher_chapters, generator_chapters=None,
                         MagicMock(return_value=fetch_return))
     monkeypatch.setattr(processing, 'get_replacement_duration', lambda: 2.0)
     monkeypatch.setattr(processing, 'resolve_ad_chapter_config',
-                        lambda db, row, slug=None: ad_config)
+                        lambda db, row: ad_config)
     monkeypatch.setattr('transcript_generator.TranscriptGenerator', transcript_gen_class)
     monkeypatch.setattr(chapters_generator, 'ChaptersGenerator', generator_class)
 
@@ -100,8 +104,8 @@ def _run(monkeypatch, db, publisher_chapters, generator_chapters=None,
     return storage_mock, embed_mock, generator_class
 
 
-def _saved_chapters(storage_mock):
-    return storage_mock.save_chapters_and_applied_cuts.call_args.args[2]['chapters']
+def _saved_chapters():
+    return processing.db.save_processing_assets.call_args.args[2]['chapters']['chapters']
 
 
 def _assert_embedded(embed_mock, merged):
@@ -115,10 +119,10 @@ def _assert_embedded(embed_mock, merged):
 def test_generate_path_appends_ad_chapters_and_embeds(monkeypatch):
     storage_mock, embed_mock, generator_class = _run(
         monkeypatch, _db(chapters_mode='generate'), publisher_chapters=[],
-        markers=KEPT_SPONSOR)
+        markers=MARKED_SPONSOR)
 
     generator_class.return_value.generate_chapters.assert_called_once()
-    merged = _saved_chapters(storage_mock)
+    merged = _saved_chapters()
     assert merged == [{'startTime': 1, 'title': 'Intro'}, AD_ENTRY, RESUME_ENTRY]
     _assert_embedded(embed_mock, merged)
     assert all(set(ch) == {'startTime', 'title'}
@@ -129,9 +133,9 @@ def test_generate_path_with_empty_generation_still_saves_ad_only_list(monkeypatc
     storage_mock, embed_mock, generator_class = _run(
         monkeypatch, _db(chapters_mode='generate'), publisher_chapters=[],
         generator_chapters={'version': '1.2.0', 'chapters': []},
-        markers=KEPT_SPONSOR)
+        markers=MARKED_SPONSOR)
 
-    merged = _saved_chapters(storage_mock)
+    merged = _saved_chapters()
     assert merged == [AD_ENTRY, RESUME_ENTRY]
     _assert_embedded(embed_mock, merged)
 
@@ -141,16 +145,16 @@ def test_generate_path_without_ads_saves_topics_only(monkeypatch):
         monkeypatch, _db(chapters_mode='generate'), publisher_chapters=[],
         markers=[])
 
-    assert _saved_chapters(storage_mock) == [{'startTime': 1, 'title': 'Intro'}]
+    assert _saved_chapters() == [{'startTime': 1, 'title': 'Intro'}]
     embed_mock.assert_called_once()
 
 
 def test_generate_path_disabled_config_saves_topics_only(monkeypatch):
     storage_mock, embed_mock, generator_class = _run(
         monkeypatch, _db(chapters_mode='generate'), publisher_chapters=[],
-        markers=KEPT_SPONSOR, ad_config=AdChapterConfig.disabled())
+        markers=MARKED_SPONSOR, ad_config=None)
 
-    assert _saved_chapters(storage_mock) == [{'startTime': 1, 'title': 'Intro'}]
+    assert _saved_chapters() == [{'startTime': 1, 'title': 'Intro'}]
 
 
 # ---------- publisher-preserve path ----------
@@ -163,10 +167,10 @@ PUBLISHER = [{'start': 0.0, 'end': 300.0, 'title': 'Intro'},
 def test_publisher_preserve_path_merges_and_embeds_when_ads_added(monkeypatch):
     storage_mock, embed_mock, generator_class = _run(
         monkeypatch, _db(chapters_mode='auto'), publisher_chapters=PUBLISHER,
-        markers=KEPT_SPONSOR)
+        markers=MARKED_SPONSOR)
 
     generator_class.return_value.generate_chapters.assert_not_called()
-    merged = _saved_chapters(storage_mock)
+    merged = _saved_chapters()
     assert merged == [{'startTime': 1, 'title': 'Intro'},
                       {'startTime': 300, 'title': 'Body'},
                       AD_ENTRY, RESUME_ENTRY,
@@ -181,7 +185,7 @@ def test_publisher_preserve_path_unchanged_when_no_ads(monkeypatch):
         monkeypatch, _db(chapters_mode='auto'), publisher_chapters=PUBLISHER,
         markers=[])
 
-    assert _saved_chapters(storage_mock) == [{'startTime': 1, 'title': 'Intro'},
+    assert _saved_chapters() == [{'startTime': 1, 'title': 'Intro'},
                                              {'startTime': 300, 'title': 'Body'},
                                              {'startTime': 1500, 'title': 'Outro'}]
     embed_mock.assert_not_called()
@@ -190,9 +194,9 @@ def test_publisher_preserve_path_unchanged_when_no_ads(monkeypatch):
 def test_chapters_mode_off_writes_nothing_even_with_ads(monkeypatch):
     storage_mock, embed_mock, generator_class = _run(
         monkeypatch, _db(chapters_mode='off'), publisher_chapters=PUBLISHER,
-        markers=KEPT_SPONSOR)
+        markers=MARKED_SPONSOR)
 
-    storage_mock.save_chapters_and_applied_cuts.assert_not_called()
+    assert 'chapters' not in processing.db.save_processing_assets.call_args.args[2]
     embed_mock.assert_not_called()
 
 
@@ -208,11 +212,11 @@ def test_upstream_json_path_merges_and_embeds(monkeypatch):
         monkeypatch,
         _db(chapters_mode='auto',
             upstream_chapters_url='https://pub.example.com/ch.json'),
-        publisher_chapters=[], markers=KEPT_SPONSOR, fetch_return=UPSTREAM,
+        publisher_chapters=[], markers=MARKED_SPONSOR, fetch_return=UPSTREAM,
         original_duration=3600.0)
 
     generator_class.return_value.generate_chapters.assert_not_called()
-    merged = _saved_chapters(storage_mock)
+    merged = _saved_chapters()
     assert merged == [{'startTime': 1, 'title': 'Cold Open'},
                       {'startTime': 300, 'title': 'Body'},
                       AD_ENTRY, RESUME_ENTRY,
@@ -240,7 +244,7 @@ def seeded(app_client):
     db.upsert_episode(slug=SLUG, episode_id=EPISODE_ID,
                       original_url='https://example.com/ep.mp3',
                       title='Ep', description='Notes', status='processed')
-    db.save_episode_details(SLUG, EPISODE_ID, ad_markers=KEPT_SPONSOR)
+    db.save_episode_details(SLUG, EPISODE_ID, ad_markers=MARKED_SPONSOR)
     get_storage().save_transcript_vtt(SLUG, EPISODE_ID, VTT)
     yield db
     db.delete_podcast(SLUG)
@@ -254,14 +258,21 @@ def _authed(client):
     return {'X-CSRF-Token': cookie.value} if cookie else {}
 
 
-def _post_regenerate(app_client, generated, ad_config=None):
+# Sentinel: callers pass ad_config=None to mean "disabled", so the default
+# must be distinct from None (which plain falsy-or would mistake for unset).
+_UNSET = object()
+
+
+def _post_regenerate(app_client, generated, ad_config=_UNSET):
+    resolved = AD_CFG if ad_config is _UNSET else ad_config
     headers = _authed(app_client)
     with patch('api.episodes.threading', SimpleNamespace(Thread=SyncThread)), \
          patch('api.episodes.ChaptersGenerator') as generator, \
          patch('api.episodes.embed_chapters', return_value=False), \
          patch('api.episodes.resolve_ad_chapter_config',
-               lambda db, row, slug=None: ad_config or AD_CFG), \
+               lambda db, row: resolved), \
          patch('main_app.processing._refresh_rss_for_slug'):
+        generator.return_value.chapters_degraded = False
         if callable(generated):
             generator.return_value.generate_chapters.side_effect = generated
         else:
@@ -290,6 +301,110 @@ def test_regenerate_endpoint_merges_ad_chapters(app_client, seeded):
         {'startTime': 960, 'title': 'Show'}]
     assert row['chapters_regen_started_at'] is None
     assert row['chapters_regen_error'] is None
+
+
+@pytest.mark.skipif(not shutil.which('ffmpeg'), reason='ffmpeg is unavailable')
+def test_manual_regeneration_clears_publisher_choice_and_recut_keeps_generated_topics(app_client, seeded, monkeypatch, tmp_path):
+    storage = get_storage()
+    storage.save_chapters_json(SLUG, EPISODE_ID, {
+        'version': '1.2.0', ID3_CHAPTER_SOURCE_KEY: 'id3',
+        'chapters': [{'startTime': 1, 'title': 'Publisher', '_id3_id': '6669727374'}],
+    })
+    seeded.save_applied_cuts(SLUG, EPISODE_ID, [])
+    chosen = {'version': '1.2.0', 'chapters': [{'startTime': 1, 'title': 'Generated'}]}
+    response = _post_regenerate(app_client, chosen, ad_config=None)
+    assert response.status_code == 202
+    assert storage.get_chapters_json(SLUG, EPISODE_ID) == chosen
+    monkeypatch.setattr(processing, 'db', seeded)
+    monkeypatch.setattr(processing, 'storage', storage)
+    monkeypatch.setattr(processing, 'resolve_ad_chapter_config', lambda *args: None)
+    source, _ = _long_fixture(tmp_path, 4)
+    assert set(chapter_frames(read_tag(source))[0]) == {b'first', b'ad', b'last'}
+    probe = MagicMock()
+    embed = MagicMock(wraps=processing.embed_chapters)
+    monkeypatch.setattr(processing, 'probe_chapters', probe)
+    monkeypatch.setattr(processing, 'embed_chapters', embed)
+    pending = {}
+    processing._remap_stored_chapters(SLUG, EPISODE_ID, [], 1, [], 60,
+                                     audio_path=source, audio_duration=60,
+                                     pending_assets=pending)
+    probe.assert_not_called()
+    assert pending['chapters'] == chosen
+    embed.assert_called_once_with(str(source), chosen['chapters'], duration=60)
+    assert set(chapter_frames(read_tag(source))[0]).isdisjoint({b'first', b'ad', b'last'})
+
+
+def test_degraded_manual_regeneration_keeps_existing_chapters_and_recovers(app_client, seeded):
+    storage = get_storage()
+    existing = {'version': '1.2.0', 'chapters': [{'startTime': 1, 'title': 'Existing'}]}
+    storage.save_chapters_json(SLUG, EPISODE_ID, existing)
+    headers = _authed(app_client)
+
+    with patch('api.episodes.threading', SimpleNamespace(Thread=SyncThread)), \
+         patch('api.episodes.ChaptersGenerator') as generator, \
+         patch('api.episodes.embed_chapters') as embed, \
+         patch('main_app.processing._refresh_rss_for_slug') as refresh:
+        generator.return_value.chapters_degraded = True
+        generator.return_value.generate_chapters.return_value = {
+            'version': '1.2.0', 'chapters': [{'startTime': 1, 'title': 'Fallback'}]}
+        response = app_client.post(
+            f'/api/v1/feeds/{SLUG}/episodes/{EPISODE_ID}/regenerate-chapters',
+            headers=headers)
+
+        assert response.status_code == 202, response.data
+        detail = app_client.get(f'/api/v1/feeds/{SLUG}/episodes/{EPISODE_ID}').get_json()
+        assert detail['chaptersRegenError']
+        assert 'existing chapters were kept' in detail['chaptersRegenError'].lower()
+        assert storage.get_chapters_json(SLUG, EPISODE_ID) == existing
+        embed.assert_not_called()
+        refresh.assert_not_called()
+        podcast = seeded.get_podcast_by_slug(SLUG)
+        failed = seeded.get_episode_processing_runs(podcast['id'], EPISODE_ID)[-1]
+        assert failed['status'] == 'failed'
+        assert json.loads(failed['processing_stats_json'])['mode'] == 'chapters'
+
+        generator.return_value.chapters_degraded = False
+        generator.return_value.generate_chapters.return_value = {
+            'version': '1.2.0', 'chapters': [{'startTime': 1, 'title': 'Recovered'}]}
+        response = app_client.post(
+            f'/api/v1/feeds/{SLUG}/episodes/{EPISODE_ID}/regenerate-chapters',
+            headers=headers)
+
+    assert response.status_code == 202, response.data
+    detail = app_client.get(f'/api/v1/feeds/{SLUG}/episodes/{EPISODE_ID}').get_json()
+    assert detail['chaptersRegenError'] is None
+    assert storage.get_chapters_json(SLUG, EPISODE_ID)['chapters'] == [
+        {'startTime': 1, 'title': 'Recovered'}]
+    history = seeded.get_episode_processing_runs(podcast['id'], EPISODE_ID)
+    assert history[-1]['status'] == 'completed'
+    assert json.loads(history[-1]['processing_stats_json'])['mode'] == 'chapters'
+
+
+@pytest.mark.parametrize('response', ['', 'Opening topic'])
+def test_incomplete_titles_preserve_existing_chapters(app_client, seeded, monkeypatch, response):
+    storage = get_storage()
+    existing = {'version': '1.2.0', 'chapters': [{'startTime': 1, 'title': 'Existing'}]}
+    storage.save_chapters_json(SLUG, EPISODE_ID, existing)
+    generator = chapters_generator.ChaptersGenerator(api_key='test')
+    generator._llm_client = MagicMock()
+    monkeypatch.setattr(generator, '_detect_boundaries_windowed', lambda *args, **kwargs: [
+        {'original_time': 600, 'title': None}])
+    monkeypatch.setattr(chapters_generator, 'call_llm', lambda **kwargs: (
+        SimpleNamespace(content=response), None))
+    headers = _authed(app_client)
+    with patch('api.episodes.threading', SimpleNamespace(Thread=SyncThread)), \
+         patch('api.episodes.ChaptersGenerator', return_value=generator), \
+         patch('api.episodes.embed_chapters') as embed, \
+         patch('main_app.processing._refresh_rss_for_slug') as refresh:
+        result = app_client.post(
+            f'/api/v1/feeds/{SLUG}/episodes/{EPISODE_ID}/regenerate-chapters', headers=headers)
+
+    assert result.status_code == 202
+    assert generator.chapters_degraded is True
+    assert 'existing chapters were kept' in seeded.get_episode(SLUG, EPISODE_ID)['chapters_regen_error'].lower()
+    assert storage.get_chapters_json(SLUG, EPISODE_ID) == existing
+    embed.assert_not_called()
+    refresh.assert_not_called()
 
 
 def test_regenerate_endpoint_skips_ad_chapters_without_applied_cuts(app_client, seeded):
@@ -324,7 +439,7 @@ def test_served_chapters_json_carries_no_internal_keys(app_client, monkeypatch):
 def test_regenerate_endpoint_without_ad_config_is_unchanged(app_client, seeded):
     resp = _post_regenerate(app_client, {
         'version': '1.2.0', 'chapters': [{'startTime': 1, 'title': 'Intro'}]},
-        ad_config=AdChapterConfig.disabled())
+        ad_config=None)
 
     assert resp.status_code == 202, resp.data
     stored = json.loads(seeded.get_episode(SLUG, EPISODE_ID)['chapters_json'])
@@ -415,6 +530,12 @@ def test_regen_job_records_the_hold_on_a_provider_rate_limit(app_client, seeded)
     row = seeded.get_episode(SLUG, EPISODE_ID)
     assert row['chapters_regen_started_at'] is None
     assert row['chapters_regen_error'] == hold_message(held_until, error)
+    podcast = seeded.get_podcast_by_slug(SLUG)
+    history = seeded.get_episode_processing_runs(podcast['id'], EPISODE_ID)[-1]
+    assert history['status'] == 'failed'
+    assert history['error_message'] == hold_message(held_until, error)
+    assert json.loads(history['processing_stats_json'])['mode'] == 'chapters'
+    assert history['run_id']
     # A fresh pause alerts once, the same rule the failure handler follows.
     assert fire.call_count == 1
     assert fire.call_args.kwargs['hold_until'] == held_until
@@ -466,7 +587,7 @@ def test_stale_regen_stamp_is_taken_over(app_client, seeded):
 
     resp = _post_regenerate(app_client, {
         'version': '1.2.0', 'chapters': [{'startTime': 1, 'title': 'Intro'}]},
-        ad_config=AdChapterConfig.disabled())
+        ad_config=None)
     assert resp.status_code == 202, resp.data
     assert seeded.get_episode(SLUG, EPISODE_ID)['chapters_regen_started_at'] is None
 
@@ -529,7 +650,7 @@ def test_regenerate_aborts_when_the_episode_moves_underneath_it(app_client, seed
             'version': '1.2.0', 'chapters': [{'startTime': 1, 'title': 'Intro'}]}
 
     resp = _post_regenerate(
-        app_client, move_episode, ad_config=AdChapterConfig.disabled())
+        app_client, move_episode, ad_config=None)
 
     assert resp.status_code == 202, resp.data
     row = seeded.get_episode(SLUG, EPISODE_ID)
@@ -550,7 +671,7 @@ def test_regenerate_merges_the_markers_as_of_the_save(app_client, seeded):
          patch('api.episodes.ChaptersGenerator') as generator, \
          patch('api.episodes.embed_chapters', return_value=False), \
          patch('api.episodes.resolve_ad_chapter_config',
-               lambda db, row, slug=None: AD_CFG), \
+               lambda db, row: AD_CFG), \
          patch('main_app.processing._refresh_rss_for_slug'):
         generator.return_value.generate_chapters.side_effect = reject_the_marker
         resp = app_client.post(
@@ -627,11 +748,11 @@ def test_chapter_step_publishes_ad_chapters_when_the_hold_write_fails(monkeypatc
                         MagicMock(side_effect=RuntimeError('settings write failed')))
     storage_mock, embed_mock, _ = _run(
         monkeypatch, _db(chapters_mode='generate'), publisher_chapters=[],
-        markers=KEPT_SPONSOR,
+        markers=MARKED_SPONSOR,
         generator_error=ProviderRateLimitedError('resets in 900s',
                                                  retry_after_seconds=900.0))
 
-    merged = _saved_chapters(storage_mock)
+    merged = _saved_chapters()
     assert merged == [AD_ENTRY, RESUME_ENTRY]
     _assert_embedded(embed_mock, merged)
 
@@ -658,3 +779,153 @@ def test_regenerate_runs_under_the_chapters_route_and_a_run_id(app_client, seede
     assert seen['route'] == snapshot['chapters']
     assert seen['run_id']
     assert resolve.call_args.args[0] == seen['run_id']
+
+
+def test_regenerate_records_own_history_and_log_with_ledger_totals(
+        app_client, seeded, monkeypatch):
+    podcast = seeded.get_podcast_by_slug(SLUG)
+    prior_id = seeded.record_processing_history(
+        podcast_id=podcast['id'], podcast_slug=SLUG,
+        podcast_title='Ad Chapters', episode_id=EPISODE_ID,
+        episode_title='Original audio run', status='completed',
+        input_tokens=12, output_tokens=4, llm_cost=0.2,
+        processing_stats={'mode': 'reprocess'},
+    )
+    storage = get_storage()
+    monkeypatch.setattr(processing, 'db', seeded)
+    monkeypatch.setattr(processing, 'storage', storage)
+    finish = seeded.finish_chapters_regen
+    finished_after_history = []
+
+    def finish_after_history(*args, **kwargs):
+        rows = seeded.get_episode_processing_runs(podcast['id'], EPISODE_ID)
+        assert len(rows) == 2
+        assert rows[-1]['log_file']
+        finished_after_history.append(True)
+        return finish(*args, **kwargs)
+
+    monkeypatch.setattr(seeded, 'finish_chapters_regen', finish_after_history)
+
+    def generate(*_args, **_kwargs):
+        ctx = run_context.current()
+        attempt = seeded.begin_llm_attempt(
+            run_id=ctx.run_id, podcast_id=podcast['id'], episode_id=EPISODE_ID,
+            phase_key='chapters', invoking_pass=1, provider_key='ollama',
+            configured_model='m-chapters', credential_slot='secondary')
+        seeded.finalize_llm_attempt(
+            attempt, state='success', input_tokens=51, output_tokens=9,
+            provider_reported_cost_usd=0.42)
+        return {'version': '1.2.0', 'chapters': [{'startTime': 1, 'title': 'Intro'}]}
+
+    with patch('main_app.processing._resolve_or_load_route_snapshot',
+               return_value={'chapters': CHAPTERS_ROUTE}):
+        response = _post_regenerate(app_client, generate)
+
+    assert response.status_code == 202
+    assert finished_after_history == [True]
+    rows = seeded.get_episode_processing_runs(podcast['id'], EPISODE_ID)
+    chapter_run = rows[-1]
+    assert rows[0]['id'] == prior_id
+    assert chapter_run['status'] == 'completed'
+    assert chapter_run['run_id']
+    assert chapter_run['ads_detected'] == 0
+    assert chapter_run['input_tokens'] == 51
+    assert chapter_run['output_tokens'] == 9
+    assert chapter_run['llm_cost'] == pytest.approx(0.42)
+    assert json.loads(chapter_run['processing_stats_json'])['mode'] == 'chapters'
+    assert seeded.get_latest_completed_processing()['episode_title'] == 'Original audio run'
+
+    assert seeded.increment_episode_token_usage(
+        podcast['id'], EPISODE_ID, 5, 2, 0.1)
+    rows = seeded.get_episode_processing_runs(podcast['id'], EPISODE_ID)
+    assert rows[0]['input_tokens'] == 17
+    assert rows[0]['output_tokens'] == 6
+    assert rows[1]['input_tokens'] == 51
+
+    headers = _authed(app_client)
+    log_response = app_client.get(
+        f'/api/v1/feeds/{SLUG}/episodes/{EPISODE_ID}/runs/'
+        f"{chapter_run['reprocess_number']}/log", headers=headers)
+    assert log_response.status_code == 200
+    messages = [line['msg'] for line in log_response.get_json()['lines']]
+    assert any('Chapter regeneration run started' in message for message in messages)
+    assert run_context.current() is None
+
+
+def test_failed_regeneration_records_history_and_log(app_client, seeded, monkeypatch):
+    podcast = seeded.get_podcast_by_slug(SLUG)
+    monkeypatch.setattr(processing, 'db', seeded)
+    monkeypatch.setattr(processing, 'storage', get_storage())
+    existing = {'version': '1.2.0', 'chapters': [{'startTime': 2, 'title': 'Keep'}]}
+    get_storage().save_chapters_json(SLUG, EPISODE_ID, existing)
+
+    def fail(*_args, **_kwargs):
+        raise RuntimeError('chapter failure')
+
+    with patch('main_app.processing._resolve_or_load_route_snapshot',
+               return_value={'chapters': CHAPTERS_ROUTE}):
+        response = _post_regenerate(app_client, fail)
+
+    assert response.status_code == 202
+    rows = seeded.get_episode_processing_runs(podcast['id'], EPISODE_ID)
+    failed = rows[-1]
+    assert failed['status'] == 'failed'
+    assert failed['error_message'] == 'chapter failure'
+    assert failed['processing_stats_json']
+    assert json.loads(failed['processing_stats_json'])['mode'] == 'chapters'
+    assert failed['log_file']
+    assert get_storage().get_chapters_json(SLUG, EPISODE_ID) == existing
+    assert run_context.current() is None
+
+
+def test_successful_regeneration_respects_disabled_episode_logs(app_client, seeded, monkeypatch):
+    podcast = seeded.get_podcast_by_slug(SLUG)
+    seeded.update_podcast(SLUG, episode_logs='off')
+    monkeypatch.setattr(processing, 'db', seeded)
+    monkeypatch.setattr(processing, 'storage', get_storage())
+    with patch('main_app.processing._resolve_or_load_route_snapshot',
+               return_value={'chapters': CHAPTERS_ROUTE}):
+        response = _post_regenerate(
+            app_client, {'version': '1.2.0', 'chapters': [
+                {'startTime': 1, 'title': 'Intro'}]})
+
+    assert response.status_code == 202
+    rows = seeded.get_episode_processing_runs(podcast['id'], EPISODE_ID)
+    assert rows[-1]['status'] == 'completed'
+    assert rows[-1]['log_file'] is None
+    assert run_context.current() is None
+
+
+@pytest.mark.parametrize('provider,model', [('typesafe', 'configured-model'),
+                                          ('systemone-compatible', 'configured-model'),
+                                          ('openai-compatible', 'typesafe/jev')])
+def test_manual_native_chapters_reject_before_claim_thread_or_log_mutation(app_client, seeded, provider, model):
+    keys = ('llm_provider', 'chapters_model', 'chapters_provider', 'chapters_enabled')
+    original = {key: seeded.get_setting(key) for key in keys}
+    before = seeded.get_episode(SLUG, EPISODE_ID)
+    try:
+        seeded.set_setting('llm_provider', provider)
+        seeded.set_setting('chapters_model', model)
+        seeded.set_setting('chapters_provider', 'primary')
+        seeded.set_setting('chapters_enabled', 'false')
+        clear_settings_cache()
+        headers = _authed(app_client)
+        thread = MagicMock()
+        with patch.object(seeded, 'claim_chapters_regen') as claim, \
+                patch('api.episodes.threading', SimpleNamespace(Thread=thread)):
+            response = app_client.post(
+                f'/api/v1/feeds/{SLUG}/episodes/{EPISODE_ID}/regenerate-chapters', headers=headers)
+        assert response.status_code == 400
+        assert 'supported chat provider and model' in response.get_json()['error']
+        claim.assert_not_called()
+        thread.assert_not_called()
+        after = seeded.get_episode(SLUG, EPISODE_ID)
+        assert after['chapters_regen_started_at'] == before['chapters_regen_started_at']
+        assert after['chapters_regen_error'] == before['chapters_regen_error']
+    finally:
+        for key, value in original.items():
+            if value is None:
+                seeded.clear_setting(key)
+            else:
+                seeded.set_setting(key, value)
+        clear_settings_cache()

@@ -14,7 +14,6 @@ import ToggleSwitch from '../../components/ToggleSwitch';
 import TriStateSelect from '../../components/TriStateSelect';
 import SegmentedToggle from '../../components/SegmentedToggle';
 import SegmentActionToggle from '../../components/SegmentActionToggle';
-import Checkbox from '../../components/Checkbox';
 import {
   SEGMENT_CATEGORIES, SEGMENT_CATEGORY_LABELS, SEGMENT_CATEGORY_DESCRIPTIONS, DEFAULT_SEGMENT_ACTION,
   type SegmentCategory, type SegmentAction,
@@ -28,6 +27,8 @@ import SavedBadge from '../settings/SavedBadge';
 import DraftNumberInput, { parseOptionalNumber } from '../../components/DraftNumberInput';
 import { selectBase } from '../../components/fieldStyles';
 import { LOW_AD_YIELD_ACTION_LABELS } from '../../utils/lowAdYield';
+import { SkipPatternsField } from './SkipPatternsField';
+import { UserAgentOverrideField } from './UserAgentOverrideField';
 
 // Matches MAX_RETENTION_DAYS_OVERRIDE in src/api/feeds.py.
 const MAX_RETENTION_DAYS = 3650;
@@ -35,7 +36,7 @@ const MAX_RETENTION_DAYS = 3650;
 type RetentionMode = 'global' | 'archive' | 'custom';
 import { focusRing } from '../../components/fieldStyles';
 import { badgeBase, tint } from '../../components/badgeStyles';
-import { RemovableChip } from '../../components/RemovableChip';
+import { isSystemOneChapterRoute } from '../settings/systemoneWarnings';
 
 interface Props {
   feed: Feed;
@@ -123,7 +124,7 @@ function CueOverrideRow({
   );
   return (
     <div className={`flex flex-col sm:flex-row ${description ? 'sm:items-start' : 'sm:items-center'} gap-2 sm:gap-3 text-sm`}>
-      <span className={`text-muted-foreground whitespace-nowrap sm:w-32 shrink-0${description ? ' sm:pt-1.5' : ''}`}>{label}:</span>
+      <span className={`text-muted-foreground sm:w-32 shrink-0${description ? ' sm:pt-1.5' : ''}`}>{label}:</span>
       {description ? (
         <div className="flex flex-col gap-1 flex-1 min-w-0">
           {inputRow}
@@ -153,7 +154,7 @@ function GlobalOverrideRow({
           value={value ?? ''}
           onChange={(e) => onChange(e.target.value === '' ? null : e.target.value as 'on' | 'off')}
           disabled={disabled}
-          className={`self-start min-w-0 max-w-full disabled:opacity-50 ${selectBase}`}
+          className={`self-start w-full sm:w-auto min-h-11 sm:min-h-0 min-w-0 max-w-full disabled:opacity-50 ${selectBase}`}
           aria-label={ariaLabel}
         >
           <option value="">Use global ({globalOn ? 'on' : 'off'})</option>
@@ -184,9 +185,11 @@ function FeedSettingsPanel({ feed, slug }: Props) {
   const [confirmRerender, setConfirmRerender] = useState(false);
   const [rerenderError, setRerenderError] = useState<string | null>(null);
   const [segmentActionError, setSegmentActionError] = useState<string | null>(null);
-  const [addingTitleSkipPattern, setAddingTitleSkipPattern] = useState(false);
-  const [titleSkipPatternInput, setTitleSkipPatternInput] = useState('');
-  const [titleSkipPatternError, setTitleSkipPatternError] = useState<string | null>(null);
+  const [durationFilterError, setDurationFilterError] = useState<string | null>(null);
+  const minDurationField = useDraftField(feed, (f) =>
+    f.minDurationSeconds == null ? '' : String(f.minDurationSeconds / 60));
+  const maxDurationField = useDraftField(feed, (f) =>
+    f.maxDurationSeconds == null ? '' : String(f.maxDurationSeconds / 60));
   // Local source of truth for the per-feed override map, not the `feed`
   // prop: the PATCH replaces the stored map outright with no server merge,
   // so building from a stale prop between edits would drop the earlier one.
@@ -203,6 +206,10 @@ function FeedSettingsPanel({ feed, slug }: Props) {
     queryKey: ['settings'],
     queryFn: getSettings,
   });
+  const unsupportedChapterRoute = isSystemOneChapterRoute(settings);
+  const nativeChapterGenerationBlocked = unsupportedChapterRoute
+    && (settings?.chaptersEnabled?.value ?? settings?.defaults?.chaptersEnabled ?? true);
+  const inheritedChapterMode = settings?.chaptersMode?.value ?? 'auto';
 
   // Cue-only mode needs at least one enabled ad-break-start and ad-break-end
   // template; fetched here to gray out the option before the user picks it.
@@ -219,11 +226,6 @@ function FeedSettingsPanel({ feed, slug }: Props) {
     (settings?.lowAdYieldAction?.value as LowAdYieldAction | undefined) ?? 'nothing';
   const globalLowAdYieldLabel = LOW_AD_YIELD_ACTION_LABELS[globalLowAdYieldAction]
     ?? LOW_AD_YIELD_ACTION_LABELS.nothing;
-
-  const globalAdChapterCategories: Partial<Record<SegmentCategory, boolean>> =
-    settings?.adChapterCategories?.value ?? {};
-  const adChaptersOn = feed.adChaptersEnabled === 'on'
-    || (feed.adChaptersEnabled == null && settings?.adChaptersEnabled?.value === true);
 
   // Retention 0 turns run log storage off everywhere, so the global option
   // has to say which way it currently falls.
@@ -300,9 +302,10 @@ function FeedSettingsPanel({ feed, slug }: Props) {
     // exact pre-edit snapshot rather than the possibly-stale feed prop.
     // onSettled always refetches so a failed PATCH still reverts every
     // other field to server truth.
-    onSettled: () => {
-      queryClient.invalidateQueries({ queryKey: ['feed', slug] });
-    },
+    onSettled: () => Promise.all([
+      queryClient.invalidateQueries({ queryKey: ['feed', slug] }),
+      queryClient.invalidateQueries({ queryKey: ['episodes', slug] }),
+    ]),
   });
 
   // Separate mutation from updateMutation: that one closes the network editor
@@ -487,34 +490,6 @@ function FeedSettingsPanel({ feed, slug }: Props) {
     });
   };
 
-  const addTitleSkipPattern = () => {
-    const pattern = titleSkipPatternInput.trim();
-    if (!pattern) return;
-    const current = feed.titleSkipPatterns ?? [];
-    if (current.includes(pattern)) {
-      setTitleSkipPatternInput('');
-      setAddingTitleSkipPattern(false);
-      return;
-    }
-    setTitleSkipPatternError(null);
-    updateMutation.mutate({ titleSkipPatterns: [...current, pattern] }, {
-      onSuccess: () => {
-        setTitleSkipPatternInput('');
-        setAddingTitleSkipPattern(false);
-      },
-      onError: (e) => setTitleSkipPatternError(getErrorMessage(e, 'Failed to add pattern')),
-    });
-  };
-
-  const removeTitleSkipPattern = (pattern: string) => {
-    setTitleSkipPatternError(null);
-    updateMutation.mutate({
-      titleSkipPatterns: (feed.titleSkipPatterns ?? []).filter((p) => p !== pattern),
-    }, {
-      onError: (e) => setTitleSkipPatternError(getErrorMessage(e, 'Failed to remove pattern')),
-    });
-  };
-
   const processingMode = feed.processingMode ?? 'standard';
   const cueOnlyActive = processingMode === 'cue_only';
   // Local feeds have no upstream RSS: source URL, title-blacklist, GUID
@@ -527,7 +502,7 @@ function FeedSettingsPanel({ feed, slug }: Props) {
     <div className="mb-6">
       <CollapsibleSection
         title="Feed settings"
-        subtitle="Network, DAI platform, auto-processing, language, tags, and collapsed cue tuning and advanced controls"
+        subtitle="Source, processing, episode filters, tags, chapters, and storage"
         defaultOpen={false}
         storageKey={`feed-settings-${slug}`}
         onToggle={setPanelOpen}
@@ -821,7 +796,7 @@ function FeedSettingsPanel({ feed, slug }: Props) {
                       processingMode: e.target.value as UpdateFeedPayload['processingMode'],
                     })}
                     disabled={updateMutation.isPending}
-                    className={`self-start min-w-0 max-w-full disabled:opacity-50 ${selectBase}`}
+                    className={`self-start min-w-0 max-w-full disabled:opacity-50 ${selectBase} pl-2`}
                   >
                     <option value="standard">Standard (detect and cut ads)</option>
                     <option value="keep_content">Keep content only (experimental)</option>
@@ -966,89 +941,102 @@ function FeedSettingsPanel({ feed, slug }: Props) {
             </div>
           </CollapsibleSection>
 
+          {!isLocal && (
           <CollapsibleSection
-            title="Title and tag rules"
+            title="Episode filters"
+            subtitle="Skip automatic processing by title, description, or duration"
             defaultOpen
-            storageKey={`feed-title-tags-${slug}`}
+            storageKey={`feed-filters-${slug}`}
           >
             <div className="space-y-4 pt-1">
-              {/* Episode title blacklist: skip episodes whose title matches a glob
-                  pattern. Local feeds don't get new upstream episodes to blacklist. */}
-              {!isLocal && (
-              <>
-              <div className="flex flex-col sm:flex-row sm:items-start gap-2 sm:gap-3 text-sm">
-                <span className="text-muted-foreground whitespace-nowrap sm:w-32 shrink-0 sm:pt-0.5">
-                  Skip episodes by title:
-                </span>
-                <div className="flex flex-col gap-1 flex-1 min-w-0">
-                  {(feed.titleSkipPatterns ?? []).length > 0 && (
-                    <div className="flex flex-wrap gap-1 mb-1">
-                      {feed.titleSkipPatterns!.map((p) => (
-                        <RemovableChip key={p} label={p} onRemove={() => removeTitleSkipPattern(p)}
-                          disabled={updateMutation.isPending} />
-                      ))}
-                    </div>
-                  )}
-                  <div className="flex items-center gap-2">
-                    {!addingTitleSkipPattern ? (
-                      <button
-                        type="button"
-                        onClick={() => setAddingTitleSkipPattern(true)}
+              <SkipPatternsField
+                label="Skip episodes by title:"
+                patterns={feed.titleSkipPatterns}
+                inputAriaLabel="New title pattern"
+                placeholder="Bonus Episode *"
+                hint="Match the whole title, ignoring case. Use * as a wildcard, for example Bonus Episode *."
+                disabled={updateMutation.isPending}
+                onAdd={(next, callbacks) => updateMutation.mutate({ titleSkipPatterns: next }, callbacks)}
+                onRemove={(next, callbacks) => updateMutation.mutate({ titleSkipPatterns: next }, callbacks)}
+              />
+
+              <SkipPatternsField
+                label="Skip episodes by description:"
+                patterns={feed.descriptionSkipPatterns}
+                addButtonAriaLabel="Add description pattern"
+                inputAriaLabel="New description pattern"
+                placeholder="*This is a preview*"
+                hint="Match the whole description text, HTML removed, ignoring case. Use * as a wildcard, for example *This is a preview. To hear the entire episode*."
+                disabled={updateMutation.isPending}
+                onAdd={(next, callbacks) => updateMutation.mutate({ descriptionSkipPatterns: next }, callbacks)}
+                onRemove={(next, callbacks) => updateMutation.mutate({ descriptionSkipPatterns: next }, callbacks)}
+              />
+
+              <div className="space-y-2 text-sm">
+                <div className="grid grid-cols-2 items-end gap-3 max-w-xs">
+                  {([
+                    ['Minimum (minutes)', minDurationField],
+                    ['Maximum (minutes)', maxDurationField],
+                  ] as const).map(([label, field]) => (
+                    <label key={label} className="flex min-w-0 flex-col gap-1.5">
+                      <span className="text-muted-foreground">{label}</span>
+                      <DraftNumberInput
+                        value={parseOptionalNumber(field.value)}
+                        fallback={null}
+                        min={0}
+                        step="any"
+                        parse={parseOptionalNumber}
+                        onChange={(value) => field.setValue(value == null ? '' : String(value))}
+                        placeholder="No limit"
+                        ariaLabel={label}
                         disabled={updateMutation.isPending}
-                        className={`px-2 py-1 text-xs rounded ${btnOutline} disabled:opacity-50 ${focusRing}`}
-                      >
-                        + Add pattern
-                      </button>
-                    ) : (
-                      <>
-                        <input
-                          type="text"
-                          autoFocus
-                          value={titleSkipPatternInput}
-                          onChange={(e) => setTitleSkipPatternInput(e.target.value)}
-                          onKeyDown={(e) => {
-                            if (e.key === 'Enter') {
-                              e.preventDefault();
-                              addTitleSkipPattern();
-                            }
-                          }}
-                          placeholder="Bonus Episode *"
-                          aria-label="New title pattern"
-                          maxLength={200}
-                          className="px-2 py-1 text-xs bg-secondary border border-border rounded flex-1 min-w-0"
-                        />
-                        <button
-                          type="button"
-                          onClick={addTitleSkipPattern}
-                          disabled={updateMutation.isPending || !titleSkipPatternInput.trim()}
-                          className={`px-2 py-1 text-xs rounded ${btnOutline} disabled:opacity-50 ${focusRing}`}
-                        >
-                          Add
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setAddingTitleSkipPattern(false);
-                            setTitleSkipPatternInput('');
-                            setTitleSkipPatternError(null);
-                          }}
-                          className={`px-2 py-1 text-xs rounded ${btnOutline} ${focusRing}`}
-                        >
-                          Cancel
-                        </button>
-                      </>
-                    )}
-                  </div>
-                  {titleSkipPatternError && (
-                    <p className="text-xs text-destructive">{titleSkipPatternError}</p>
-                  )}
-                  <p className="text-xs text-muted-foreground">
-                    Patterns match the whole episode title, case-insensitively. Use * as a wildcard: Bonus Episode * skips titles starting with Bonus Episode. Without a wildcard the whole title must match.
-                  </p>
+                        className="w-full min-h-11 px-3 py-2 rounded-lg border border-input bg-background text-foreground focus:outline-hidden focus:ring-2 focus:ring-ring disabled:opacity-50"
+                      />
+                    </label>
+                  ))}
                 </div>
+                <p className="text-xs text-muted-foreground">
+                  Unknown durations are kept. Manual reprocessing overrides filters.
+                </p>
+                {durationFilterError && <p role="alert" className="text-xs text-destructive">{durationFilterError}</p>}
+                <button
+                  type="button"
+                  disabled={updateMutation.isPending || (!minDurationField.dirty && !maxDurationField.dirty)}
+                  className={`min-h-11 px-3 py-2 text-sm rounded ${btnSecondary} disabled:opacity-50 ${focusRing}`}
+                  onClick={() => {
+                    const minimum = parseOptionalNumber(minDurationField.value);
+                    const maximum = parseOptionalNumber(maxDurationField.value);
+                    if ((minimum != null && minimum < 0) || (maximum != null && maximum < 0)) {
+                      setDurationFilterError('Duration limits must be 0 minutes or greater.');
+                      return;
+                    }
+                    if ((minimum != null && !Number.isFinite(minimum * 60))
+                      || (maximum != null && !Number.isFinite(maximum * 60))) {
+                      setDurationFilterError('Duration limits must be finite numbers.');
+                      return;
+                    }
+                    if (minimum != null && maximum != null && minimum > maximum) {
+                      setDurationFilterError('Minimum duration must not exceed maximum duration.');
+                      return;
+                    }
+                    setDurationFilterError(null);
+                    updateMutation.mutate({
+                      minDurationSeconds: minimum == null ? null : minimum * 60,
+                      maxDurationSeconds: maximum == null ? null : maximum * 60,
+                    }, {
+                      onSuccess: () => {
+                        minDurationField.markClean(minDurationField.value);
+                        maxDurationField.markClean(maxDurationField.value);
+                      },
+                      onError: (error) => setDurationFilterError(getErrorMessage(error, 'Could not save duration limits.')),
+                    });
+                  }}
+                >
+                  Save duration limits
+                </button>
               </div>
 
-              {/* Served-feed visibility for a title-blacklisted episode */}
+
               <div className="flex flex-col sm:flex-row sm:items-start gap-2 sm:gap-3 text-sm">
                 <span className="text-muted-foreground whitespace-nowrap sm:w-32 shrink-0 sm:pt-1.5">
                   Skipped episodes:
@@ -1066,9 +1054,16 @@ function FeedSettingsPanel({ feed, slug }: Props) {
                   <option value="hide">Hide from feed</option>
                 </select>
               </div>
-              </>
-              )}
+            </div>
+          </CollapsibleSection>
+          )}
 
+          <CollapsibleSection
+            title="Tags"
+            defaultOpen
+            storageKey={`feed-title-tags-${slug}`}
+          >
+            <div className="space-y-4 pt-1">
               {/* Feed tags */}
               <div className="flex flex-col sm:flex-row sm:items-start gap-2 sm:gap-3 text-sm">
                 <span className="text-muted-foreground whitespace-nowrap sm:w-32 shrink-0 sm:pt-0.5">Tags:</span>
@@ -1084,21 +1079,25 @@ function FeedSettingsPanel({ feed, slug }: Props) {
             defaultOpen
             storageKey={`feed-chapters-${slug}`}
           >
-            <div className="space-y-4 pt-1">
+            <div className="space-y-4 pt-1 max-sm:[&_select]:min-h-11">
               {/* Per-feed chapter mode */}
               <div className="flex flex-col sm:flex-row sm:items-start gap-2 sm:gap-3 text-sm">
                 <span className="text-muted-foreground whitespace-nowrap sm:w-32 shrink-0 sm:pt-1.5">Chapters:</span>
                 <div className="flex flex-col gap-1 flex-1 min-w-0">
                   <select
                     value={feed.chaptersMode ?? ''}
-                    onChange={(e) => updateMutation.mutate({ chaptersMode: e.target.value === '' ? null : e.target.value as 'auto' | 'generate' | 'off' })}
+                    onChange={(e) => {
+                      const next = e.target.value === '' ? null : e.target.value as 'auto' | 'generate' | 'off';
+                      if (nativeChapterGenerationBlocked && (next ?? inheritedChapterMode) !== 'off') return;
+                      updateMutation.mutate({ chaptersMode: next });
+                    }}
                     disabled={updateMutation.isPending}
                     className={`self-start min-w-0 max-w-full disabled:opacity-50 ${selectBase}`}
                     aria-label="Chapters"
                   >
-                    <option value="">Inherit global ({settings?.chaptersMode?.value ?? 'auto'})</option>
-                    <option value="auto">Auto</option>
-                    <option value="generate">Always generate</option>
+                    <option value="" disabled={nativeChapterGenerationBlocked && inheritedChapterMode !== 'off'}>Inherit global ({inheritedChapterMode})</option>
+                    <option value="auto" disabled={nativeChapterGenerationBlocked}>Auto</option>
+                    <option value="generate" disabled={nativeChapterGenerationBlocked}>Always generate</option>
                     <option value="off">Off</option>
                   </select>
                   <p className="text-xs text-muted-foreground">
@@ -1106,6 +1105,7 @@ function FeedSettingsPanel({ feed, slug }: Props) {
                     the ad-free audio, and generates chapters when an episode has too
                     few. Always generate replaces them; Off leaves them untouched.
                   </p>
+                  {unsupportedChapterRoute && <p role="status" className="text-xs text-warning">System One cannot generate chapters. Select a chat provider and model.</p>}
                 </div>
               </div>
 
@@ -1122,54 +1122,6 @@ function FeedSettingsPanel({ feed, slug }: Props) {
                 feed, so apps show it without starting playback.
               </GlobalOverrideRow>
 
-              {/* Per-feed ad chapters override */}
-              <GlobalOverrideRow
-                label="Ad chapters"
-                ariaLabel="Ad chapters"
-                value={feed.adChaptersEnabled}
-                globalOn={!!settings?.adChaptersEnabled?.value}
-                disabled={updateMutation.isPending}
-                onChange={(adChaptersEnabled) => updateMutation.mutate({ adChaptersEnabled })}
-              >
-                Publish kept segments as chapters in this feed. Needs a chapters
-                mode other than Off.
-              </GlobalOverrideRow>
-
-              {adChaptersOn && (
-                <div className="flex flex-col sm:flex-row sm:items-start gap-2 sm:gap-3 text-sm">
-                  <span className="text-muted-foreground whitespace-nowrap sm:w-32 shrink-0 sm:pt-1.5">Chaptered categories:</span>
-                  <div className="flex flex-col gap-2 flex-1 min-w-0">
-                    <Checkbox
-                      checked={feed.adChapterCategories == null}
-                      // Copying the global map needs the settings query resolved.
-                      disabled={updateMutation.isPending || !settings}
-                      onChange={(checked) => updateMutation.mutate({
-                        adChapterCategories: checked ? null : { ...globalAdChapterCategories },
-                      })}
-                      label="Use global categories"
-                    />
-                    {feed.adChapterCategories != null && (
-                      <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
-                        {SEGMENT_CATEGORIES.map((category) => (
-                          <Checkbox
-                            key={category}
-                            checked={feed.adChapterCategories?.[category]
-                              ?? globalAdChapterCategories[category] ?? false}
-                            disabled={updateMutation.isPending}
-                            onChange={(checked) => updateMutation.mutate({
-                              adChapterCategories: { ...feed.adChapterCategories, [category]: checked },
-                            })}
-                            label={SEGMENT_CATEGORY_LABELS[category]}
-                          />
-                        ))}
-                      </div>
-                    )}
-                    <p className="text-xs text-muted-foreground">
-                      Which kept categories get a chapter in this feed.
-                    </p>
-                  </div>
-                </div>
-              )}
             </div>
           </CollapsibleSection>
 
@@ -1179,6 +1131,26 @@ function FeedSettingsPanel({ feed, slug }: Props) {
             storageKey={`feed-output-${slug}`}
           >
             <div className="space-y-4 pt-1">
+              <GlobalOverrideRow
+                label="Replacement sound"
+                ariaLabel="Replacement sound"
+                value={feed.audioReplacementSoundOverride == null ? null : feed.audioReplacementSoundOverride ? 'on' : 'off'}
+                globalOn={settings?.audioReplacementSoundEnabled?.value ?? true}
+                disabled={updateMutation.isPending}
+                onChange={(value) => updateMutation.mutate({ audioReplacementSoundOverride: value === null ? null : value === 'on' })}
+              >
+                Insert a sound where audio is removed.
+              </GlobalOverrideRow>
+              <GlobalOverrideRow
+                label="MP3 stream copy"
+                ariaLabel="MP3 stream copy"
+                value={feed.audioMp3StreamCopyOverride == null ? null : feed.audioMp3StreamCopyOverride ? 'on' : 'off'}
+                globalOn={settings?.audioMp3StreamCopyEnabled?.value ?? false}
+                disabled={updateMutation.isPending}
+                onChange={(value) => updateMutation.mutate({ audioMp3StreamCopyOverride: value === null ? null : value === 'on' })}
+              >
+                Tries compatible MP3 cuts; otherwise re-encodes.
+              </GlobalOverrideRow>
               {/* Hide unprocessed episodes from the served feed. Meaningless for a
                   local feed: nothing is served until it finishes processing. */}
               {!isLocal && (
@@ -1189,7 +1161,7 @@ function FeedSettingsPanel({ feed, slug }: Props) {
                     value={feed.onlyExposeProcessedEpisodes}
                     onChange={(next) => updateMutation.mutate({ onlyExposeProcessedEpisodes: next })}
                     disabled={updateMutation.isPending}
-                    className="px-2 py-1.5 text-sm bg-secondary border border-border rounded flex-1 sm:flex-none min-w-0"
+                    className="px-2 py-1.5 text-sm bg-secondary border border-border rounded w-full sm:w-auto min-h-11 sm:min-h-0 sm:flex-none min-w-0"
                   />
                   {feed.onlyExposeProcessedEpisodes !== null && feed.onlyExposeProcessedEpisodes !== undefined && (
                     <span className={`${badgeBase} font-medium ${
@@ -1239,7 +1211,7 @@ function FeedSettingsPanel({ feed, slug }: Props) {
                         ? null : (e.target.value as EpisodeLogsOverride),
                     })}
                     disabled={updateMutation.isPending}
-                    className={`self-start min-w-0 max-w-full disabled:opacity-50 ${selectBase}`}
+                    className={`self-start w-full sm:w-auto min-h-11 sm:min-h-0 min-w-0 max-w-full disabled:opacity-50 ${selectBase}`}
                     aria-label="Run log storage"
                   >
                     <option value="">Use global ({globalEpisodeLogsLabel})</option>
@@ -1274,7 +1246,7 @@ function FeedSettingsPanel({ feed, slug }: Props) {
                         });
                       }}
                       disabled={updateMutation.isPending}
-                      className={`self-start min-w-0 max-w-full disabled:opacity-50 ${selectBase}`}
+                      className={`self-start w-full sm:w-auto min-h-11 sm:min-h-0 min-w-0 max-w-full disabled:opacity-50 ${selectBase}`}
                       aria-label="Retention"
                     >
                       <option value="global">Use global ({globalStorageRetentionLabel})</option>
@@ -1309,7 +1281,7 @@ function FeedSettingsPanel({ feed, slug }: Props) {
                   </div>
                   <p className="text-xs text-muted-foreground">
                     How long processed audio for this feed stays on disk. Archive keeps every
-                    episode indefinitely, and survives the &ldquo;Clear all processed audio&rdquo;
+                    episode indefinitely, and survives the "Clear all processed audio"
                     action in Settings.
                   </p>
                 </div>
@@ -1328,7 +1300,7 @@ function FeedSettingsPanel({ feed, slug }: Props) {
                           ? null : e.target.value === 'on',
                       })}
                       disabled={updateMutation.isPending}
-                      className={`self-start min-w-0 max-w-full disabled:opacity-50 ${selectBase}`}
+                      className={`self-start w-full sm:w-auto min-h-11 sm:min-h-0 min-w-0 max-w-full disabled:opacity-50 ${selectBase}`}
                       aria-label="Keep original audio"
                     >
                       <option value="">Use global ({globalKeepOriginalLabel})</option>
@@ -1350,7 +1322,7 @@ function FeedSettingsPanel({ feed, slug }: Props) {
             </div>
           </CollapsibleSection>
 
-          {/* Segment actions (issue #565): per-feed remove/beep/keep overrides,
+          {/* Segment actions (issue #565): per-feed remove/beep/keep/mark overrides,
               show-segment detection, and the bulk re-render trigger. */}
           <CollapsibleSection
             title="Segment actions"
@@ -1360,7 +1332,7 @@ function FeedSettingsPanel({ feed, slug }: Props) {
           >
             <div className="flex flex-col gap-3 pt-1">
               <p className="text-sm text-muted-foreground">
-                Choose what happens to each kind of detected segment. Remove cuts it out, Beep replaces it with a tone, Keep leaves it in.
+                Choose what happens to each kind of detected segment. Remove cuts it out, Beep replaces it with a tone, Keep leaves it in. Mark leaves it in and adds a chapter a player can skip.
               </p>
               <div className="space-y-2">
                 {SEGMENT_CATEGORIES.map((category) => {
@@ -1545,11 +1517,37 @@ function FeedSettingsPanel({ feed, slug }: Props) {
           {/* Advanced settings (collapsible; rarely-changed knobs) */}
           <CollapsibleSection
             title="Advanced"
-            subtitle="Cut snapping, ad review holds, and cross-fetch"
+            subtitle="Download requests, cut snapping, ad review holds, and differential checks"
             defaultOpen={false}
             storageKey={`feed-advanced-${slug}`}
           >
             <div className="flex flex-col gap-3 pt-1">
+              <UserAgentOverrideField
+                id={`download-ua-${slug}`}
+                label="Download User-Agent"
+                feed={feed}
+                field="downloadUserAgentOverride"
+                globalValue={settings?.downloadUserAgent?.value}
+                hint="Audio, artwork, and chapters for this feed. Blank uses global. Cross-fetch uses a different client."
+                saveAriaLabel="Save download User-Agent"
+                useGlobalAriaLabel="Use global download User-Agent"
+                errorFallback="Failed to save download User-Agent"
+                disabled={updateMutation.isPending}
+                onSave={(next, callbacks) => updateMutation.mutate({ downloadUserAgentOverride: next }, callbacks)}
+              />
+              <UserAgentOverrideField
+                id={`feed-ua-${slug}`}
+                label="RSS User-Agent"
+                feed={feed}
+                field="feedUserAgentOverride"
+                globalValue={settings?.feedUserAgent?.value}
+                hint="This feed's own RSS fetch. Blank uses global."
+                saveAriaLabel="Save RSS User-Agent"
+                useGlobalAriaLabel="Use global RSS User-Agent"
+                errorFallback="Failed to save RSS User-Agent"
+                disabled={updateMutation.isPending}
+                onSave={(next, callbacks) => updateMutation.mutate({ feedUserAgentOverride: next }, callbacks)}
+              />
               {/* Boundary-snap opt-ins (simple flags; off unless enabled here) */}
               {(
                 [
@@ -1753,6 +1751,32 @@ function FeedSettingsPanel({ feed, slug }: Props) {
                   <p className="text-xs text-warning">
                     Downloads each new episode twice and compares them; audio that differs was
                     inserted dynamically. Doubles this feed's download count.
+                  </p>
+                </div>
+              </div>
+              )}
+
+              {/* Local feeds have no publisher transcript to compare against. */}
+              {!isLocal && (
+              <div className="flex flex-col sm:flex-row sm:items-start gap-2 sm:gap-3 text-sm">
+                <span className="text-muted-foreground whitespace-nowrap sm:w-32 shrink-0 sm:pt-0.5">Transcript diff:</span>
+                <div className="flex flex-col gap-1 flex-1 min-w-0">
+                  <select
+                    value={feed.transcriptDifferential == null ? 'inherit' : feed.transcriptDifferential ? 'on' : 'off'}
+                    onChange={(e) => updateMutation.mutate({
+                      transcriptDifferential: e.target.value === 'inherit' ? null : e.target.value === 'on',
+                    })}
+                    disabled={updateMutation.isPending}
+                    className={`self-start min-w-0 disabled:opacity-50 ${selectBase}`}
+                    aria-label="Compare with the publisher transcript"
+                  >
+                    <option value="inherit">Inherit global ({settings?.transcriptDifferentialEnabled?.value === false ? 'Off' : 'On'})</option>
+                    <option value="on">On</option>
+                    <option value="off">Off</option>
+                  </select>
+                  <p className="text-xs text-muted-foreground">
+                    When an episode links the publisher's own transcript, speech missing from it is
+                    flagged as a likely ad. Gaps no other detector confirms are held for review.
                   </p>
                 </div>
               </div>

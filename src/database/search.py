@@ -25,6 +25,7 @@ _HL_CLOSE = '\x03'
 
 # All groups search_grouped can compute; also the valid values for the /search groups= param.
 SEARCH_GROUP_NAMES = ('shows', 'episodes', 'transcripts', 'patterns', 'sponsors')
+SEARCH_INDEX_CONTENT_TYPES = ('podcast', 'episode', 'pattern', 'sponsor')
 
 # Episodes per indexing statement: two bound params each, plus one MATCH term each.
 _INDEX_CHUNK = 500
@@ -49,7 +50,7 @@ _SHADOW_NAME_RE = re.compile(r'^search_index_new_[0-9]+_[0-9]+$')
 # (an FTS5 DROP walks and deletes the whole corpus); it is purged afterwards.
 _RETIRED_PREFIX = 'search_index_retired'
 _RETIRED_NAME_RE = re.compile(r'^search_index_retired_[0-9]+_[0-9]+$')
-_PURGE_CHUNK_ROWS = 500
+_PURGE_CHUNK_ROWS = _REBUILD_TX_ROWS
 
 
 @contextmanager
@@ -676,14 +677,21 @@ class SearchMixin:
         """Get statistics about the search index."""
         conn = self.get_connection()
 
-        stats = {}
-        cursor = conn.execute("""
-            SELECT content_type, COUNT(*) as count
-            FROM search_index
-            GROUP BY content_type
-        """)
-        for row in cursor:
-            stats[row['content_type']] = row['count']
+        count_queries = ' UNION ALL '.join(
+            'SELECT ? AS content_type, COUNT(*) AS count FROM search_index '
+            'WHERE search_index MATCH ?'
+            for _ in SEARCH_INDEX_CONTENT_TYPES
+        )
+        params = tuple(
+            value
+            for content_type in SEARCH_INDEX_CONTENT_TYPES
+            for value in (content_type, f'content_type:{content_type}')
+        )
+        stats = {
+            row['content_type']: row['count']
+            for row in conn.execute(count_queries, params)
+            if row['count']
+        }
 
         stats['total'] = sum(stats.values())
         return stats

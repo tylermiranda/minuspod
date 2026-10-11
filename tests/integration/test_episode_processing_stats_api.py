@@ -69,7 +69,8 @@ STATS_API = {
     'transcriptSegments': 132,
     'windows': {'total': 7, 'failed': 0},
     'verificationWindows': None,
-    'stageHits': {'fingerprint': 0, 'textPattern': 3, 'differential': 11, 'llm': 11},
+    'stageHits': {'fingerprint': 0, 'textPattern': 3, 'differential': 11, 'llm': 11,
+                  'transcriptDifferential': 0},
     'detected': 12,
     'markers': {'cut': 6, 'held': 4, 'notCut': 5},
     'verificationAdsCut': 1,
@@ -79,6 +80,7 @@ STATS_API = {
     'timings': {
         'downloadSeconds': 42.0,
         'transcriptionSeconds': 180.0,
+        'transcriptDiffSeconds': None,
         'differentialSeconds': 3.5,
         'audioAnalysisSeconds': 8.0,
         'detectionSeconds': 120.0,
@@ -159,6 +161,32 @@ def test_episode_exposes_processing_runs_and_rss_duration(app_client, seeded):
     assert runs[1]['adsDetected'] == 6
 
 
+def test_processing_runs_expose_chapter_degradation_only_when_recorded(app_client, seeded):
+    db, slug, podcast = seeded['db'], seeded['slug'], seeded['podcast']
+    episode_id = 'face12345678'
+    seeded['seed'](episode_id)
+    db.record_processing_history(
+        podcast_id=podcast['id'], podcast_slug=slug, podcast_title='Proc',
+        episode_id=episode_id, episode_title='Legacy stats', status='completed',
+        ads_detected=0, processing_stats=STATS_DB)
+    db.record_processing_history(
+        podcast_id=podcast['id'], podcast_slug=slug, podcast_title='Proc',
+        episode_id=episode_id, episode_title='Chapter fallback', status='completed',
+        ads_detected=0,
+        processing_stats={
+            **STATS_DB,
+            'chapters_degraded': True,
+            'chapters_degraded_reason': 'Chapter AI is unavailable. Check Settings > AI Models, then try again.',
+        })
+
+    _authed(app_client)
+    runs = app_client.get(f'/api/v1/feeds/{slug}/episodes/{episode_id}').get_json()['processingRuns']
+    assert runs[1]['stats']['chaptersDegraded'] is True
+    assert runs[1]['stats']['chaptersDegradedReason'].startswith('Chapter AI is unavailable.')
+    assert 'chaptersDegraded' not in runs[0]['stats']
+    assert 'chaptersDegradedReason' not in runs[0]['stats']
+
+
 def test_failed_run_preserves_partial_stage_timings(app_client, seeded):
     db, slug, podcast = seeded['db'], seeded['slug'], seeded['podcast']
     seeded['seed']('faced1234567', original=3305.7, new=None)
@@ -186,6 +214,7 @@ def test_failed_run_preserves_partial_stage_timings(app_client, seeded):
     assert run['stats']['timings'] == {
         'downloadSeconds': 42.0,
         'transcriptionSeconds': 180.0,
+        'transcriptDiffSeconds': None,
         'differentialSeconds': None,
         'audioAnalysisSeconds': None,
         'detectionSeconds': None,

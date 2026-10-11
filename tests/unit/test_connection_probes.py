@@ -53,7 +53,7 @@ def _response(status, body=b'', json_body=None):
 
 class TestProbeModelsEndpoint:
     def test_success(self):
-        with patch('api.providers.safe_get',
+        with patch('provider_probe.safe_get',
                    return_value=_response(200, json_body={'data': []})) as sg:
             result = _probe_models_endpoint('http://localhost:11434/v1', 'sk-x')
         assert result['ok'] is True
@@ -62,26 +62,26 @@ class TestProbeModelsEndpoint:
         assert sg.call_args[1]['headers']['Authorization'] == 'Bearer sk-x'
 
     def test_no_key_sends_no_auth_header(self):
-        with patch('api.providers.safe_get',
+        with patch('provider_probe.safe_get',
                    return_value=_response(200, json_body={'data': []})) as sg:
             _probe_models_endpoint('http://localhost:11434/v1', '')
         assert 'Authorization' not in sg.call_args[1]['headers']
 
     def test_404_points_at_path(self):
-        with patch('api.providers.safe_get', return_value=_response(404)):
+        with patch('provider_probe.safe_get', return_value=_response(404)):
             result = _probe_models_endpoint('http://localhost:11434', '')
         assert result['ok'] is False
         assert result['reachable'] is True
         assert '/v1' in result['detail']
 
     def test_401_points_at_key(self):
-        with patch('api.providers.safe_get', return_value=_response(401)):
+        with patch('provider_probe.safe_get', return_value=_response(401)):
             result = _probe_models_endpoint('http://server:8000/v1', '')
         assert result['reachable'] is True
         assert 'API key' in result['detail']
 
     def test_200_non_json_is_not_ok(self):
-        with patch('api.providers.safe_get',
+        with patch('provider_probe.safe_get',
                    return_value=_response(200, body=b'<html>')):
             result = _probe_models_endpoint('http://some-web-server', '')
         assert result['ok'] is False
@@ -90,19 +90,19 @@ class TestProbeModelsEndpoint:
     def test_200_json_without_data_list_is_not_ok(self):
         # The real client reads response.data; JSON without it means
         # discovery would fail despite the 200.
-        with patch('api.providers.safe_get',
+        with patch('provider_probe.safe_get',
                    return_value=_response(200, json_body={'error': 'nope'})):
             result = _probe_models_endpoint('http://server:8000/v1', '')
         assert result['ok'] is False
         assert 'model list' in result['detail']
 
     def test_401_with_key_names_saved_key(self):
-        with patch('api.providers.safe_get', return_value=_response(401)):
+        with patch('provider_probe.safe_get', return_value=_response(401)):
             result = _probe_models_endpoint('http://server:8000/v1', 'sk-x')
         assert 'rejected the saved API key' in result['detail']
 
     def test_connection_error_unreachable(self):
-        with patch('api.providers.safe_get',
+        with patch('provider_probe.safe_get',
                    side_effect=requests_lib.ConnectionError('refused')):
             result = _probe_models_endpoint('http://server:8000/v1', '')
         assert result['ok'] is False
@@ -197,31 +197,50 @@ class TestFixedProviderConnection:
                            content_type='application/json')
 
     def test_anthropic_probes_fixed_url(self, client):
-        with patch('api.providers.safe_get',
-                   return_value=_response(200, json_body={'data': []})) as sg:
+        with patch('provider_probe.safe_get',
+                   return_value=_response(200, json_body={
+                       'data': [{'type': 'model', 'id': 'claude-example'}],
+                   })) as sg:
             r = self._post(client, 'anthropic')
         assert r.status_code == 200
         assert r.get_json()['ok'] is True
         assert sg.call_args[0][0] == 'https://api.anthropic.com/v1/models'
 
     def test_openrouter_probes_fixed_url(self, client):
-        with patch('api.providers.safe_get',
-                   return_value=_response(200, json_body={'data': {}})) as sg:
+        with patch('provider_probe.safe_get',
+                   return_value=_response(200, json_body={
+                       'data': {'label': 'test-key', 'usage': 0},
+                   })) as sg:
             r = self._post(client, 'openrouter')
         assert r.get_json()['ok'] is True
-        assert sg.call_args[0][0] == 'https://openrouter.ai/api/v1/auth/key'
+        assert sg.call_args[0][0] == 'https://openrouter.ai/api/v1/key'
+
+    @pytest.mark.parametrize(('provider', 'body'), [
+        ('anthropic', {'data': [{}]}),
+        ('anthropic', {'data': 'not-a-list'}),
+        ('openrouter', {'data': {}}),
+        ('openrouter', {'error': {'message': 'invalid key'}}),
+    ])
+    def test_malformed_fixed_provider_response_is_not_healthy(self, client, provider, body):
+        with patch('provider_probe.safe_get',
+                   return_value=_response(200, json_body=body)):
+            result = self._post(client, provider).get_json()
+        assert result['ok'] is False
+        assert result['reachable'] is True
 
     def test_body_base_url_ignored_for_fixed_provider(self, client):
         # No baseUrl input exists for fixed providers; a body value must
         # never redirect the probe (or the saved key) anywhere else.
-        with patch('api.providers.safe_get',
-                   return_value=_response(200, json_body={'data': []})) as sg:
+        with patch('provider_probe.safe_get',
+                   return_value=_response(200, json_body={
+                       'data': [{'id': 'claude-example'}],
+                   })) as sg:
             self._post(client, 'anthropic',
                        {'baseUrl': 'http://evil.example.com'})
         assert sg.call_args[0][0] == 'https://api.anthropic.com/v1/models'
 
     def test_401_without_key(self, client):
-        with patch('api.providers.safe_get', return_value=_response(401)):
+        with patch('provider_probe.safe_get', return_value=_response(401)):
             r = self._post(client, 'anthropic')
         data = r.get_json()
         assert data['ok'] is False
@@ -230,14 +249,14 @@ class TestFixedProviderConnection:
 
     def test_401_with_saved_key(self, client, temp_db):
         temp_db.set_secret('anthropic_api_key', 'sk-ant-bad')
-        with patch('api.providers.safe_get', return_value=_response(401)) as sg:
+        with patch('provider_probe.safe_get', return_value=_response(401)) as sg:
             r = self._post(client, 'anthropic')
         data = r.get_json()
         assert 'rejected the saved key' in data['detail']
         assert sg.call_args[1]['headers']['x-api-key'] == 'sk-ant-bad'
 
     def test_unreachable(self, client):
-        with patch('api.providers.safe_get',
+        with patch('provider_probe.safe_get',
                    side_effect=requests_lib.ConnectionError('no route')):
             r = self._post(client, 'openrouter')
         data = r.get_json()
@@ -267,7 +286,9 @@ class TestSecondaryProviderConnection:
         temp_db.set_setting('secondary_provider', 'anthropic', is_default=False)
         temp_db.set_secret('secondary_provider_api_key', 'sk-ant-secondary')
         temp_db.set_secret('anthropic_api_key', 'sk-ant-primary')
-        with patch('api.providers.safe_get', return_value=_response(200, json_body={'data': []})) as sg:
+        with patch('provider_probe.safe_get', return_value=_response(200, json_body={
+            'data': [{'id': 'claude-example'}],
+        })) as sg:
             r = self._post(client)
         assert r.status_code == 200
         assert r.get_json()['ok'] is True
@@ -321,7 +342,9 @@ class TestSecondaryProviderConnection:
         selection, not the last-saved secondary_provider setting."""
         temp_db.set_setting('secondary_provider', 'ollama', is_default=False)
         temp_db.set_secret('secondary_provider_api_key', 'sk-ollama-secondary')
-        with patch('api.providers.safe_get', return_value=_response(200, json_body={'data': []})) as sg:
+        with patch('provider_probe.safe_get', return_value=_response(200, json_body={
+            'data': [{'id': 'claude-example'}],
+        })) as sg:
             r = self._post(client, {'provider': 'anthropic'})
         assert r.status_code == 200
         assert r.get_json()['ok'] is True
@@ -332,7 +355,7 @@ class TestSecondaryProviderConnection:
         probe of an unsaved type override must not send it."""
         temp_db.set_setting('secondary_provider', 'ollama', is_default=False)
         temp_db.set_secret('secondary_provider_api_key', 'sk-ollama-secondary')
-        with patch('api.providers.safe_get', return_value=_response(401)) as sg:
+        with patch('provider_probe.safe_get', return_value=_response(401)) as sg:
             r = self._post(client, {'provider': 'anthropic'})
         assert r.status_code == 200
         assert 'x-api-key' not in sg.call_args[1]['headers']
@@ -402,6 +425,146 @@ class TestLegacyKeyTestOllamaNormalization:
             r = client.post('/api/v1/settings/providers/ollama/test')
         assert r.status_code == 200
         assert sg.call_args[0][0] == 'http://localhost:11434/v1/models'
+
+
+class TestNativeProviderConnection:
+    @pytest.mark.parametrize('provider', ['typesafe', 'systemone-compatible'])
+    @pytest.mark.parametrize('slot, action', [
+        ('primary', 'test'), ('primary', 'test-connection'), ('secondary', 'test-connection'),
+    ])
+    def test_save_and_test_without_stage_models(self, client, temp_db, provider, slot, action):
+        for key in ('claude_model', 'verification_model', 'review_model'):
+            temp_db.set_setting(key, '', is_default=False)
+        base = 'http://localhost:8000/v1'
+        secret = 'sk-secondary-saved' if slot == 'secondary' else 'sk-openai-saved'
+        with patch('provider_probe.safe_get', return_value=_response(200, json_body={'data': []})) as get, \
+                patch('provider_probe.llm_client.create_client_for_provider',
+                      side_effect=AssertionError('manual connection must not run inference')):
+            if slot == 'primary':
+                saved = client.put(f'/api/v1/settings/providers/{provider}',
+                                   json={'apiKey': secret, 'baseUrl': base})
+                path = f'/api/v1/settings/providers/{provider}/{action}'
+                body = {}
+            else:
+                saved = client.put('/api/v1/settings/ad-detection', json={
+                    'secondaryProvider': provider, 'secondaryProviderApiKey': secret,
+                    'secondaryProviderBaseUrl': base,
+                })
+                path = '/api/v1/settings/providers/secondary/test-connection'
+                body = {'provider': provider}
+            assert saved.status_code == 200, saved.get_json()
+            response = client.post(path, json=body)
+        assert response.status_code == 200
+        result = response.get_json()
+        assert result['ok'] is True and result['reachable'] is True
+        assert result['validation'] == 'model_catalog' and result['inferenceChecked'] is False
+        assert result['detail'] == 'Connection successful. Inference not tested.'
+        assert get.call_count == 1
+        assert get.call_args[0][0] == (
+            'https://api.typesafe.ai/v1/models' if provider == 'typesafe' else f'{base}/models')
+        assert get.call_args.kwargs['headers']['Authorization'] == f'Bearer {secret}'
+        assert temp_db.get_connection().execute('SELECT COUNT(*) FROM llm_call_usage').fetchone()[0] == 0
+        for key in ('claude_model', 'verification_model', 'review_model'):
+            assert not temp_db.get_setting(key)
+
+    @pytest.mark.parametrize('slot', ['primary', 'secondary'])
+    def test_compatible_draft_url_withholds_saved_key(self, client, temp_db, slot):
+        if slot == 'primary':
+            temp_db.set_setting('systemone_base_url', 'http://server:8000/v1')
+            temp_db.set_secret('systemone_api_key', 'sk-openai-saved')
+            path = '/api/v1/settings/providers/systemone-compatible/test-connection'
+        else:
+            temp_db.set_setting('secondary_provider', 'systemone-compatible', is_default=False)
+            temp_db.set_setting('secondary_provider_base_url', 'http://server:8000/v1')
+            temp_db.set_secret('secondary_provider_api_key', 'sk-secondary-saved')
+            path = '/api/v1/settings/providers/secondary/test-connection'
+        with patch('provider_probe.safe_get', return_value=_response(200, json_body={'data': []})) as get:
+            result = client.post(path, json={'baseUrl': 'http://evil.example.com/v1'}).get_json()
+        assert result['ok'] is True and result['inferenceChecked'] is False
+        assert 'Authorization' not in get.call_args.kwargs['headers']
+
+    def test_draft_type_withholds_secondary_key(self, client, temp_db):
+        temp_db.set_setting('secondary_provider', 'anthropic', is_default=False)
+        temp_db.set_secret('secondary_provider_api_key', 'sk-secondary-saved')
+        with patch('provider_probe.safe_get', return_value=_response(200, json_body={'data': []})) as get:
+            result = client.post('/api/v1/settings/providers/secondary/test-connection', json={
+                'provider': 'systemone-compatible', 'baseUrl': 'http://localhost:8000/v1',
+            }).get_json()
+        assert result['ok'] is True and result['inferenceChecked'] is False
+        assert 'Authorization' not in get.call_args.kwargs['headers']
+
+    @pytest.mark.parametrize('slot', ['primary', 'secondary'])
+    def test_typesafe_missing_key_never_sends(self, client, temp_db, monkeypatch, slot):
+        monkeypatch.delenv('TYPESAFE_API_KEY', raising=False)
+        if slot == 'primary':
+            path = '/api/v1/settings/providers/typesafe/test-connection'
+        else:
+            temp_db.set_setting('secondary_provider', 'typesafe', is_default=False)
+            path = '/api/v1/settings/providers/secondary/test-connection'
+        with patch('provider_probe.safe_get') as get:
+            result = client.post(path, json={}).get_json()
+        assert result['ok'] is False and result['reachable'] is False
+        assert result['inferenceChecked'] is False
+        get.assert_not_called()
+
+    @pytest.mark.parametrize('slot', ['primary', 'secondary'])
+    def test_compatible_invalid_url_never_sends(self, client, temp_db, slot):
+        if slot == 'primary':
+            path = '/api/v1/settings/providers/systemone-compatible/test-connection'
+        else:
+            temp_db.set_setting('secondary_provider', 'systemone-compatible', is_default=False)
+            path = '/api/v1/settings/providers/secondary/test-connection'
+        with patch('provider_probe.safe_get') as get:
+            assert client.post(path, json={'baseUrl': 'http://user:pass@server:8000/v1'}).status_code == 400
+            result = client.post(path, json={'baseUrl': 'http://169.254.169.254/latest'}).get_json()
+        assert result['ok'] is False and result['reachable'] is False
+        get.assert_not_called()
+
+    def test_explicit_model_does_not_change_manual_probe(self, client, temp_db):
+        temp_db.set_setting('systemone_base_url', 'http://localhost:8000/v1')
+        with patch('provider_probe.safe_get', return_value=_response(200, json_body={'data': []})) as get:
+            result = client.post('/api/v1/settings/providers/systemone-compatible/test-connection',
+                                 json={'model': 'selected-model'}).get_json()
+        assert result['ok'] is True and result['inferenceChecked'] is False
+        assert get.call_count == 1 and get.call_args[0][0].endswith('/models')
+
+    @pytest.mark.parametrize('status', [401, 403])
+    @pytest.mark.parametrize('provider', ['typesafe', 'systemone-compatible'])
+    def test_auth_denial_is_not_connection_success(self, client, temp_db, provider, status):
+        temp_db.set_secret('typesafe_api_key' if provider == 'typesafe' else 'systemone_api_key', 'sk-openai-saved')
+        temp_db.set_setting('systemone_base_url', 'http://localhost:8000/v1')
+        with patch('provider_probe.safe_get', return_value=_response(status)):
+            result = client.post(f'/api/v1/settings/providers/{provider}/test').get_json()
+        assert result['ok'] is False and result['reachable'] is True
+        assert result['status'] == status and result['inferenceChecked'] is False
+        assert 'rejected the saved API key' in result['detail']
+
+    @pytest.mark.parametrize('body', [{'models': []}, {'models': [{'name': 'claude-example'}]}])
+    def test_native_catalog_alternative_shape(self, client, temp_db, body):
+        temp_db.set_setting('systemone_base_url', 'http://localhost:8000/v1')
+        with patch('provider_probe.safe_get', return_value=_response(200, json_body=body)):
+            result = client.post('/api/v1/settings/providers/systemone-compatible/test').get_json()
+        assert result['ok'] is True and result['inferenceChecked'] is False
+
+    @pytest.mark.parametrize('status, body', [(200, {'error': 'nope'}), (200, {'data': [{}]}), (404, {})])
+    def test_unusable_catalog_does_not_claim_inference_failure(self, client, temp_db, status, body):
+        temp_db.set_setting('systemone_base_url', 'http://localhost:8000/v1')
+        with patch('provider_probe.safe_get', return_value=_response(status, json_body=body)):
+            result = client.post('/api/v1/settings/providers/systemone-compatible/test').get_json()
+        assert result['ok'] is False and result['reachable'] is True
+        assert result['inferenceChecked'] is False
+        assert result['detail'] == (
+            'The model list endpoint was not found (HTTP 404).'
+            if status == 404 else 'The server did not return a model list.')
+
+    def test_network_failure_never_uses_cached_models(self, client, temp_db):
+        temp_db.set_setting('systemone_base_url', 'http://localhost:8000/v1')
+        with patch('provider_probe.safe_get', side_effect=requests_lib.ConnectionError('refused')), \
+                patch('llm_client.SystemOneClient.list_models', return_value=[{'id': 'claude-example'}]) as cached:
+            result = client.post('/api/v1/settings/providers/systemone-compatible/test').get_json()
+        assert result['ok'] is False and result['reachable'] is False
+        assert result['inferenceChecked'] is False
+        cached.assert_not_called()
 
 
 class TestPodcastIndexHeaders:

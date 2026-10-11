@@ -6,10 +6,12 @@ for easy tuning and consistency across the codebase.
 import fnmatch
 import json
 import logging
+import math
 import os
 import re
 import sqlite3
 import string
+from functools import lru_cache
 from typing import Any
 from urllib.parse import urlparse
 
@@ -69,6 +71,22 @@ HOLD_REASON_CUE_LOW_CONFIDENCE = 'cue_low_confidence'
 HOLD_REASON_LARGE_VAD_GAP = 'large_vad_gap_extension'
 # An LLM span with no category or an audio-only reason whose transcript holds no ad language (#807).
 HOLD_REASON_NO_TRANSCRIPT_EVIDENCE = 'no_transcript_evidence'
+# An upstream-transcript-differential gap the LLM did not corroborate (2.98.0).
+HOLD_REASON_TRANSCRIPT_DIFFERENTIAL = 'transcript_differential_unreviewed'
+# Candidate-only holds whose rejected text must not seed cross-episode false-positive matching.
+SNIPPET_EXCLUDED_HOLD_REASONS = frozenset({
+    HOLD_REASON_DIFFERENTIAL_UNCORROBORATED, HOLD_REASON_TRANSCRIPT_DIFFERENTIAL,
+})
+# Stages whose markers count as those holds even after hold_reason was popped.
+SNIPPET_EXCLUDED_STAGE_REASONS = {
+    'dai_differential': HOLD_REASON_DIFFERENTIAL_UNCORROBORATED,
+    'transcript_differential': HOLD_REASON_TRANSCRIPT_DIFFERENTIAL,
+}
+# SQL fragment and params excluding those reasons from false-positive text reads.
+SNIPPET_EXCLUDED_SQL = (
+    f"(pc.source_hold_reason IS NULL OR pc.source_hold_reason NOT IN "
+    f"({', '.join('?' * len(SNIPPET_EXCLUDED_HOLD_REASONS))}))")
+SNIPPET_EXCLUDED_SQL_PARAMS = tuple(sorted(SNIPPET_EXCLUDED_HOLD_REASONS))
 # Share of an evidence-gated span a measured DAI core must cover to stand in for transcript evidence.
 EVIDENCE_GATE_DAI_CORE_MIN_COVERAGE = 0.5
 # Holds only the reviewer stamps; recut validation cannot re-derive them.
@@ -86,8 +104,14 @@ ALL_HOLD_REASONS = frozenset(v for k, v in globals().items() if k.startswith('HO
 # resolution defaults (see normalize_segment_category).
 SEGMENT_CATEGORIES = ('sponsor', 'cross_promo', 'self_promo', 'interaction',
                       'intro', 'outro', 'recap')
-SEGMENT_ACTIONS = ('remove', 'beep', 'keep')
+SEGMENT_ACTIONS = ('remove', 'beep', 'keep', 'mark')
 DEFAULT_SEGMENT_ACTION = 'remove'
+
+
+def is_keep_like(action: str | None) -> bool:
+    """True for 'keep' or 'mark': both leave the audio in place."""
+    return action in ('keep', 'mark')
+
 
 # Display names for the categories. Mirrors SEGMENT_CATEGORY_LABELS in
 # frontend/src/utils/segmentCategory.ts; keep the two in sync.
@@ -214,26 +238,6 @@ def resolve_segment_category_actions_map(
 # Ad chapters: segments left in the audio published as skippable chapters.
 AD_CHAPTER_SNAP_SECONDS = 2.0
 AD_CHAPTER_KINDS = frozenset({'ad', 'resume'})
-DEFAULT_AD_CHAPTER_CATEGORIES = {
-    cat: cat in ('sponsor', 'cross_promo') for cat in SEGMENT_CATEGORIES}
-DEFAULT_AD_CHAPTER_CATEGORIES_JSON = json.dumps(DEFAULT_AD_CHAPTER_CATEGORIES)
-
-
-def resolve_ad_chapter_categories_map(raw_json, baseline=None) -> dict[str, bool]:
-    """Full category -> bool map; unknown keys and non-bool values are ignored."""
-    merged = dict(baseline) if baseline is not None else dict(DEFAULT_AD_CHAPTER_CATEGORIES)
-    if not raw_json:
-        return merged
-    try:
-        parsed = json.loads(raw_json)
-    except (TypeError, ValueError):
-        return merged
-    if not isinstance(parsed, dict):
-        return merged
-    for cat, flag in parsed.items():
-        if cat in SEGMENT_CATEGORIES and isinstance(flag, bool):
-            merged[cat] = flag
-    return merged
 
 
 def valid_ad_chapter_title_format(value) -> bool:
@@ -247,17 +251,6 @@ def valid_ad_chapter_title_format(value) -> bool:
         return False
     return all(name is None or (name in ('category', 'label') and not spec and not conv)
                for _, name, spec, conv in fields)
-
-
-def validate_ad_chapter_categories(value) -> str | None:
-    """Error message for an adChapterCategories map, or None when it is valid."""
-    if not isinstance(value, dict):
-        return 'adChapterCategories must be an object'
-    for cat, flag in value.items():
-        if cat not in SEGMENT_CATEGORIES or not isinstance(flag, bool):
-            return (f"adChapterCategories: '{cat}' must be a known category "
-                    "with true or false")
-    return None
 
 
 # Hold reasons pass-2 auto-approval may release when the verification pass
@@ -284,11 +277,12 @@ PASS2_AUTOAPPROVE_HOLD_REASONS = frozenset({
     HOLD_REASON_ESTIMATED_PATTERN,
 })
 
-# Holds a reviewed pass-2 subspan may release: the auto-approve set plus the
-# reviewer abstentions, where a review of the narrower span is the missing second look.
+# Holds a reviewed pass-2 subspan may release: the auto-approve set plus the reviewer
+# abstentions and transcript gaps, where a review of the narrower span is the missing second look.
 PASS2_REVIEWED_RELEASE_HOLD_REASONS = PASS2_AUTOAPPROVE_HOLD_REASONS | frozenset({
     HOLD_REASON_REVIEWER_INCONCLUSIVE_BOUNDS,
     HOLD_REASON_REVIEWER_FAILED,
+    HOLD_REASON_TRANSCRIPT_DIFFERENTIAL,
 })
 
 # Of those, the reasons a pass-2 ad may only corroborate by covering the held
@@ -376,6 +370,18 @@ def is_pending_review(marker) -> bool:
     return bool(marker.get('held_for_review')) and not marker.get('was_cut', True)
 
 
+def refreshed_keep_like_action(marker, actions: dict[str, str] | None) -> str | None:
+    """Re-resolve keep-like actions from feed config; preserve held or unmapped actions and never cut."""
+    action = marker.get('action_applied')
+    category = marker.get('category')
+    if (actions is not None and is_keep_like(action) and not is_pending_review(marker)
+            and category in SEGMENT_CATEGORIES):
+        resolved = actions.get(category, action)
+        if is_keep_like(resolved):
+            return resolved
+    return action
+
+
 def count_pending_review(markers) -> int:
     """Number of markers awaiting review; persisted as pending_review_count."""
     return sum(1 for m in markers if is_pending_review(m))
@@ -384,24 +390,69 @@ def count_pending_review(markers) -> int:
 def count_not_cut(markers) -> int:
     """Number of markers that stayed in the audio and are not pending review
     (e.g. a rejected correction). Missing was_cut defaults to True (cut),
-    matching is_pending_review's convention. A keep-action marker is
+    matching is_pending_review's convention. A keep/mark-action marker is
     intentionally left in the audio, not a miss, so it's excluded here:
     it must never inflate the notification-facing not-cut/miss count."""
     return sum(1 for m in markers
                if not m.get('was_cut', True) and not is_pending_review(m)
-               and m.get('action_applied') != 'keep')
+               and not is_keep_like(m.get('action_applied')))
+
+
+@lru_cache(maxsize=256)
+def _parsed_skip_patterns(patterns_json):
+    """Lowercased pattern tuple for patterns_json, cached so a feed's list is parsed once."""
+    try:
+        patterns = json.loads(patterns_json)
+    except (ValueError, TypeError):
+        return ()
+    return tuple(str(p).lower() for p in patterns if p)
+
+
+def _matches_skip_patterns(text, patterns_json):
+    """Case-insensitive fnmatch of text against the pattern list encoded in patterns_json."""
+    if not text or not patterns_json:
+        return False
+    low = text.lower()
+    return any(fnmatch.fnmatch(low, p) for p in _parsed_skip_patterns(patterns_json))
 
 
 def title_matches_skip_patterns(title, patterns_json):
     """Case-insensitive fnmatch against the feed's title skip list."""
-    if not title or not patterns_json:
+    return _matches_skip_patterns(title, patterns_json)
+
+
+def _description_plain_text(description):
+    """Description HTML reduced to lowercase-ready plain text for matching."""
+    from utils.prompt import strip_html  # lazy: utils imports audio, which imports config
+    return re.sub(r'\s+', ' ', strip_html(description)).strip()
+
+
+def description_matches_skip_patterns(description, patterns_json):
+    """Case-insensitive fnmatch against the feed's description skip list, HTML stripped."""
+    if not description or not patterns_json:
         return False
-    try:
-        patterns = json.loads(patterns_json)
-    except (ValueError, TypeError):
+    return _matches_skip_patterns(_description_plain_text(description), patterns_json)
+
+
+def duration_outside_feed_range(duration, podcast):
+    """Compare known RSS duration against inclusive per-feed bounds."""
+    if not isinstance(duration, (int, float)) or isinstance(duration, bool):
         return False
-    low = title.lower()
-    return any(fnmatch.fnmatch(low, str(p).lower()) for p in patterns if p)
+    if not math.isfinite(duration) or duration <= 0:
+        return False
+    podcast = podcast or {}
+    minimum = podcast.get('min_duration_seconds')
+    maximum = podcast.get('max_duration_seconds')
+    return ((minimum is not None and duration < minimum)
+            or (maximum is not None and duration > maximum))
+
+
+def episode_matches_feed_filters(episode, podcast):
+    """Apply title, description, and RSS-duration exclusions without downloading audio."""
+    podcast = podcast or {}
+    return (title_matches_skip_patterns(episode.get('title'), podcast.get('title_skip_patterns'))
+            or description_matches_skip_patterns(episode.get('description'), podcast.get('description_skip_patterns'))
+            or duration_outside_feed_range(episode.get('rss_duration'), podcast))
 
 # Ad evidence thresholds
 CONTENT_DURATION_THRESHOLD = 120.0  # Segments >= this without evidence are likely content
@@ -484,7 +535,6 @@ WINDOW_OVERLAP_SECONDS = 180    # Overlap between windows (3 min)
 # ============================================================
 # Background Processing (seconds)
 # ============================================================
-RSS_REFRESH_INTERVAL = 900      # Seconds between RSS refreshes (15 min)
 # Feed Refresh Failed alerting (#516). A failure only increments the
 # per-feed counter when the previous counted failure is at least the
 # interval old (on-demand refreshes triggered by client polls would
@@ -986,6 +1036,16 @@ def resolve_skip_second_pass(podcast_row, db=None):
     return db.get_setting_bool('skip_second_pass', False)
 
 
+def resolve_transcript_differential(podcast_row, db=None):
+    """Resolve the upstream-transcript differential opt-out, with a global fallback."""
+    value = (podcast_row or {}).get('transcript_differential')
+    if value is not None:
+        return bool(value)
+    if not db:
+        return True
+    return db.get_setting_bool('transcript_differential_enabled', True)
+
+
 CUE_ONLY_SAFETY_HOLD_NEW = 'hold_new'
 CUE_ONLY_SAFETY_AUTO_CUT = 'auto_cut'
 CUE_ONLY_SAFETY_VALUES = (CUE_ONLY_SAFETY_HOLD_NEW, CUE_ONLY_SAFETY_AUTO_CUT)
@@ -1031,8 +1091,6 @@ def resolve_chapters_mode(podcast_row, db=None):
 # Chapter list in served descriptions (#720): per-feed 'on'/'off', NULL
 # follows the global chapters_in_notes setting.
 CHAPTERS_IN_NOTES_VALUES = EPISODE_LOGS_VALUES
-# Per-feed ad_chapters_enabled_override, same 'on'/'off' shape.
-AD_CHAPTERS_OVERRIDE_VALUES = EPISODE_LOGS_VALUES
 
 
 def _resolve_feed_toggle(db, podcast_row, column, setting, default) -> bool:
@@ -1046,11 +1104,6 @@ def _resolve_feed_toggle(db, podcast_row, column, setting, default) -> bool:
 def resolve_chapters_in_notes(db, podcast_row) -> bool:
     return _resolve_feed_toggle(db, podcast_row, 'chapters_in_notes',
                                 'chapters_in_notes', False)
-
-
-def resolve_ad_chapters_enabled(db, podcast_row) -> bool:
-    return _resolve_feed_toggle(db, podcast_row, 'ad_chapters_enabled_override',
-                                'ad_chapters_enabled', False)
 
 
 def resolve_cue_template_score_with_source(db, podcast_id):
@@ -1183,7 +1236,6 @@ def resolve_differential_fetch_setting(db, podcast_id):
 DIFFERENTIAL_FETCH_MODE_AUTO = 'auto'
 DIFFERENTIAL_FETCH_MODE_ON = 'on'
 DIFFERENTIAL_FETCH_MODE_OFF = 'off'
-DIFFERENTIAL_FETCH_MODE_INHERIT = 'inherit'
 VALID_DIFFERENTIAL_FETCH_MODES = frozenset({
     DIFFERENTIAL_FETCH_MODE_AUTO,
     DIFFERENTIAL_FETCH_MODE_ON,
@@ -1478,7 +1530,6 @@ LLM_TIMEOUT_DEFAULT = 120.0          # Anthropic / fast cloud APIs
 LLM_TIMEOUT_LOCAL = 600.0            # Ollama / local models (10 min)
 LLM_RETRY_MAX_RETRIES = 3            # Default retries for cloud APIs
 LLM_RETRY_MAX_RETRIES_LOCAL = 2      # Fewer retries for local (each is slow)
-AD_DETECTION_MAX_TOKENS = int(os.environ.get('AD_DETECTION_MAX_TOKENS', '4096'))
 
 # ============================================================
 # Outbound HTTP
@@ -1528,6 +1579,9 @@ API_CHUNK_DURATION_SECONDS = 600
 WHISPER_BACKEND_LOCAL = 'local'
 WHISPER_BACKEND_API = 'openai-api'
 
+# Failover targets by API name (#806); shared by failover and webhook_service.
+FAILOVER_API_TARGET_NAMES = {'llm-a': 'llm:primary', 'llm-b': 'llm:secondary', 'transcriber': 'whisper'}
+
 # Whisper pool bounds. The settings registry validator, the POST /settings
 # range check and the pool's own reader clamp all read these, so an env var
 # or a direct DB write cannot route around the range.
@@ -1547,11 +1601,18 @@ WHISPER_DEVICES = ('cpu', 'cuda')
 WHISPER_DEVICE_DEFAULT = 'cpu'
 
 
+def normalize_whisper_device(raw: str | None) -> str | None:
+    """Canonical device for a WHISPER_DEVICE value, or None when unrecognized."""
+    value = (raw or WHISPER_DEVICE_DEFAULT).strip().lower()
+    return value if value in WHISPER_DEVICES else None
+
+
 def resolve_whisper_device():
     """Validated WHISPER_DEVICE. An unrecognized value degrades to CPU (#605)."""
-    raw = (os.environ.get('WHISPER_DEVICE') or WHISPER_DEVICE_DEFAULT).strip().lower()
-    if raw in WHISPER_DEVICES:
-        return raw
+    raw = os.environ.get('WHISPER_DEVICE')
+    device = normalize_whisper_device(raw)
+    if device is not None:
+        return device
     _tunable_logger.warning(
         "WHISPER_DEVICE=%r is not one of %s; transcribing on CPU instead",
         raw, ', '.join(WHISPER_DEVICES))
@@ -1640,7 +1701,109 @@ PROVIDER_ANTHROPIC = 'anthropic'
 PROVIDER_OPENROUTER = 'openrouter'
 PROVIDER_OPENAI_COMPATIBLE = 'openai-compatible'
 PROVIDER_OLLAMA = 'ollama'
-PROVIDERS_NON_ANTHROPIC = ('openai-compatible', 'ollama')
+PROVIDER_TYPESAFE = 'typesafe'
+PROVIDER_SYSTEMONE_COMPATIBLE = 'systemone-compatible'
+TYPESAFE_BASE_URL = 'https://api.typesafe.ai/v1'
+TYPESAFE_SYSTEMONE_URL = 'https://api.typesafe.ai/v1/systemone'
+SYSTEMONE_COMPATIBLE_BASE_URL = ''
+SYSTEMONE_PROVIDERS = (PROVIDER_TYPESAFE, PROVIDER_SYSTEMONE_COMPATIBLE)
+PROVIDERS_NON_ANTHROPIC = ('openai-compatible', 'ollama', *SYSTEMONE_PROVIDERS)
+SYSTEMONE_TUNABLE_DEFAULTS = {
+    PROVIDER_TYPESAFE: {
+        'detectionEnter': 0.95,
+        'detectionStay': 0.40,
+        'categoryPass': True,
+        'categoryContext': 2,
+        'defaultCategory': 'sponsor',
+        'refineBoundaries': False,
+        'reviewEvidenceEnter': None,
+        'reviewChoiceEnter': None,
+        'reviewProgrammeVeto': 0.85,
+        'reviewBoundaryCapSeconds': 60.0,
+        'reviewContextSeconds': 30.0,
+        'requestDeadlineSeconds': 75.0,
+        'maxConcurrentOperations': 4,
+        'retryAfterMaxSeconds': 5.0,
+        'maxQuestionsPerRequest': None,
+        'maxRequestBytes': None,
+        'maxChoiceOptions': 255,
+    },
+    PROVIDER_SYSTEMONE_COMPATIBLE: {
+        'detectionEnter': 0.95,
+        'detectionStay': 0.40,
+        'categoryPass': True,
+        'categoryContext': 2,
+        'defaultCategory': 'sponsor',
+        'refineBoundaries': False,
+        'reviewEvidenceEnter': None,
+        'reviewChoiceEnter': None,
+        'reviewProgrammeVeto': 0.85,
+        'reviewBoundaryCapSeconds': 60.0,
+        'reviewContextSeconds': 30.0,
+        'requestDeadlineSeconds': 75.0,
+        'maxConcurrentOperations': 4,
+        'retryAfterMaxSeconds': 5.0,
+        'maxQuestionsPerRequest': None,
+        'maxRequestBytes': None,
+        'maxChoiceOptions': None,
+    },
+}
+SYSTEMONE_TUNABLE_PROFILE_KEYS = {
+    ('primary', PROVIDER_TYPESAFE): 'systemone_tunables_primary_typesafe',
+    ('primary', PROVIDER_SYSTEMONE_COMPATIBLE): 'systemone_tunables_primary_compatible',
+    ('secondary', PROVIDER_TYPESAFE): 'systemone_tunables_secondary_typesafe',
+    ('secondary', PROVIDER_SYSTEMONE_COMPATIBLE): 'systemone_tunables_secondary_compatible',
+}
+
+_ANTHROPIC_ADAPTIVE_ONLY_MODELS = (
+    'claude-opus-4-7',
+    'claude-opus-4-8',
+    'claude-opus-5-5',
+    'claude-sonnet-5-5',
+    'claude-fable-5-1',
+    'claude-mythos-5-1',
+    'claude-opus-5',
+    'claude-sonnet-5',
+    'claude-fable-5',
+    'claude-mythos-5',
+    'claude-haiku-5-5',
+)
+_ANTHROPIC_DISABLED_THINKING_MODELS = (
+    'claude-opus-4-7',
+    'claude-opus-4-8',
+    'claude-sonnet-5',
+    'claude-opus-5',
+    'claude-haiku-5-5',
+)
+_ANTHROPIC_NO_FORCED_TOOL_MODELS = (
+    'claude-opus-5-5',
+    'claude-sonnet-5-5',
+    'claude-fable-5-1',
+    'claude-mythos-5-1',
+)
+
+
+def _anthropic_model_matches(model: str | None, tokens: tuple[str, ...]) -> bool:
+    if not model:
+        return False
+    lowered = model.lower()
+    suffix = r'(?=$|-(?:\d{8}|latest)(?:$|[/]))'
+    return any(re.search(re.escape(token) + suffix, lowered) for token in tokens)
+
+
+def anthropic_model_requires_adaptive_thinking(model: str | None) -> bool:
+    """Whether ``model`` rejects manual thinking budgets and uses adaptive effort."""
+    return _anthropic_model_matches(model, _ANTHROPIC_ADAPTIVE_ONLY_MODELS)
+
+
+def anthropic_model_allows_disabled_thinking(model: str | None) -> bool:
+    """Whether adaptive thinking can be disabled for ``model`` at low effort."""
+    return _anthropic_model_matches(model, _ANTHROPIC_DISABLED_THINKING_MODELS)
+
+
+def anthropic_model_supports_forced_tools(model: str | None) -> bool:
+    """Whether Anthropic accepts a forced tool choice for ``model``."""
+    return not _anthropic_model_matches(model, _ANTHROPIC_NO_FORCED_TOOL_MODELS)
 
 # ============================================================
 # Model Configuration Errors
@@ -2055,23 +2218,28 @@ def resolve_chapter_geometry(settings: dict | None = None):
     return target, window, max_boundaries, min_duration
 
 
-def resolve_stage_tunables(prefix: str, settings: dict | None = None,
-                           provider: str | None = None):
-    """Read (max_tokens, temperature, reasoning) for a stage prefix.
-
-    Reasoning picks the right key based on ``provider``, the provider this
-    stage's call is actually routed to: numeric budget for Anthropic, string
-    enum level for everyone else. Omitted, it falls back to the global
-    effective provider, which is wrong for a stage routed elsewhere. Stage
-    modules call this once at LLM-call time; the DB reads are cached.
-    """
+def resolve_stage_reasoning(prefix: str, settings: dict | None = None,
+                            provider: str | None = None, model: str | None = None):
+    """Resolve the stage's reasoning value for its routed provider and model."""
     from llm_client import get_effective_provider  # lazy: llm_client imports config
+    effective_provider = provider or get_effective_provider()
+    if effective_provider == PROVIDER_ANTHROPIC:
+        if model and anthropic_model_requires_adaptive_thinking(model):
+            key = f'{prefix}_reasoning_level'
+        else:
+            key = f'{prefix}_reasoning_budget'
+    else:
+        key = f'{prefix}_reasoning_level'
+    return get_stage_tunable(key, settings=settings)
+
+
+def resolve_stage_tunables(prefix: str, settings: dict | None = None,
+                           provider: str | None = None, model: str | None = None):
+    """Resolve stage tunables using the routed provider and model."""
     max_tokens = get_stage_tunable(f'{prefix}_max_tokens', settings=settings)
     temperature = get_stage_tunable(f'{prefix}_temperature', settings=settings)
-    if (provider or get_effective_provider()) == PROVIDER_ANTHROPIC:
-        reasoning = get_stage_tunable(f'{prefix}_reasoning_budget', settings=settings)
-    else:
-        reasoning = get_stage_tunable(f'{prefix}_reasoning_level', settings=settings)
+    reasoning = resolve_stage_reasoning(
+        prefix, settings=settings, provider=provider, model=model)
     return max_tokens, temperature, reasoning
 
 
@@ -2079,6 +2247,13 @@ def resolve_stage_tunables(prefix: str, settings: dict | None = None,
 # frontend/src/pages/settings/AudioSection.tsx.
 ALLOWED_AUDIO_BITRATES = ('64k', '96k', '128k', '192k', '256k')
 DEFAULT_AUDIO_BITRATE = '128k'
+
+# libmp3lame -compression_level: 0 is slowest/best, 9 is fastest. 'default'
+# omits the flag so ffmpeg's own default behavior is unchanged.
+ALLOWED_AUDIO_ENCODER_COMPRESSION_LEVELS = ('default', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9')
+DEFAULT_AUDIO_ENCODER_COMPRESSION_LEVEL = 'default'
+DEFAULT_AUDIO_REPLACEMENT_SOUND_ENABLED = True
+DEFAULT_AUDIO_MP3_STREAM_COPY_ENABLED = False
 
 
 # Ad-detection parallelism. Bounded ceiling protects against accidental
@@ -2109,6 +2284,10 @@ AD_REVIEWER_PARALLEL_ADS_MAX = 32
 
 def _validate_audio_bitrate(value: str) -> bool:
     return value in ALLOWED_AUDIO_BITRATES
+
+
+def _validate_audio_encoder_compression_level(value: str) -> bool:
+    return value in ALLOWED_AUDIO_ENCODER_COMPRESSION_LEVELS
 
 
 def _validate_bool_string(value: str) -> bool:
@@ -2165,6 +2344,68 @@ def coerce_bool_setting(value) -> bool:
     return str(value).strip().lower() in _TRUTHY_STRINGS
 
 
+def normalize_ad_chapters_enabled_compat(value, allow_null=False) -> tuple[bool | None, str | None]:
+    """adChaptersEnabled to bool; accepts legacy 'on'/'off' strings, and
+    null as a no-op when allow_null is set. (bool_or_None, error) on return.
+    """
+    if value is None and allow_null:
+        return True, None
+    if isinstance(value, bool):
+        return value, None
+    if isinstance(value, str) and value.lower() in ('on', 'off'):
+        return value.lower() == 'on', None
+    return None, "adChaptersEnabled must be true, false, 'on', or 'off'"
+
+
+def apply_ad_chapter_compat(resolved: dict[str, str], data: dict,
+                            allow_null: bool = False) -> tuple[dict[str, str] | None, str | None]:
+    """Translate legacy chapter settings to keep/mark actions; `allow_null` treats cleared fields as absent."""
+    if 'adChaptersEnabled' not in data and 'adChapterCategories' not in data:
+        # None (not {}) tells the caller neither field was sent, vs. sent-but-unchanged.
+        return None, None
+
+    working = dict(resolved)
+    changes: dict[str, str] = {}
+
+    if 'adChapterCategories' in data:
+        value = data['adChapterCategories']
+        if value is None and allow_null:
+            pass
+        elif not isinstance(value, dict):
+            return None, 'adChapterCategories must be an object'
+        else:
+            for cat, flag in value.items():
+                if cat not in SEGMENT_CATEGORIES or not isinstance(flag, bool):
+                    return None, (f"adChapterCategories: '{cat}' must be a known "
+                                   "category with true or false")
+            for cat, flag in value.items():
+                if flag and working.get(cat) == 'keep':
+                    working[cat] = changes[cat] = 'mark'
+                elif not flag and working.get(cat) == 'mark':
+                    working[cat] = changes[cat] = 'keep'
+
+    if 'adChaptersEnabled' in data:
+        enabled, error = normalize_ad_chapters_enabled_compat(data['adChaptersEnabled'], allow_null)
+        if error:
+            return None, error
+        if not enabled:
+            for cat in SEGMENT_CATEGORIES:
+                if working.get(cat) == 'mark':
+                    working[cat] = changes[cat] = 'keep'
+
+    return changes, None
+
+
+def ad_chapter_compat_view(resolved: dict[str, str]) -> tuple[bool, dict[str, bool]]:
+    """GET-side adChaptersEnabled/adChapterCategories (spec 1.4), derived
+    from an already resolved segment-actions map.
+    """
+    return (
+        any(resolved.get(cat) == 'mark' for cat in SEGMENT_CATEGORIES),
+        {cat: resolved.get(cat) == 'mark' for cat in SEGMENT_CATEGORIES},
+    )
+
+
 def _validate_parallel_windows(value: str) -> bool:
     try:
         n = int(value)
@@ -2192,7 +2433,8 @@ def _validate_llm_provider(value: str) -> bool:
     """Reject an unrecognized LLM_PROVIDER so a typo falls back safely
     instead of being adopted verbatim into the stored setting."""
     return value in (PROVIDER_ANTHROPIC, PROVIDER_OPENROUTER,
-                      PROVIDER_OPENAI_COMPATIBLE, PROVIDER_OLLAMA)
+                      PROVIDER_OPENAI_COMPATIBLE, PROVIDER_OLLAMA,
+                      PROVIDER_TYPESAFE, PROVIDER_SYSTEMONE_COMPATIBLE)
 
 
 def _validate_positive_int(value: str) -> bool:
@@ -2298,6 +2540,12 @@ def get_env_backed_int(key: str, *, floor: int = None, ceiling: int = None,
 ENV_BACKED_SETTINGS = (
     ('llm_provider', 'LLM_PROVIDER', 'anthropic', _validate_llm_provider),
     ('audio_bitrate', 'AUDIO_BITRATE', DEFAULT_AUDIO_BITRATE, _validate_audio_bitrate),
+    (
+        'audio_encoder_compression_level',
+        'AUDIO_ENCODER_COMPRESSION_LEVEL',
+        DEFAULT_AUDIO_ENCODER_COMPRESSION_LEVEL,
+        _validate_audio_encoder_compression_level,
+    ),
     ('skip_flac_compression', 'SKIP_FLAC_COMPRESSION', 'false', _validate_bool_string),
     (
         'ad_detection_parallel_windows',

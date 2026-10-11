@@ -3,6 +3,7 @@ import json
 import logging
 import re
 import threading
+import time
 import uuid
 from decimal import Decimal
 
@@ -16,13 +17,14 @@ from api import (
     _resolve_original_audio,
 )
 from config import (
-    is_pending_review, normalize_segment_category, resolve_chapters_in_notes,
-    title_matches_skip_patterns,
+    is_keep_like, is_pending_review, normalize_segment_category, resolve_chapters_in_notes,
+    title_matches_skip_patterns, description_matches_skip_patterns,
+    duration_outside_feed_range, episode_matches_feed_filters,
     resolve_processing_mode, DEFAULT_SEGMENT_ACTION,
     PROCESSING_MODE_PASSTHROUGH, PROCESSING_MODE_SKIP_DETECTION, PROCESSING_MODE_CUE_ONLY,
 )
 from ad_chapters import (
-    merge_ad_chapters, public_chapters, resolve_ad_chapter_config,
+    merge_ad_chapters, public_chapters, refresh_keep_like_markers, resolve_ad_chapter_config,
 )
 from ad_validator import user_trimmed_keep_ranges
 from ad_yield import latest_completed_run, low_ad_yield
@@ -41,6 +43,7 @@ from llm_client import (
 )
 import run_context
 from llm_route import resolve_route
+from llm_capabilities import chapters_capability_error
 from processing_queue import ProcessingQueue
 from rate_limit_hold import (
     get_active_hold, hold_message, hold_queue_for_provider_limit,
@@ -66,6 +69,9 @@ logger = logging.getLogger('podcast.api')
 # 'deferred' episodes (#482) are included so a stuck offline queue
 # can be force-retried or cleaned up by hand.
 REPROCESSABLE_STATUSES = ('processed', 'failed', 'permanently_failed', 'deferred')
+
+# One more than the 500-episode bulk-action cap enforced below.
+SELECTION_FETCH_CAP = 501
 
 
 def _float_arg(name, default=None):
@@ -106,11 +112,11 @@ def _overlaps_any(marker, spans) -> bool:
 def _marker_wants_cut(marker, action, false_positives, confirmed) -> bool:
     """Whether the recorded decisions ask for this marker to leave the audio.
 
-    Conservative: anything not plainly kept, rejected, or awaiting review
-    counts as wanted, so an unclear marker costs a recut rather than a
-    silently dropped decision.
+    Conservative: anything not plainly kept/marked, rejected, or awaiting
+    review counts as wanted, so an unclear marker costs a recut rather than
+    a silently dropped decision.
     """
-    if action == 'keep':
+    if is_keep_like(action):
         return False
     if _overlaps_any(marker, false_positives):
         return False
@@ -134,7 +140,7 @@ def _same_cut(a, b, tol=0.05) -> bool:
 
 def chapters_only_decisions(markers, applied_cuts, original_duration,
                             actions=None, false_positives=(), confirmed=(),
-                            keep_override=None):
+                            keep_override=None, replacement_sound_enabled=True):
     """True when cutting the current markers reproduces the applied cuts.
 
     The decisions then changed only which ad chapters the audio should carry,
@@ -147,6 +153,8 @@ def chapters_only_decisions(markers, applied_cuts, original_duration,
     """
     if applied_cuts is None or not original_duration:
         return False
+    if not replacement_sound_enabled and any('replacement_duration' not in cut for cut in applied_cuts):
+        return False
     # A marker without bounds cannot be compared; dropping it shortens the
     # wanted list, which answers False rather than guessing.
     resolved = [
@@ -157,11 +165,11 @@ def chapters_only_decisions(markers, applied_cuts, original_duration,
         if m.get('start') is not None and m.get('end') is not None
     ]
     resolved = [(m, DEFAULT_SEGMENT_ACTION
-                 if action == 'keep' and keep_override and keep_override(m) else action)
+                 if is_keep_like(action) and keep_override and keep_override(m) else action)
                 for m, action in resolved]
-    protected = [*(m for m, action in resolved if action == 'keep'),
+    protected = [*(m for m, action in resolved if is_keep_like(action)),
                  *user_trimmed_keep_ranges(list(confirmed))]
-    wanted = AudioProcessor().compute_applied_cuts(
+    wanted = AudioProcessor(replacement_sound_enabled=replacement_sound_enabled).compute_applied_cuts(
         [dict(m, beep=(action == 'beep')) for m, action in resolved
          if _marker_wants_cut(m, action, false_positives, confirmed)],
         original_duration, cut_barriers=protected, hard_barriers=protected,
@@ -187,6 +195,7 @@ def _apply_needs_chapters_only(db, slug, episode_id, episode, markers) -> bool:
             episode['podcast_id'], episode_id),
         confirmed=db.get_confirmed_corrections(
             episode['podcast_id'], episode_id),
+        replacement_sound_enabled=db.resolve_audio_output(slug)['replacement_sound_enabled'],
         keep_override=lambda m: _keep_overridden(dict(m), differential_override))
 
 
@@ -283,19 +292,24 @@ def list_episodes(slug):
     offset = max(0, request.args.get('offset', 0, type=int))
     sort_by = request.args.get('sort_by', 'published_at')
     sort_dir = request.args.get('sort_dir', 'desc')
+    search = request.args.get('search', '').strip()
+    selection = request.args.get('selection', '').lower() == 'true'
+    query_limit = SELECTION_FETCH_CAP if selection else limit
+    if selection:
+        offset = 0
 
     if is_recents_feed(podcast):
         # Membership rows belong to other feeds; each carries its source.
         cutoff = recents_cutoff(podcast)
         if status in (None, 'all', 'processed'):
-            episodes = db.get_recent_processed_episodes(cutoff, limit=limit, offset=offset,
-                                                        sort_by=sort_by, sort_dir=sort_dir)
-            total = db.count_recent_processed_episodes(cutoff)
+            episodes = db.get_recent_processed_episodes(cutoff, limit=query_limit, offset=offset,
+                                                        sort_by=sort_by, sort_dir=sort_dir, search=search)
+            total = db.count_recent_processed_episodes(cutoff, search=search)
         else:
             episodes, total = [], 0
     else:
-        episodes, total = db.get_episodes(slug, status=status, limit=limit, offset=offset,
-                                          sort_by=sort_by, sort_dir=sort_dir)
+        episodes, total = db.get_episodes(slug, status=status, limit=query_limit, offset=offset,
+                                          sort_by=sort_by, sort_dir=sort_dir, search=search, selection=selection)
 
     # One batched lookup for the whole page rather than one query per row.
     job_states = db.get_episode_job_states([ep['episode_id'] for ep in episodes])
@@ -304,12 +318,36 @@ def list_episodes(slug):
     for ep in episodes:
         source_slug = ep.get('source_slug')
         owner_slug = source_slug or slug
+        if selection:
+            filters = ({
+                'min_duration_seconds': ep.get('source_min_duration_seconds'),
+                'max_duration_seconds': ep.get('source_max_duration_seconds'),
+            } if source_slug else podcast)
+            status_key = EpisodeStatus.to_api(ep['status'])
+            episode_list.append({
+                'id': ep['episode_id'], 'status': status_key,
+                'jobState': _job_state(status_key, job_states.get((owner_slug, ep['episode_id']))),
+                'titleSkipped': title_matches_skip_patterns(
+                    ep.get('title'), ep.get('source_title_skip_patterns')
+                    if source_slug else podcast.get('title_skip_patterns')),
+                'descriptionSkipped': description_matches_skip_patterns(
+                    ep.get('description'), ep.get('source_description_skip_patterns')
+                    if source_slug else podcast.get('description_skip_patterns')),
+                'durationSkipped': duration_outside_feed_range(ep.get('rss_duration'), filters),
+            })
+            continue
         item = _episode_base_json(
             ep, slug=owner_slug,
             is_local=(ep.get('source_feed_type') == 'local') if source_slug else is_local,
             storage=storage,
             title_skip_patterns=(ep.get('source_title_skip_patterns')
-                                 if source_slug else podcast.get('title_skip_patterns')))
+                                 if source_slug else podcast.get('title_skip_patterns')),
+            description_skip_patterns=(ep.get('source_description_skip_patterns')
+                                       if source_slug else podcast.get('description_skip_patterns')),
+            duration_filters=({
+                'min_duration_seconds': ep.get('source_min_duration_seconds'),
+                'max_duration_seconds': ep.get('source_max_duration_seconds'),
+            } if source_slug else podcast))
         item['ad_count'] = ep['ads_removed']
         item['episodeNumber'] = ep.get('episode_number')
         item['jobState'] = _job_state(
@@ -320,10 +358,12 @@ def list_episodes(slug):
         episode_list.append(item)
 
     return json_response({
-        'episodes': episode_list,
+        'episodes': [] if selection else episode_list,
+        **({'selection': episode_list} if selection else {}),
         'total': total,
         'limit': limit,
-        'offset': offset
+        'offset': offset,
+        **({'truncated': total > len(episode_list)} if selection else {}),
     })
 
 
@@ -381,7 +421,8 @@ def _episode_job_state(db, slug, episode_id, status):
 
 
 def _episode_base_json(ep, *, slug=None, is_local=False, storage=None,
-                       title_skip_patterns=None):
+                       title_skip_patterns=None, description_skip_patterns=None,
+                       duration_filters=None):
     """Shared camelCase fields for the episode list and detail serializers.
 
     Status is mapped for frontend compatibility: 'processed' -> 'completed';
@@ -425,10 +466,27 @@ def _episode_base_json(ep, *, slug=None, is_local=False, storage=None,
         'pendingReviewCount': ep.get('pending_review_count', 0),
         'titleSkipped': title_matches_skip_patterns(
             ep.get('title'), title_skip_patterns),
+        'descriptionSkipped': description_matches_skip_patterns(
+            ep.get('description'), description_skip_patterns),
+        'durationSkipped': duration_outside_feed_range(ep.get('rss_duration'), duration_filters),
         'passthroughEnabled': bool(ep.get('passthrough_enabled')),
         # Stable Process/Reprocess eligibility: a completed episode that is
         # queued again reverts to 'pending', so status alone flips the label.
         'hasBeenProcessed': bool(ep.get('has_been_processed')),
+    }
+
+
+def _upstream_transcript_to_api(payload):
+    """Shape the stored upstream transcript diff for the episode detail (or None)."""
+    if not isinstance(payload, dict):
+        return None
+    return {
+        'status': payload.get('status'),
+        'coverage': payload.get('coverage'),
+        'sourceType': payload.get('mime'),
+        'spans': [{'start': span.get('start'), 'end': span.get('end'),
+                   'offsetConfirmed': bool(span.get('offset_confirmed'))}
+                  for span in payload.get('spans') or () if isinstance(span, dict)],
     }
 
 
@@ -455,6 +513,7 @@ def _run_stats_to_api(stats):
             'textPattern': stage_hits.get('text_pattern', 0),
             'differential': stage_hits.get('differential', 0),
             'llm': stage_hits.get('llm', 0),
+            'transcriptDifferential': stage_hits.get('transcript_differential', 0),
         } if stage_hits else None,
         'detected': stats.get('detected'),
         'markers': {
@@ -469,6 +528,7 @@ def _run_stats_to_api(stats):
         'timings': {
             'downloadSeconds': timings.get('download'),
             'transcriptionSeconds': timings.get('transcription'),
+            'transcriptDiffSeconds': timings.get('transcript_diff'),
             'differentialSeconds': timings.get('differential'),
             'audioAnalysisSeconds': timings.get('audio_analysis'),
             'detectionSeconds': timings.get('detection'),
@@ -482,6 +542,10 @@ def _run_stats_to_api(stats):
             'ffmpegSeconds': timings.get('ffmpeg'),
         } if timings is not None else None,
     }
+    if 'chapters_degraded' in stats:
+        result['chaptersDegraded'] = stats['chapters_degraded']
+    if 'chapters_degraded_reason' in stats:
+        result['chaptersDegradedReason'] = stats['chapters_degraded_reason']
     transcription = stats.get('transcription')
     if transcription:
         result['transcription'] = {
@@ -493,6 +557,13 @@ def _run_stats_to_api(stats):
             'gpuDeviceName': transcription.get('gpu_device_name'),
             'model': transcription.get('model'),
             'error': transcription.get('error'),
+        }
+    transcript_diff = stats.get('transcript_diff')
+    if isinstance(transcript_diff, dict):
+        result['transcriptDiff'] = {
+            'status': transcript_diff.get('status'),
+            'coverage': transcript_diff.get('coverage'),
+            'spans': transcript_diff.get('spans', 0),
         }
     notices = stats.get('thinking_notices')
     if notices:
@@ -509,6 +580,14 @@ def _run_stats_to_api(stats):
                     notice.get('fallback') or {}).get('reasoning_effort'),
             },
         } for notice in notices]
+    failover_usage = stats.get('failover')
+    if isinstance(failover_usage, dict):
+        slot_names = {'primary': 'llm-a', 'secondary': 'llm-b'}
+        result['failover'] = {
+            'llm': [slot_names[slot] for slot in failover_usage.get('llm') or ()
+                    if slot in slot_names],
+            'whisper': bool(failover_usage.get('whisper')),
+        }
     return result
 
 
@@ -656,9 +735,8 @@ def get_episode(slug, episode_id):
 
     # Parse ad markers if present, separating into four buckets:
     #   pendingReviewMarkers: held_for_review=True and not was_cut (checked FIRST)
-    #   keptMarkers:          action_applied == 'keep' and not held (deliberate
-    #                         per-category keep; keep resolution clears holds
-    #                         upstream, so this never overlaps pendingReviewMarkers)
+    #   keptMarkers:          action_applied keep-like and not held;
+    #                         actionApplied tells keep from mark.
     #   rejectedAdMarkers:    REJECT decision or not was_cut (and not held/kept)
     #   adMarkers:            everything else (accepted cuts)
     ad_markers = []
@@ -668,6 +746,10 @@ def get_episode(slug, episode_id):
     if episode.get('ad_markers_json'):
         try:
             all_markers = parse_ad_markers(episode['ad_markers_json']) or []
+            # Not persisted: a Keep<->Mark switch since these markers were
+            # stamped shows up in actionApplied/the bucket here without a recut.
+            all_markers = refresh_keep_like_markers(
+                all_markers, db.resolve_segment_actions(slug, podcast))
             for marker in all_markers:
                 decision = marker.get('validation', {}).get('decision', 'ACCEPT')
                 # Markers persisted by a failed run were never cut.
@@ -680,7 +762,7 @@ def get_episode(slug, episode_id):
                 marker['actionApplied'] = marker.get('action_applied')
                 if is_pending_review(marker):
                     pending_review_markers.append(marker)
-                elif marker.get('action_applied') == 'keep':
+                elif is_keep_like(marker.get('action_applied')):
                     kept_markers.append(marker)
                 elif decision == 'REJECT' or not was_cut:
                     rejected_ad_markers.append(marker)
@@ -698,11 +780,16 @@ def get_episode(slug, episode_id):
         except (json.JSONDecodeError, TypeError):
             dai_differential = None
 
+    upstream_transcript = _upstream_transcript_to_api(
+        db.get_episode_upstream_transcript(slug, episode_id))
+
     splice_calibration = db.get_episode_splice_calibration(slug, episode_id)
 
     base = _episode_base_json(
         episode, slug=slug, is_local=is_local, storage=storage,
-        title_skip_patterns=podcast.get('title_skip_patterns'))
+        title_skip_patterns=podcast.get('title_skip_patterns'),
+        description_skip_patterns=podcast.get('description_skip_patterns'),
+        duration_filters=podcast)
     # Separate from description: the local-episode editor round-trips that
     # field, and the block must never be written back (#720).
     base['chapterNotes'] = (format_chapter_block(episode.get('chapters_json'))
@@ -783,6 +870,7 @@ def get_episode(slug, episode_id):
         'partialDetection': _partial_detection(episode, processing_runs),
         'incompleteCoverage': _incomplete_coverage(processing_runs),
         'daiDifferential': dai_differential,
+        'upstreamTranscript': upstream_transcript,
         'spliceCalibration': splice_calibration,
         'transcript': episode.get('transcript_text'),
         'transcriptAvailable': bool(episode.get('transcript_text')),
@@ -1242,6 +1330,7 @@ def regenerate_chapters(slug, episode_id):
         return error_response('Episode not found', 404)
     if not episode['has_transcript_vtt']:
         return error_response('No VTT transcript available - full reprocess required', 400)
+    chapters_route = None
     try:
         chapters_route = resolve_route('chapters')
         chapters_provider = chapters_route.provider_key
@@ -1251,6 +1340,14 @@ def regenerate_chapters(slug, episode_id):
         # legacy unscoped check, a safe superset of any real provider hold.
         chapters_provider = None
         chapters_slot = 'primary'
+    if chapters_route is not None:
+        chapters_error = chapters_capability_error(
+            db, chapters_route.provider_key, chapters_route.model_id)
+    else:
+        chapters_error = chapters_capability_error(db)
+    if chapters_error:
+        return error_response('Chapter regeneration requires a supported chat provider and model; '
+                              'System One does not support chapters', 400)
     hold_until, _ = get_active_hold(db, chapters_provider, chapters_slot)
     if hold_until:
         return error_response(
@@ -1280,6 +1377,13 @@ def _regenerate_chapters_job(slug, episode_id, stamp):
     db = get_database()
     error = None
     podcast_name = slug
+    episode = None
+    ctx = run_context.begin(slug, episode_id, run_id=uuid.uuid4().hex)
+    from main_app.processing import _end_run_log, _record_history_row, _start_run_log
+    recorder = _start_run_log(slug, episode_id)
+    started = time.perf_counter()
+    start_episode_token_tracking()
+    logger.info(f"[{slug}:{episode_id}] Chapter regeneration run started ({ctx.run_id})")
     try:
         episode = db.get_episode(slug, episode_id)
         if not episode:
@@ -1301,7 +1405,24 @@ def _regenerate_chapters_job(slug, episode_id, stamp):
         logger.exception(f"Failed to regenerate chapters for {slug}:{episode_id}")
         error = truncate(str(exc), 500) or 'Chapter regeneration failed'
     finally:
-        db.finish_chapters_regen(slug, episode_id, stamp, error=error)
+        token_totals = get_episode_token_totals()
+        try:
+            _record_history_row(
+                db, slug, episode_id,
+                (episode or {}).get('title') or 'Unknown', podcast_name,
+                status='failed' if error else 'completed',
+                processing_time=time.perf_counter() - started,
+                ads_detected=0, token_totals=token_totals,
+                error_message=error, run_stats={'mode': 'chapters'},
+            )
+        except Exception:
+            logger.exception(f"Failed to record chapter regeneration history for {slug}:{episode_id}")
+        finally:
+            try:
+                _end_run_log(recorder)
+            finally:
+                run_context.end(ctx)
+                db.finish_chapters_regen(slug, episode_id, stamp, error=error)
 
 
 def _markers_from_row(episode):
@@ -1328,95 +1449,88 @@ def _regenerate_chapters(db, storage, slug, episode_id, episode, podcast, podcas
     segment_markers = _markers_from_row(episode)
     marker_cuts = storage.get_applied_cuts(slug, episode_id)
 
-    # Same run setup as a pipeline run: without the frozen route snapshot the
-    # chapters phase falls back to the global client and the primary slot,
-    # ignoring the operator's chapters route, and its ledger rows carry no run.
+    # Reuse the job context so route, usage, and logs share one run ID.
     from main_app.processing import _resolve_or_load_route_snapshot
-    run_id = uuid.uuid4().hex
-    ctx = run_context.begin(slug, episode_id, run_id=run_id)
+    ctx = run_context.current()
+    if ctx is None or not ctx.run_id:
+        raise RuntimeError('Chapter regeneration has no run context')
+    route_snapshot = _resolve_or_load_route_snapshot(ctx.run_id)
+    if route_snapshot is not None:
+        ctx.set_route_snapshot(route_snapshot)
+    chapters_gen = ChaptersGenerator()
+
+    # VTT segments are already ad-adjusted; omit ads_removed so
+    # generate_chapters doesn't double-adjust. marker_cuts still maps
+    # segment_markers onto the processed timeline for topic hints.
     try:
-        route_snapshot = _resolve_or_load_route_snapshot(run_id)
-        if route_snapshot is not None:
-            ctx.set_route_snapshot(route_snapshot)
-        start_episode_token_tracking()
-        chapters_gen = ChaptersGenerator()
-
-        # VTT segments are already ad-adjusted; omit ads_removed so
-        # generate_chapters doesn't double-adjust. marker_cuts still maps
-        # segment_markers onto the processed timeline for topic hints.
-        chapters = chapters_gen.generate_chapters(
-            segments,
-            episode_description=episode_description,
-            podcast_name=podcast_name,
-            episode_title=episode_title,
-            episode_id=episode_id,
-            replacement_duration=get_replacement_duration(),
-            segment_markers=segment_markers,
-            marker_cuts=marker_cuts,
-            slug=slug,
-        )
-
-        # A reprocess finishing during the LLM call above rewrote the transcript
-        # these chapters came from, so they no longer describe the served audio.
-        current = db.get_episode(slug, episode_id)
-        if (current is None or current['status'] == EpisodeStatus.PROCESSING
-                or current['processed_version'] != episode.get('processed_version')
-                or current['processed_at'] != episode.get('processed_at')):
-            raise RuntimeError(
-                'Episode was reprocessed during chapter regeneration; chapters not saved')
-        # This run outlived its claim window and another took the stamp over.
-        if current['chapters_regen_started_at'] != stamp:
-            raise RuntimeError(
-                'Chapter regeneration was taken over by a newer run; chapters not saved')
-
-        # Markers and cuts are re-read here, not reused from entry: a correction
-        # applied during the LLM pass must not be reverted by the merge.
-        current_markers = _markers_from_row(current)
-        current_cuts = storage.get_applied_cuts(slug, episode_id)
-        # current_cuts None means no authoritative cuts persisted, not "no cuts":
-        # skip the ad merge rather than place spans at original offsets.
-        if current_cuts is None:
-            logger.info(f"[{slug}:{episode_id}] No authoritative applied cuts "
-                        f"persisted; skipping ad chapters")
-        else:
-            ad_config = resolve_ad_chapter_config(db, podcast, slug=slug)
-            topic = (chapters or {}).get('chapters') or []
-            merged = merge_ad_chapters(topic, current_markers, current_cuts,
-                                       segments[-1].get('end') if segments else None,
-                                       get_replacement_duration(), ad_config)
-            if merged:
-                chapters = {**(chapters or {'version': '1.2.0'}), 'chapters': merged}
-
-        if not chapters or not chapters.get('chapters'):
-            raise RuntimeError('Failed to generate chapters')
-
-        storage.save_chapters_json(slug, episode_id, chapters)
-        logger.info(f"[{slug}:{episode_id}] Regenerated {len(chapters['chapters'])} chapters from VTT")
-        # Also refresh the ID3 chapters in the served MP3 so players that
-        # ignore podcast:chapters see the new set (issue #523).
-        processed_path = storage.get_episode_path(
-            slug, episode_id, version=current['processed_version'])
-        if processed_path.exists():
-            embed_chapters(str(processed_path), public_chapters(chapters['chapters']))
-        # Same seam a finished run uses, so the served feed (which may
-        # list the chapters, #720) picks up the new set.
-        from main_app.processing import _refresh_rss_for_slug
-        _refresh_rss_for_slug(slug, episode_id)
+        with ctx.timing.measure('chapters'):
+            chapters = chapters_gen.generate_chapters(
+                segments,
+                episode_description=episode_description,
+                podcast_name=podcast_name,
+                episode_title=episode_title,
+                episode_id=episode_id,
+                replacement_duration=get_replacement_duration(),
+                segment_markers=segment_markers,
+                marker_cuts=marker_cuts,
+                slug=slug,
+            )
     except ProviderRateLimitedError as exc:
-        # Scope the hold here: the caller records it after this run's route
-        # snapshot has already been torn down.
         exc.provider_key, exc.credential_slot = resolve_hold_scope(exc, 'chapters')
         raise
-    finally:
-        token_totals = get_episode_token_totals()
-        run_context.end(ctx)
-        if token_totals['input_tokens'] > 0:
-            db.increment_episode_token_usage(
-                podcast['id'], episode_id,
-                token_totals['input_tokens'],
-                token_totals['output_tokens'],
-                token_totals['cost'],
-            )
+    if getattr(chapters_gen, 'chapters_degraded', False) is True:
+        raise RuntimeError(
+            'Chapter generation was incomplete. Existing chapters were kept. '
+            'Check Settings > AI Models and try again after recovery.')
+
+    # A reprocess finishing during the LLM call above rewrote the transcript
+    # these chapters came from, so they no longer describe the served audio.
+    current = db.get_episode(slug, episode_id)
+    if (current is None or current['status'] == EpisodeStatus.PROCESSING
+            or current['processed_version'] != episode.get('processed_version')
+            or current['processed_at'] != episode.get('processed_at')):
+        raise RuntimeError(
+            'Episode was reprocessed during chapter regeneration; chapters not saved')
+    # This run outlived its claim window and another took the stamp over.
+    if current['chapters_regen_started_at'] != stamp:
+        raise RuntimeError(
+            'Chapter regeneration was taken over by a newer run; chapters not saved')
+
+    # Markers and cuts are re-read here, not reused from entry: a correction
+    # applied during the LLM pass must not be reverted by the merge.
+    current_markers = _markers_from_row(current)
+    current_cuts = storage.get_applied_cuts(slug, episode_id)
+    # current_cuts None means no authoritative cuts persisted, not "no cuts":
+    # skip the ad merge rather than place spans at original offsets.
+    if current_cuts is None:
+        logger.info(f"[{slug}:{episode_id}] No authoritative applied cuts "
+                    f"persisted; skipping ad chapters")
+    else:
+        ad_config = resolve_ad_chapter_config(db, podcast)
+        topic = (chapters or {}).get('chapters') or []
+        # A category-action change since the marker was stamped applies only
+        # to this rebuild; it does not rewrite ad_markers_json.
+        refreshed_markers = (refresh_keep_like_markers(current_markers, ad_config.actions)
+                             if ad_config else current_markers)
+        merged = merge_ad_chapters(topic, refreshed_markers, current_cuts,
+                                   segments[-1].get('end') if segments else None,
+                                   get_replacement_duration(), ad_config)
+        if merged:
+            chapters = {**(chapters or {'version': '1.2.0'}), 'chapters': merged}
+
+    if not chapters or not chapters.get('chapters'):
+        raise RuntimeError('Failed to generate chapters')
+
+    storage.save_chapters_json(slug, episode_id, chapters)
+    logger.info(f"[{slug}:{episode_id}] Regenerated {len(chapters['chapters'])} chapters from VTT")
+    # Also refresh ID3 chapters for players that ignore podcast:chapters.
+    processed_path = storage.get_episode_path(
+        slug, episode_id, version=current['processed_version'])
+    if processed_path.exists():
+        embed_chapters(str(processed_path), public_chapters(chapters['chapters']))
+    # Refresh the served feed if it includes chapters.
+    from main_app.processing import _refresh_rss_for_slug
+    _refresh_rss_for_slug(slug, episode_id)
 
 
 def parse_vtt_to_segments(vtt_content: str) -> list:
@@ -1591,12 +1705,11 @@ def bulk_episode_action(slug):
             if not episode:
                 skipped += 1
                 continue
-            if title_matches_skip_patterns(
-                    episode.get('title'), podcast.get('title_skip_patterns')):
+            if episode_matches_feed_filters(episode, podcast):
                 skipped += 1
                 skipped_episodes.append({
                     'episodeId': episode_id,
-                    'reason': 'Title matches feed title-skip patterns',
+                    'reason': 'Episode matches feed filters',
                 })
                 continue
             if episode.get('status') == EpisodeStatus.DISCOVERED.value:

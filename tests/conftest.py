@@ -37,6 +37,14 @@ def _align_loaded_app_singletons():
     _restore_loaded_app_singletons()
 
 
+@pytest.fixture(autouse=True)
+def _isolate_reviewer_calibration(request, monkeypatch, _reset_rate_limiter):
+    """Only scheduler tests may start automatic calibration workers."""
+    settings_module = sys.modules.get('api.settings')
+    if settings_module is not None and 'calibration_runs' not in request.fixturenames:
+        monkeypatch.setattr(settings_module, 'trigger_reviewer_calibration', lambda *args: None)
+
+
 @pytest.fixture
 def temp_dir():
     """Create a temporary directory for test data."""
@@ -95,31 +103,6 @@ def sample_transcript():
 
 
 @pytest.fixture
-def sample_ads():
-    """Sample ad markers for validation testing."""
-    return [
-        {
-            'start': 30.0,
-            'end': 90.0,
-            'confidence': 0.95,
-            'reason': 'BetterHelp sponsor read with promo code',
-            'end_text': 'betterhelp.com/podcast'
-        }
-    ]
-
-
-@pytest.fixture
-def low_confidence_ad():
-    """Ad with low confidence for rejection testing."""
-    return {
-        'start': 100.0,
-        'end': 120.0,
-        'confidence': 0.25,
-        'reason': 'Possible ad detected'
-    }
-
-
-@pytest.fixture
 def short_ad():
     """Ad that is too short to be valid."""
     return {
@@ -139,24 +122,6 @@ def long_ad():
         'confidence': 0.70,
         'reason': 'Extended promotional segment'
     }
-
-
-@pytest.fixture
-def overlapping_ads():
-    """Ads that overlap and should be merged."""
-    return [
-        {'start': 30.0, 'end': 60.0, 'confidence': 0.90, 'reason': 'First pass ad'},
-        {'start': 55.0, 'end': 90.0, 'confidence': 0.85, 'reason': 'Second pass ad'}
-    ]
-
-
-@pytest.fixture
-def adjacent_ads():
-    """Ads with small gaps that should be merged."""
-    return [
-        {'start': 30.0, 'end': 60.0, 'confidence': 0.90, 'reason': 'First ad'},
-        {'start': 63.0, 'end': 90.0, 'confidence': 0.85, 'reason': 'Second ad within gap'}
-    ]
 
 
 @pytest.fixture

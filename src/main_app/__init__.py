@@ -614,7 +614,7 @@ compress.init_app(app)
 # middleware stack.
 
 # Import and register API blueprint
-from api import api as api_blueprint, init_limiter
+from api import api as api_blueprint, init_limiter, limiter
 app.register_blueprint(api_blueprint)
 init_limiter(app)
 
@@ -708,6 +708,7 @@ def _apply_security_headers(response):
 # Register routes from routes module
 from main_app.routes import register_routes
 register_routes(app)
+limiter.exempt(app.view_functions['serve_ui'])
 
 # Re-export public API for downstream consumers
 from main_app.feeds import refresh_rss_feed, refresh_all_feeds, invalidate_feed_cache, get_feed_map
@@ -743,8 +744,9 @@ def _background_threads_enabled() -> bool:
     database. They also share patched globals with the test, which made
     assertions depend on which module won the leader lock first.
     """
-    if os.environ.get('MINUSPOD_BACKGROUND_THREADS') == '1':
-        return True
+    background_threads = os.environ.get('MINUSPOD_BACKGROUND_THREADS')
+    if background_threads in ('0', '1'):
+        return background_threads == '1'
     return 'pytest' not in sys.modules
 
 

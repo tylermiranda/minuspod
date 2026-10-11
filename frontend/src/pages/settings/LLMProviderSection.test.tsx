@@ -12,6 +12,8 @@ const providersState: ProvidersResponse = {
   openrouter: { configured: false, source: 'none' },
   whisper: { configured: false, source: 'none' },
   ollama: { configured: false, source: 'none' },
+  typesafe: { configured: false, source: 'none' },
+  'systemone-compatible': { configured: false, source: 'none' },
 };
 
 function renderSection(overrides: Partial<Parameters<typeof LLMProviderSection>[0]> = {}) {
@@ -21,9 +23,11 @@ function renderSection(overrides: Partial<Parameters<typeof LLMProviderSection>[
     <LLMProviderSection
       llmProvider="anthropic"
       openaiBaseUrl=""
+      systemoneBaseUrl=""
       pricingSourceMode="auto"
       onProviderChange={vi.fn()}
       onBaseUrlChange={vi.fn()}
+      onSystemOneBaseUrlChange={vi.fn()}
       onPricingSourceModeChange={vi.fn()}
       providersState={providersState}
       onProviderKeySave={vi.fn().mockResolvedValue(undefined)}
@@ -54,6 +58,14 @@ function renderSection(overrides: Partial<Parameters<typeof LLMProviderSection>[
       onProviderTokensPerMinChange={vi.fn()}
       secondaryProviderTokensPerMin={0}
       onSecondaryProviderTokensPerMinChange={vi.fn()}
+      providerATimeoutSeconds={null}
+      onProviderATimeoutSecondsChange={vi.fn()}
+      providerAMaxRetries={null}
+      onProviderAMaxRetriesChange={vi.fn()}
+      providerBTimeoutSeconds={null}
+      onProviderBTimeoutSecondsChange={vi.fn()}
+      providerBMaxRetries={null}
+      onProviderBMaxRetriesChange={vi.fn()}
       primaryAccountChanged={false}
       secondaryAccountChanged={false}
       affectedRunsAction="requeue"
@@ -64,10 +76,44 @@ function renderSection(overrides: Partial<Parameters<typeof LLMProviderSection>[
   );
 }
 
+describe('LLMProviderSection: Provider A / Provider B labeling', () => {
+  it('labels the two slots Provider A and Provider B', () => {
+    renderSection({ secondaryProviderEnabled: true });
+    expect(screen.getByText('Provider A')).toBeDefined();
+    expect(screen.getByRole('switch', { name: 'Enable Provider B' })).toBeDefined();
+    expect(screen.getByLabelText('Provider B type')).toBeDefined();
+    expect(screen.queryByText(/secondary/i)).toBeNull();
+    expect(screen.queryByText(/primary/i)).toBeNull();
+  });
+
+  it('shows timeout and retries per provider with type defaults as placeholders', () => {
+    renderSection({ secondaryProviderEnabled: true, llmProvider: 'anthropic', secondaryProvider: 'ollama' });
+    expect((screen.getByLabelText('Provider A request timeout (seconds)') as HTMLInputElement).placeholder).toBe('120');
+    expect((screen.getByLabelText('Provider A max retries') as HTMLInputElement).placeholder).toBe('3');
+    expect((screen.getByLabelText('Provider B request timeout (seconds)') as HTMLInputElement).placeholder).toBe('600');
+    expect((screen.getByLabelText('Provider B max retries') as HTMLInputElement).placeholder).toBe('2');
+    expect(screen.getAllByText('Blank uses the provider default. 0 sends one request with no retries.')).toHaveLength(2);
+  });
+
+  it('accepts fractional native timeouts without imposing chat timeout limits', async () => {
+    const onProviderATimeoutSecondsChange = vi.fn();
+    renderSection({ llmProvider: 'typesafe', secondaryProviderEnabled: true, secondaryProvider: 'anthropic', onProviderATimeoutSecondsChange });
+    const native = screen.getByLabelText('Provider A request timeout (seconds)') as HTMLInputElement;
+    await userEvent.setup().type(native, '0.25');
+    expect(onProviderATimeoutSecondsChange).toHaveBeenLastCalledWith(0.25);
+    expect(native.validity.valid).toBe(true);
+    expect(native.max).toBe('');
+    const chat = screen.getByLabelText('Provider B request timeout (seconds)') as HTMLInputElement;
+    expect(chat.min).toBe('10');
+    expect(chat.max).toBe('3600');
+    expect(chat.step).toBe('1');
+  });
+});
+
 describe('LLMProviderSection: secondary provider toggle', () => {
   it('hides every secondary control until the toggle is on', () => {
     renderSection();
-    expect(screen.queryByLabelText('Secondary provider type')).toBeNull();
+    expect(screen.queryByLabelText('Provider B type')).toBeNull();
     expect(screen.queryByLabelText('OpenRouter API key')).toBeNull();
   });
 
@@ -78,7 +124,7 @@ describe('LLMProviderSection: secondary provider toggle', () => {
     const onBaseUrlChange = vi.fn();
     renderSection({ onSecondaryProviderEnabledChange, onProviderChange, onBaseUrlChange });
 
-    await user.click(screen.getByRole('switch', { name: 'Enable secondary provider' }));
+    await user.click(screen.getByRole('switch', { name: 'Enable Provider B' }));
 
     expect(onSecondaryProviderEnabledChange).toHaveBeenCalledWith(true);
     expect(onProviderChange).not.toHaveBeenCalled();
@@ -87,16 +133,59 @@ describe('LLMProviderSection: secondary provider toggle', () => {
 });
 
 describe('LLMProviderSection: secondary provider block, once enabled', () => {
+  it('shows the primary native test failure detail', async () => {
+    const onProviderKeyTest = vi.fn().mockResolvedValue({ ok: false, detail: 'HTTP 401' });
+    renderSection({
+      llmProvider: 'typesafe',
+      providersState: { ...providersState, typesafe: providersState.anthropic },
+      onProviderKeyTest,
+    });
+    const form = screen.getByLabelText('TypeSafe API key').closest('form') as HTMLElement;
+    await userEvent.setup().click(within(form).getByRole('button', { name: 'Test' }));
+    expect(await within(form).findByText('HTTP 401')).toBeTruthy();
+  });
+
+  it('keeps native tests available without stage models and shows connection-only results in both slots', async () => {
+    const user = userEvent.setup();
+    const detail = 'Connection successful. Inference not tested.';
+    const result = { ok: true, reachable: true, detail, validation: 'model_catalog', inferenceChecked: false };
+    const onProviderKeyTest = vi.fn().mockResolvedValue(result);
+    const onConnectionTest = vi.fn().mockResolvedValue(result);
+    const onSecondaryConnectionTest = vi.fn().mockResolvedValue(result);
+    renderSection({
+      llmProvider: 'typesafe',
+      providersState: { ...providersState, typesafe: providersState.anthropic },
+      secondaryProviderEnabled: true,
+      secondaryProvider: 'systemone-compatible',
+      secondaryProviderApiKeyConfigured: true,
+      onProviderKeyTest, onConnectionTest, onSecondaryConnectionTest,
+    });
+
+    const primary = screen.getByLabelText('TypeSafe API key').closest('form') as HTMLElement;
+    const secondary = screen.getByLabelText('System One API key').closest('form') as HTMLElement;
+    for (const container of [primary, secondary]) {
+      await user.click(within(container).getByRole('button', { name: 'Test' }));
+      expect(await within(container).findByText(detail)).toBeTruthy();
+    }
+    for (const button of screen.getAllByRole('button', { name: 'Test connection' })) {
+      await user.click(button);
+    }
+    expect(screen.getAllByRole('status').map((status) => status.textContent)).toEqual([detail, detail]);
+    expect(onProviderKeyTest).toHaveBeenCalledWith('typesafe');
+    expect(onConnectionTest).toHaveBeenCalledWith('typesafe', undefined);
+    expect(onSecondaryConnectionTest).toHaveBeenCalledTimes(2);
+  });
+
   it('exposes the same controls as the primary block: type select, key field, connection test', () => {
     renderSection({ secondaryProviderEnabled: true });
-    expect(screen.getByLabelText('Secondary provider type')).toBeDefined();
+    expect(screen.getByLabelText('Provider B type')).toBeDefined();
     expect(screen.getByLabelText('OpenRouter API key')).toBeDefined();
     expect(screen.getAllByRole('button', { name: 'Test connection' }).length).toBeGreaterThan(0);
   });
 
   it('offers a placeholder instead of a silent first option when no type is saved', () => {
     renderSection({ secondaryProviderEnabled: true, secondaryProvider: '' });
-    const select = screen.getByLabelText('Secondary provider type') as HTMLSelectElement;
+    const select = screen.getByLabelText('Provider B type') as HTMLSelectElement;
     expect(select.value).toBe('');
     expect(within(select).getByRole('option', { name: 'Choose a provider' })).toBeDefined();
   });
@@ -113,7 +202,7 @@ describe('LLMProviderSection: secondary provider block, once enabled', () => {
       onConnectionTest,
     });
 
-    const baseUrlInput = screen.getByLabelText('Secondary base URL');
+    const baseUrlInput = screen.getByLabelText('Provider B base URL');
     expect(baseUrlInput).toBeDefined();
     const container = baseUrlInput.closest('div') as HTMLElement;
     await user.click(within(container).getByRole('button', { name: 'Test connection' }));
@@ -134,7 +223,7 @@ describe('LLMProviderSection: secondary provider block, once enabled', () => {
     // Both the primary (default "anthropic") and secondary blocks are
     // fixed-endpoint types here, so scope to the secondary block's own
     // container rather than matching either "Test connection" button.
-    const secondaryContainer = screen.getByLabelText('Secondary provider type').closest('.space-y-4') as HTMLElement;
+    const secondaryContainer = screen.getByLabelText('Provider B type').closest('.space-y-4') as HTMLElement;
     await user.click(within(secondaryContainer).getByRole('button', { name: 'Test connection' }));
 
     expect(onSecondaryConnectionTest).toHaveBeenCalledWith('openrouter', undefined);
@@ -146,7 +235,7 @@ describe('LLMProviderSection: secondary provider block, once enabled', () => {
     const onSecondaryProviderChange = vi.fn();
     renderSection({ secondaryProviderEnabled: true, onProviderChange, onSecondaryProviderChange });
 
-    await user.selectOptions(screen.getByLabelText('Secondary provider type'), 'ollama');
+    await user.selectOptions(screen.getByLabelText('Provider B type'), 'ollama');
 
     expect(onSecondaryProviderChange).toHaveBeenCalledWith('ollama');
     expect(onProviderChange).not.toHaveBeenCalled();
@@ -216,8 +305,8 @@ describe('LLMProviderSection: rate-limit grouping and field chrome', () => {
     renderSection({ secondaryProviderEnabled: true });
     const groups = screen.getAllByRole('group');
     const legends = groups.map((g) => g.querySelector('legend')?.textContent);
-    expect(legends).toContain('Primary provider rate limits');
-    expect(legends).toContain('Secondary provider rate limits');
+    expect(legends).toContain('Provider A rate limits');
+    expect(legends).toContain('Provider B rate limits');
   });
 
   it('gives the base URL field the shared input chrome', () => {

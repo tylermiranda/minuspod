@@ -20,6 +20,7 @@ Configuration via environment variables:
         OPENAI_API_KEY: API key if required (default: "not-needed")
 """
 
+import copy
 import json
 import logging
 import os
@@ -37,6 +38,7 @@ from typing import Any, Union
 import run_context
 
 import requests
+import httpx
 
 from utils.circuit_breaker import CircuitBreaker, CircuitBreakerOpen
 from utils.rate_limit import (
@@ -44,13 +46,12 @@ from utils.rate_limit import (
     parse_google_retry_delay, parse_google_daily_quota,
 )
 from utils.http import safe_url_for_log
+from utils.safe_http import URLTrust, safe_get
 from utils.ttl_cache import TTLCache
 
 from config import (
     HTTP_MAX_REDIRECTS_API,
     HTTP_TIMEOUT_API,
-    LLM_TIMEOUT_DEFAULT,
-    LLM_TIMEOUT_LOCAL,
     LLM_RETRY_MAX_RETRIES,
     LLM_RETRY_MAX_RETRIES_LOCAL,
     DEFAULT_OPENAI_BASE_URL,
@@ -61,6 +62,11 @@ from config import (
     PROVIDER_OPENROUTER,
     PROVIDER_OLLAMA,
     PROVIDER_OPENAI_COMPATIBLE,
+    PROVIDER_TYPESAFE,
+    PROVIDER_SYSTEMONE_COMPATIBLE,
+    SYSTEMONE_PROVIDERS,
+    TYPESAFE_BASE_URL,
+    TYPESAFE_SYSTEMONE_URL,
     PROVIDERS_NON_ANTHROPIC,
     coerce_bool_setting,
     get_stage_tunable,
@@ -68,6 +74,7 @@ from config import (
 )
 from llm_capabilities import (
     classify_reasoning_rejection,
+    anthropic_model_supports_forced_tools,
     get_pass_defaults,
     is_fallback_eligible_error,
     is_fallback_set,
@@ -77,6 +84,16 @@ from llm_capabilities import (
     set_fallback,
     translate_reasoning_effort,
 )
+import database
+from llm_timeout import get_llm_timeout_from_snapshot
+from systemone.admission import operation_admission
+from systemone.settings import get_systemone_settings
+from systemone.transport import SystemOneTransport, DispatchResponse
+from systemone.client import response_payload
+from systemone.adapter import ReviewInconclusiveError, run_chat_completion
+from systemone.protocol import GUIDANCE as SYSTEMONE_GUIDANCE, jev_ask
+from sponsor_service import SponsorService
+from community_export import normalize_aliases
 
 logger = logging.getLogger(__name__)
 io_logger = logging.getLogger('podcast.llm_io')
@@ -157,6 +174,23 @@ _JSON_FORMAT_SYSTEM_INSTRUCTION = (
     "Malformed JSON causes parsing failures.</output_format>"
 )
 
+_STRUCTURED_TOOL_SYSTEM_INSTRUCTION = (
+    "\n\nWhen a structured-output tool is provided, call that expected tool "
+    "and return its object. Do not answer with free text."
+)
+
+
+def _strict_anthropic_schema(schema):
+    """Copy a schema and close every object without changing its fields."""
+    if isinstance(schema, list):
+        return [_strict_anthropic_schema(item) for item in schema]
+    if not isinstance(schema, dict):
+        return schema
+    result = {key: _strict_anthropic_schema(value) for key, value in schema.items()}
+    if result.get('type') == 'object':
+        result['additionalProperties'] = False
+    return result
+
 # Substrings seen in 400s from endpoints that reject response_format / structured outputs.
 _JSON_MODE_REJECTIONS = ("response_format", "structured-outputs", "structured outputs",
                          "json_schema", "json schema")
@@ -214,6 +248,7 @@ class LLMResponse:
     reasoning_exhausted: bool = False
     returned_model: str | None = None
     provider_reported_cost_usd: float | None = None
+    diagnostics: dict | None = None
 
 
 @dataclass
@@ -327,12 +362,16 @@ def _clear_model_list_cache():
         _model_list_last_good.clear()
 
 
+def get_effective_provider_from_snapshot(snapshot):
+    value = snapshot.get('llm_provider')
+    if isinstance(value, dict):
+        value = value.get('value')
+    return (value or os.environ.get('LLM_PROVIDER', PROVIDER_ANTHROPIC)).lower()
+
+
 def get_effective_provider() -> str:
     """Return the active LLM provider, checking DB first then env var."""
-    db_val = _get_cached_setting('llm_provider')
-    if db_val:
-        return db_val.lower()
-    return os.environ.get('LLM_PROVIDER', PROVIDER_ANTHROPIC).lower()
+    return get_effective_provider_from_snapshot({'llm_provider': _get_cached_setting('llm_provider')})
 
 
 def model_matches_provider(model_id: str, provider: str) -> bool:
@@ -353,14 +392,7 @@ def _omit_temperature_override() -> bool:
 
 
 def supports_json_schema_for_calls(model: str | None = None) -> bool:
-    """Structured-output gate for OpenAI-compatible endpoints (#693/#694).
-
-    Deliberately narrower than llm_capabilities.supports_json_schema, which
-    answers for Anthropic: a json_schema request on the Anthropic path forces
-    a tool_choice call, and Anthropic rejects that alongside the extended
-    thinking a configured reasoning budget turns on. Only the category-repair
-    site, which sends no reasoning budget, ORs the two. Do not merge them.
-    """
+    """Return the configured schema-probe result for the active OpenAI endpoint."""
     if get_effective_provider() != PROVIDER_OPENAI_COMPATIBLE:
         return False
     if not coerce_bool_setting(_get_cached_setting('llm_json_schema_enabled')):
@@ -380,6 +412,12 @@ def reset_schema_probe_memo() -> None:
     """Forget this process's inconclusive json_schema probes so the next
     endpoint verification retries them (#693)."""
     _SCHEMA_PROBE_ATTEMPTED.clear()
+
+
+def clear_settings_cache() -> None:
+    """Drop cached setting reads without bumping the client config revision."""
+    with _provider_cache_lock:
+        _provider_cache.clear()
 
 
 def invalidate_provider_cache() -> None:
@@ -473,6 +511,18 @@ def get_effective_secondary_provider_api_key() -> str | None:
     return _get_cached_secret('secondary_provider_api_key')
 
 
+def get_effective_failover_llm_api_key() -> str | None:
+    """Return the failover-slot LLM API key. DB secret only, like secondary."""
+    return _get_cached_secret('failover_llm_api_key')
+
+
+def get_effective_systemone_api_key(provider: str) -> str | None:
+    """Resolve only the credential belonging to this System One provider."""
+    setting = 'typesafe_api_key' if provider == PROVIDER_TYPESAFE else 'systemone_api_key'
+    env_name = 'TYPESAFE_API_KEY' if provider == PROVIDER_TYPESAFE else 'SYSTEMONE_API_KEY'
+    return _get_cached_secret(setting) or os.environ.get(env_name)
+
+
 def _apply_pass_fallback(
     episode_id: str | None,
     pass_name: str | None,
@@ -520,6 +570,8 @@ def _provider_error_kind(error: Exception) -> str:
 
 def is_review_inconclusive_error(error: Exception) -> bool:
     """True for the review service's explicit inconclusive response."""
+    if isinstance(error, ReviewInconclusiveError):
+        return True
     try:
         status = int(_provider_status_code(error))
     except (TypeError, ValueError):
@@ -587,7 +639,7 @@ def _record_reasoning_fallback_notice(
     compatibility = classify_reasoning_rejection(error)
     requested_value = _safe_reasoning_value(requested)
     if (compatibility is None or requested_value == 'redacted'
-            or not translate_reasoning_effort(provider, requested)):
+            or not translate_reasoning_effort(provider, requested, model)):
         return
     ctx = run_context.current()
     if (ctx is None or not ctx.run_id
@@ -810,30 +862,7 @@ class LLMClient(ABC):
         episode_id: str | None = None,
         pass_name: str | None = None,
     ) -> LLMResponse:
-        """Send a completion request (synchronous).
-
-        Args:
-            model: Model identifier
-            max_tokens: Maximum tokens in response
-            system: System prompt
-            messages: List of message dicts with 'role' and 'content'
-            temperature: Sampling temperature (0.0 = deterministic)
-            timeout: Request timeout in seconds
-            response_format: Optional format specification (e.g., {"type": "json_object"})
-                           Used by OpenAI-compatible APIs to enforce JSON output
-            reasoning_effort: Provider-aware reasoning control. Integer token budget
-                for Anthropic (extended thinking), string enum ("none"|"low"|"medium"|"high")
-                for other providers, or None to omit reasoning configuration.
-            episode_id: Episode identifier for per-pass fallback flag scoping.
-            pass_name: Pass identifier (e.g. "ad_detection_pass_1") for per-pass
-                fallback flag scoping. When both episode_id and pass_name are set,
-                a 4xx from the provider sets a fallback flag and the call is retried
-                with built-in defaults; remaining calls in the same pass use the
-                defaults too. Cleared explicitly by the orchestrator between passes.
-
-        Returns:
-            LLMResponse with content, model, and usage info
-        """
+        """Send a completion request with provider-compatible response settings."""
         pass
 
     @abstractmethod
@@ -852,6 +881,243 @@ class LLMClient(ABC):
     def get_provider_name(self) -> str:
         """Return the provider name for logging."""
         pass
+
+
+class SystemOneClient(LLMClient):
+    """Run the Jev adapter while accounting each provider POST separately."""
+    uses_per_request_dispatch = True
+
+    def __init__(self, provider: str, *, base_url: str, api_key: str | None):
+        super().__init__()
+        self.provider = provider
+        self.base_url = base_url.rstrip('/')
+        self.api_key = api_key
+        self._http_client = None
+        self._http_client_lock = threading.Lock()
+
+    def close(self):
+        with self._http_client_lock:
+            if self._http_client is not None:
+                self._http_client.close()
+                self._http_client = None
+        super().close()
+
+    def messages_create(self, model, max_tokens, system, messages,
+                        temperature=0.0, timeout=120.0, response_format=None,
+                        reasoning_effort=None, episode_id=None, pass_name=None):
+        settings = get_systemone_settings(
+            self.provider, self.credential_slot, model)
+        http_client = self._get_http_client(settings.request_timeout)
+        transport = self._make_transport(settings, http_client)
+        deadline_at = time.monotonic() + settings.request_deadline_seconds
+        metadata = run_context.current_llm_dispatch_context()
+        if metadata is not None:
+            metadata['deadline_at'] = deadline_at
+            metadata['retry_after_cap'] = settings.retry_after_max_seconds
+        check = self._admission_check(metadata)
+        with operation_admission(
+                transport.url, self.api_key, settings.max_concurrent_operations,
+                deadline_at=deadline_at, check=check):
+            self._check_circuit_breaker()
+            diagnostics = {}
+            try:
+                diagnostics = metadata.setdefault('diagnostics', {}) if metadata is not None else {}
+                database = metadata.get('database') if metadata is not None else None
+                if database is None:
+                    raise RuntimeError('System One calls require the shared LLM call context')
+                sponsor_rows = SponsorService(database).get_sponsors()
+                sponsors = tuple({
+                    'name': row.get('name'),
+                    'candidates': tuple([row.get('name'), *normalize_aliases(row.get('aliases'))]),
+                } for row in sponsor_rows)
+                data = run_chat_completion(
+                    messages=[{'role': 'system', 'content': system}, *messages],
+                    request_model=model, settings=settings, fetcher=transport,
+                    sponsor_lookup=lambda: sponsors,
+                    deadline_at=deadline_at,
+                    diagnostics=diagnostics,
+                )
+                payload = response_payload(data)
+                usage = data.get('usage') or {}
+                result = LLMResponse(
+                    content=json.dumps(payload, separators=(',', ':')),
+                    model=data.get('model') or settings.model,
+                    usage={
+                        'input_tokens': usage.get('prompt_tokens'),
+                        'output_tokens': usage.get('completion_tokens'),
+                    },
+                    finish_reason=(data.get('choices') or [{}])[0].get('finish_reason'),
+                    returned_model=data.get('model'),
+                    diagnostics=diagnostics,
+                )
+            except ReviewInconclusiveError as error:
+                error.systemone_diagnostics = diagnostics
+                self._record_circuit_breaker(success=True)
+                raise
+            except Exception as error:
+                error.systemone_diagnostics = diagnostics
+                metadata_cancel = metadata.get('cancel_exceptions', ()) if metadata else ()
+                if (is_rate_limit_error(error)
+                        or isinstance(error, ProviderAccountChangedError)
+                        or (metadata_cancel and isinstance(error, metadata_cancel))
+                        or run_context.first_llm_dispatch_attempt() is None):
+                    self._release_circuit_breaker_probe()
+                else:
+                    self._record_circuit_breaker(success=False, error=error)
+                raise
+            self._record_circuit_breaker(success=True)
+            return result
+
+    def _admission_check(self, metadata):
+        context_database = metadata.get('database') if metadata else None
+        from_database = context_database or database.Database()
+        secret_key = ('secondary_provider_api_key' if self.credential_slot == 'secondary'
+                      else 'typesafe_api_key' if self.provider == PROVIDER_TYPESAFE
+                      else 'systemone_api_key')
+        endpoint_key = ('secondary_provider_base_url' if self.credential_slot == 'secondary'
+                        else 'systemone_base_url')
+        env_key = 'TYPESAFE_API_KEY' if self.provider == PROVIDER_TYPESAFE else 'SYSTEMONE_API_KEY'
+
+        def current_identity():
+            key = from_database.get_secret(secret_key)
+            if self.credential_slot == 'primary':
+                key = key or os.environ.get(env_key)
+            endpoint = (from_database.get_setting(endpoint_key)
+                        or (os.environ.get('SYSTEMONE_BASE_URL') if self.credential_slot == 'primary' else None))
+            return key, endpoint
+
+        frozen_identity = current_identity()
+
+        def check(waited):
+            if metadata:
+                metadata.get('cancel_check', lambda: None)()
+                account_check = metadata.get('account_check')
+                if account_check:
+                    account_check(metadata)
+            if waited and current_identity() != frozen_identity:
+                raise ProviderAccountChangedError(
+                    'System One credentials or endpoint changed while waiting for local capacity',
+                    credential_slot=self.credential_slot)
+        return check
+
+    def list_models(self, bypass_cache=False):
+        cache_key = f'{self.provider}:{self.base_url}:{self.credential_slot}'
+        cached = None if bypass_cache else _get_cached_model_list(cache_key)
+        if cached is not None:
+            return cached
+        headers = {'Authorization': f'Bearer {self.api_key}'} if self.api_key else {}
+        headers.update(_opencode_headers(self.base_url))
+        try:
+            response = safe_get(
+                f'{self.base_url}/models', trust=URLTrust.OPERATOR_CONFIGURED,
+                timeout=HTTP_TIMEOUT_API, max_redirects=HTTP_MAX_REDIRECTS_API,
+                headers=headers,
+            )
+            response.raise_for_status()
+            body = response.json()
+            entries = body.get('data', body.get('models', [])) if isinstance(body, dict) else []
+            models = []
+            if isinstance(entries, list):
+                for item in entries:
+                    if not isinstance(item, dict):
+                        continue
+                    model_id = item.get('id') or item.get('name')
+                    if isinstance(model_id, str) and model_id:
+                        models.append(LLMModel(
+                            id=model_id, name=item.get('name') or model_id,
+                            created=str(item['created']) if item.get('created') is not None else None,
+                        ))
+            _set_cached_model_list(cache_key, models)
+            return models
+        except Exception as error:
+            logger.info('System One model discovery unavailable: %s', type(error).__name__)
+            return []
+
+    def _get_http_client(self, timeout):
+        with self._http_client_lock:
+            if self._http_client is None:
+                self._http_client = httpx.Client(timeout=timeout)
+            return self._http_client
+
+    def _make_transport(self, settings, http_client):
+        return SystemOneTransport(
+            url=(TYPESAFE_SYSTEMONE_URL if self.provider == PROVIDER_TYPESAFE
+                 else f'{self.base_url}/systemone'), api_key=self.api_key,
+            model=settings.model, timeout=settings.request_timeout,
+            http_client=http_client)
+
+    def probe_once(self, model, reserve_request=None, note_dispatch=None):
+        """Send one native protocol request for a caller-owned ledger row."""
+        settings = get_systemone_settings(self.provider, self.credential_slot, model)
+        transport = self._make_transport(settings, self._get_http_client(settings.request_timeout))
+        deadline_at = time.monotonic() + settings.request_deadline_seconds
+        check = self._admission_check(run_context.current_llm_dispatch_context())
+        with operation_admission(
+                transport.url, self.api_key, settings.max_concurrent_operations,
+                deadline_at=deadline_at, check=check):
+            self._check_circuit_breaker()
+            dispatch_response = None
+            attempts = []
+
+            def fetcher(payload, **kwargs):
+                nonlocal dispatch_response
+                attempt_id = reserve_request(payload) if reserve_request else None
+                started = time.monotonic()
+                dispatched = False
+
+                def on_dispatch():
+                    nonlocal dispatched
+                    check(False)
+                    if note_dispatch is not None and attempt_id is not None:
+                        note_dispatch(attempt_id)
+                    check(False)
+                    dispatched = True
+
+                try:
+                    body, dispatch_response = transport.probe_once(
+                        payload, deadline_at=deadline_at, validate=kwargs.get('validate'),
+                        on_dispatch=on_dispatch)
+                except Exception as error:
+                    latency = round((time.monotonic() - started) * 1000)
+                    response = getattr(error, 'usage_response', None)
+                    if not dispatched:
+                        response = DispatchResponse(usage={}, actual_dispatch_count=0)
+                    if getattr(response, 'actual_dispatch_count', 1) == 0:
+                        latency = None
+                    attempts.append((attempt_id, response, latency))
+                    raise
+                attempts.append((attempt_id, dispatch_response,
+                                 dispatch_response.dispatch_latency_ms))
+                return body
+
+            try:
+                result = jev_ask(
+                    [{'sid': 0, 'text': 'Connection test.'}], model=settings.model,
+                    guidance=SYSTEMONE_GUIDANCE, enter=settings.detection_enter,
+                    stay=settings.detection_stay, fetcher=fetcher,
+                    request_kind='probe', window_label='connection_probe',
+                    deadline_at=deadline_at,
+                )
+            except Exception as error:
+                error.usage_response = dispatch_response or getattr(
+                    error, 'usage_response', None)
+                error.systemone_probe_attempts = attempts
+                metadata = run_context.current_llm_dispatch_context()
+                metadata_cancel = metadata.get('cancel_exceptions', ()) if metadata else ()
+                if isinstance(error, ReviewInconclusiveError):
+                    self._record_circuit_breaker(success=True)
+                elif (is_rate_limit_error(error) or isinstance(error, ProviderAccountChangedError)
+                      or not attempts or not any(getattr(row[1], 'actual_dispatch_count', 1) for row in attempts)
+                      or (metadata_cancel and isinstance(error, metadata_cancel))):
+                    self._release_circuit_breaker_probe()
+                else:
+                    self._record_circuit_breaker(success=False, error=error)
+                raise
+            self._record_circuit_breaker(success=True)
+            return {'result': result, 'attempts': attempts}
+
+    def get_provider_name(self):
+        return 'TypeSafe (Jev)' if self.provider == PROVIDER_TYPESAFE else 'System One compatible'
 
 
 class AnthropicClient(LLMClient):
@@ -890,19 +1156,14 @@ class AnthropicClient(LLMClient):
         self._check_circuit_breaker()
         self._ensure_client()
 
-        # Anthropic doesn't support response_format natively; inject JSON
-        # instructions into the system prompt when requested. A 'json_schema'
-        # request forces a tool call below instead; the two are mutually exclusive.
+        # Anthropic uses prompt instructions for json_object and tools for json_schema.
         effective_system = system
         if response_format and response_format.get('type') == 'json_object':
             if '<output_format>' not in system:
                 effective_system = system + _JSON_FORMAT_SYSTEM_INSTRUCTION
                 logger.debug("Added JSON format instructions to system prompt")
 
-        # 'json_schema' forces a tool call so the Messages API validates the
-        # response against the tool's input_schema (gated by
-        # llm_capabilities.supports_json_schema): a real guarantee instead of
-        # prompt-injected instructions the model can ignore.
+        # Structured responses use tools, with strict auto choice when required.
         tool_spec = None
         if response_format and response_format.get('type') == 'json_schema':
             schema_cfg = response_format.get('json_schema') or {}
@@ -910,7 +1171,8 @@ class AnthropicClient(LLMClient):
                 "name": schema_cfg.get('name', 'structured_output'),
                 "description": schema_cfg.get(
                     'description', 'Return the structured result.'),
-                "input_schema": schema_cfg.get('schema', {"type": "object"}),
+                "input_schema": copy.deepcopy(
+                    schema_cfg.get('schema', {"type": "object"})),
             }
 
         # If a previous call in this pass already tripped the fallback flag,
@@ -918,6 +1180,23 @@ class AnthropicClient(LLMClient):
         eff_max, eff_temp, eff_reasoning, started_in_fallback = _apply_pass_fallback(
             episode_id, pass_name, max_tokens, temperature, reasoning_effort
         )
+
+        structured_tool_auto = tool_spec is not None and (
+            not anthropic_model_supports_forced_tools(model)
+            or translate_reasoning_effort(
+                PROVIDER_ANTHROPIC, eff_reasoning, model).get('thinking', {}).get('type')
+            == 'enabled'
+        )
+        if structured_tool_auto:
+            effective_system += _STRUCTURED_TOOL_SYSTEM_INSTRUCTION
+
+        system_blocks = None
+        if effective_system:
+            system_blocks = [{
+                "type": "text",
+                "text": effective_system,
+                "cache_control": {"type": "ephemeral", "ttl": "5m"},
+            }]
 
         # Operator override (settings.omit_temperature) takes priority over
         # the static list / learned memo; see model_omits_temperature().
@@ -930,7 +1209,7 @@ class AnthropicClient(LLMClient):
             kw = dict(
                 model=model,
                 max_tokens=tok,
-                system=effective_system,
+                system=system_blocks if system_blocks is not None else "",
                 messages=messages,
                 timeout=timeout,
             )
@@ -942,10 +1221,26 @@ class AnthropicClient(LLMClient):
             # 400 for no-sampling models is unchanged.
             if not model_omits_temperature(model, omit_temp_override):
                 kw["extra_body"] = {"temperature": tmp}
-            kw.update(translate_reasoning_effort(PROVIDER_ANTHROPIC, reasoning))
+            reasoning_kwargs = translate_reasoning_effort(
+                PROVIDER_ANTHROPIC, reasoning, model)
+            kw.update(reasoning_kwargs)
             if tool_spec is not None:
-                kw["tools"] = [tool_spec]
-                kw["tool_choice"] = {"type": "tool", "name": tool_spec["name"]}
+                use_auto = (
+                    not anthropic_model_supports_forced_tools(model)
+                    or reasoning_kwargs.get('thinking', {}).get('type') == 'enabled'
+                )
+                active_tool = tool_spec
+                if use_auto:
+                    active_tool = {
+                        **tool_spec,
+                        "input_schema": _strict_anthropic_schema(tool_spec["input_schema"]),
+                        "strict": True,
+                    }
+                kw["tools"] = [active_tool]
+                kw["tool_choice"] = (
+                    {"type": "auto"} if use_auto
+                    else {"type": "tool", "name": tool_spec["name"]}
+                )
             # 429 is throttling, not a provider failure; 4xx tunable rejections
             # also skip the breaker because the _send_with_fallback wrapper is
             # about to retry. Both are handled in the wrapper.
@@ -968,12 +1263,12 @@ class AnthropicClient(LLMClient):
             for block in blocks
         )
         if tool_spec is not None:
-            # Forced tool_choice guarantees exactly one tool_use block; its
-            # `input` is the schema-validated answer. Re-serialize to JSON
-            # text since downstream parsing expects a JSON string.
+            # Only the requested object is a valid structured response.
             content = ""
             for block in blocks:
-                if getattr(block, 'type', None) == 'tool_use':
+                if (getattr(block, 'type', None) == 'tool_use'
+                        and getattr(block, 'name', None) == tool_spec['name']
+                        and isinstance(getattr(block, 'input', None), dict)):
                     content = json.dumps(block.input)
                     break
         else:
@@ -992,8 +1287,9 @@ class AnthropicClient(LLMClient):
 
         usage = None
         if response.usage:
+            input_tokens = response.usage.input_tokens
             usage = {
-                'input_tokens': response.usage.input_tokens,
+                'input_tokens': input_tokens,
                 'output_tokens': response.usage.output_tokens
             }
             cache_write = _numeric_usage_value(
@@ -1004,6 +1300,9 @@ class AnthropicClient(LLMClient):
                 usage['cache_write_tokens'] = cache_write
             if cache_read is not None:
                 usage['cache_read_tokens'] = cache_read
+            if cache_write is not None or cache_read is not None:
+                raw_input = _numeric_usage_value(input_tokens)
+                usage['input_tokens'] = (raw_input or 0) + (cache_write or 0) + (cache_read or 0)
 
         llm_response = LLMResponse(
             content=content,
@@ -1771,26 +2070,40 @@ class OllamaNativeClient(OpenAICompatibleClient):
 # Provider-aware timeout / retry helpers
 # =============================================================================
 
-def get_llm_timeout() -> float:
-    """Return the LLM request timeout based on the configured provider.
-
-    Non-Anthropic providers (except OpenRouter, which is a fast cloud API)
-    get a longer timeout since inference may be on-device or routed through
-    a wrapper and significantly slower than the direct Anthropic API.
-    """
-    provider = get_effective_provider()
-    if provider in (PROVIDER_ANTHROPIC, PROVIDER_OPENROUTER):
-        return LLM_TIMEOUT_DEFAULT
-    return LLM_TIMEOUT_LOCAL
+_RETRY_KEYS = {'primary': 'llm_max_retries', 'secondary': 'secondary_llm_max_retries',
+               'failover': 'failover_llm_max_retries'}
 
 
-def get_llm_max_retries() -> int:
-    """Return the max retry count based on the configured provider.
+def _slot_int_setting(key: str) -> int | None:
+    raw = _get_cached_setting(key)
+    try:
+        return int(raw) if raw not in (None, '') else None
+    except (TypeError, ValueError):
+        return None
 
-    Non-Anthropic providers (except OpenRouter) use fewer retries since
-    each attempt may be slower than the direct Anthropic API.
-    """
-    provider = get_effective_provider()
+
+def llm_retries_disabled(credential_slot: str = 'primary') -> bool:
+    """True when the slot's max retries is explicitly 0 (fail fast, no per-window rungs)."""
+    return _slot_int_setting(_RETRY_KEYS.get(credential_slot, 'llm_max_retries')) == 0
+
+
+def get_llm_timeout(provider_key: str | None = None, credential_slot: str = 'primary') -> float:
+    """Per-slot request timeout; blank falls back to the provider-type default."""
+    provider = provider_key or get_effective_provider()
+    key = {'primary': 'llm_timeout_seconds',
+           'secondary': 'secondary_llm_timeout_seconds',
+           'failover': 'failover_llm_timeout_seconds'}.get(
+               credential_slot, 'llm_timeout_seconds')
+    return get_llm_timeout_from_snapshot(
+        provider, credential_slot, {key: _get_cached_setting(key)})
+
+
+def get_llm_max_retries(provider_key: str | None = None, credential_slot: str = 'primary') -> int:
+    """Per-slot max retries; blank falls back to the provider-type default."""
+    configured = _slot_int_setting(_RETRY_KEYS.get(credential_slot, 'llm_max_retries'))
+    if configured is not None:
+        return configured
+    provider = provider_key or get_effective_provider()
     if provider in (PROVIDER_ANTHROPIC, PROVIDER_OPENROUTER):
         return LLM_RETRY_MAX_RETRIES
     return LLM_RETRY_MAX_RETRIES_LOCAL
@@ -1801,6 +2114,7 @@ def get_llm_max_retries() -> int:
 # =============================================================================
 
 _client_lock = threading.Lock()
+_UNSET_API_KEY = object()
 
 # Cache of built clients keyed by (provider_key, normalized_base,
 # credential_slot). Multiple providers can be active concurrently (per-phase
@@ -1849,6 +2163,15 @@ def _resolve_cache_key(provider_key: str, base_url: str | None = None,
         return (provider_key, None, credential_slot)
     if provider_key == PROVIDER_OPENROUTER:
         return (provider_key, base_url or OPENROUTER_BASE_URL, credential_slot)
+    if provider_key == PROVIDER_TYPESAFE:
+        return (provider_key, TYPESAFE_BASE_URL, credential_slot)
+    if provider_key == PROVIDER_SYSTEMONE_COMPATIBLE:
+        if credential_slot == 'secondary':
+            raw = base_url or _get_cached_setting('secondary_provider_base_url') or ''
+        else:
+            raw = (base_url or _get_cached_setting('systemone_base_url')
+                   or os.getenv('SYSTEMONE_BASE_URL') or '')
+        return (provider_key, raw.rstrip('/'), credential_slot)
     if provider_key in PROVIDERS_NON_ANTHROPIC:
         raw = base_url or get_effective_base_url()
         return (provider_key, _normalize_base_url_for_provider(provider_key, raw), credential_slot)
@@ -2010,28 +2333,44 @@ def _opencode_headers(base_url: str) -> dict[str, str]:
 
 
 def _build_client(provider: str, base_url: str | None = None,
-                   credential_slot: str = 'primary') -> LLMClient | None:
-    """Build an LLM client for a given provider without caching.
+                   credential_slot: str = 'primary',
+                   api_key_override=_UNSET_API_KEY) -> LLMClient | None:
+    """Build an uncached client; secondary and standby credentials never fall back to primary."""
+    def slot_key(primary_getter):
+        if credential_slot == 'secondary':
+            return get_effective_secondary_provider_api_key()
+        if credential_slot == 'failover':
+            return get_effective_failover_llm_api_key()
+        return primary_getter()
 
-    ``base_url`` overrides the DB/env-derived endpoint for non-Anthropic
-    providers (used by per-provider routing); when omitted, the effective
-    setting is used as before. ``credential_slot`` picks which secret to
-    resolve: 'primary' (default) reads the provider type's own key;
-    'secondary' reads secondary_provider_api_key instead, so a secondary
-    slot of the same type as primary never reuses primary's credential. An
-    unset secondary key builds with no/empty key (matching the keyless-local
-    path below) rather than falling back to the primary secret; the auth
-    error then surfaces at call time, not here.
-    """
-    secondary = credential_slot == 'secondary'
     if provider == PROVIDER_ANTHROPIC:
         client = AnthropicClient()
-        if secondary:
-            client.api_key = get_effective_secondary_provider_api_key()
+        if credential_slot != 'primary':
+            client.api_key = slot_key(lambda: client.api_key)
         return client
+    elif provider in SYSTEMONE_PROVIDERS:
+        if api_key_override is not _UNSET_API_KEY:
+            api_key = api_key_override
+        elif credential_slot in ('secondary', 'failover'):
+            api_key = slot_key(lambda: None)
+        else:
+            api_key = get_effective_systemone_api_key(provider)
+        if provider == PROVIDER_TYPESAFE:
+            if not api_key:
+                raise ValueError("TypeSafe requires an API key for the selected credential slot")
+            endpoint = TYPESAFE_BASE_URL
+        else:
+            if credential_slot == 'secondary':
+                endpoint = (base_url or _get_cached_setting(
+                    'secondary_provider_base_url') or '').rstrip('/')
+            else:
+                endpoint = (base_url or _get_cached_setting('systemone_base_url')
+                            or os.getenv('SYSTEMONE_BASE_URL') or '').rstrip('/')
+        if provider == PROVIDER_SYSTEMONE_COMPATIBLE and not endpoint:
+            raise ValueError('System One compatible requires a base URL for the selected credential slot')
+        return SystemOneClient(provider, base_url=endpoint, api_key=api_key)
     elif provider == PROVIDER_OPENROUTER:
-        api_key = (get_effective_secondary_provider_api_key() if secondary
-                   else get_effective_openrouter_api_key()) or 'not-needed'
+        api_key = slot_key(get_effective_openrouter_api_key) or 'not-needed'
         return OpenAICompatibleClient(
             base_url=base_url or OPENROUTER_BASE_URL,
             api_key=api_key,
@@ -2046,8 +2385,7 @@ def _build_client(provider: str, base_url: str | None = None,
         if provider == PROVIDER_OLLAMA:
             if normalized_base_url != raw_base_url:
                 logger.info(f"Ollama provider: normalized base_url to {safe_url_for_log(normalized_base_url)}")
-            api_key = (get_effective_secondary_provider_api_key() if secondary
-                       else get_effective_ollama_api_key()) or 'not-needed'
+            api_key = slot_key(get_effective_ollama_api_key) or 'not-needed'
             ollama_num_ctx = get_effective_ollama_num_ctx()
             if ollama_num_ctx:
                 logger.info(f"Ollama provider: num_ctx={ollama_num_ctx}, using native /api/chat")
@@ -2056,8 +2394,7 @@ def _build_client(provider: str, base_url: str | None = None,
                     extra_headers=_opencode_headers(normalized_base_url),
                     ollama_num_ctx=ollama_num_ctx)
         else:
-            api_key = (get_effective_secondary_provider_api_key() if secondary
-                       else get_effective_openai_api_key()) or 'not-needed'
+            api_key = slot_key(get_effective_openai_api_key) or 'not-needed'
         return OpenAICompatibleClient(base_url=normalized_base_url, api_key=api_key,
                                       extra_headers=_opencode_headers(normalized_base_url))
     return None
@@ -2065,6 +2402,7 @@ def _build_client(provider: str, base_url: str | None = None,
 
 def create_client_for_provider(
     provider: str, credential_slot: str = 'primary', base_url: str | None = None,
+    api_key_override=_UNSET_API_KEY,
 ) -> LLMClient | None:
     """Create a non-cached LLM client for a specific provider.
 
@@ -2077,7 +2415,9 @@ def create_client_for_provider(
     slot's own configurable endpoint.
     """
     try:
-        client = _build_client(provider, base_url=base_url, credential_slot=credential_slot)
+        client = _build_client(
+            provider, base_url=base_url, credential_slot=credential_slot,
+            api_key_override=api_key_override)
         if client is None:
             logger.warning(f"Unknown provider '{provider}' for preview client")
         else:
@@ -2250,7 +2590,7 @@ def is_retryable_error(error: Exception) -> bool:
             return True
         # Check for specific status codes in generic APIError
         if isinstance(error, a.APIError):
-            if _provider_status_code(error) in (429, 500, 502, 503, 529):
+            if _provider_status_code(error) in (408, 429, 500, 502, 503, 529):
                 return True
             return False  # Non-retryable Anthropic error -- don't fall to string matching
 
@@ -2260,7 +2600,7 @@ def is_retryable_error(error: Exception) -> bool:
         if isinstance(error, (o.APIConnectionError, o.RateLimitError, o.InternalServerError)):
             return True
         if isinstance(error, o.APIError):
-            if _provider_status_code(error) in (429, 500, 502, 503, 529):
+            if _provider_status_code(error) in (408, 429, 500, 502, 503, 529):
                 return True
             return False  # Non-retryable OpenAI error
 
@@ -2300,47 +2640,25 @@ def is_connectivity_error(error: Exception) -> bool:
         # APITimeoutError subclasses APIConnectionError in both SDKs.
         if isinstance(error, (a.APIConnectionError, a.InternalServerError)):
             return True
-        if isinstance(error, a.APIError) and _provider_status_code(error) in (500, 502, 503, 504, 529):
+        if isinstance(error, a.APIError) and _provider_status_code(error) in (408, 500, 502, 503, 504, 529):
             return True
     o = _openai_exc()
     if o is not None:
         if isinstance(error, (o.APIConnectionError, o.InternalServerError)):
             return True
-        if isinstance(error, o.APIError) and _provider_status_code(error) in (500, 502, 503, 504, 529):
+        if isinstance(error, o.APIError) and _provider_status_code(error) in (408, 500, 502, 503, 504, 529):
             return True
     return False
 
 
-def check_llm_connectivity(timeout: float = 5.0) -> bool:
-    """Availability probe for the offline queue re-drive (#482).
-
-    OpenRouter and OpenAI-compatible providers reuse the startup verification
-    (an endpoint /models probe). Anthropic gets a real network probe here:
-    verify_llm_connection only checks key presence for it, which would report
-    "reachable" during a genuine outage and thrash the re-drive loop. Any HTTP
-    response below 500 proves the endpoint is up. On success the LLM circuit
-    breaker resets so re-queued episodes are not immediately rejected by a
-    breaker that opened while the service was down.
-    """
-    try:
-        if get_effective_provider() == PROVIDER_ANTHROPIC:
-            api_key = get_api_key()
-            if not api_key:
-                return False
-            response = requests.get(
-                'https://api.anthropic.com/v1/models',
-                headers={'x-api-key': api_key, 'anthropic-version': '2023-06-01'},
-                timeout=timeout,
-            )
-            reachable = response.status_code < 500
-        else:
-            reachable = verify_llm_connection()
-    except Exception as e:
-        logger.debug(f"LLM connectivity probe failed: {e}")
+def is_failover_trigger_error(error: Exception) -> bool:
+    """True for outages, auth rejections, missing models and exhausted credit. Never a 429 or daily quota."""
+    if isinstance(error, (ProviderRequestRejectedError, StructuralRateLimitError)):
         return False
-    if reachable:
-        _get_circuit_breaker_for_provider(get_effective_provider()).reset()
-    return reachable
+    if is_rate_limit_error(error):
+        return False
+    return (is_connectivity_error(error) or is_auth_error(error)
+            or is_not_found_error(error) or is_limit_exceeded_error(error))
 
 
 def is_llm_api_error(error: Exception) -> bool:

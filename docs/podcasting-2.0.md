@@ -8,7 +8,6 @@
 
 - [The rule](#the-rule)
 - [What MinusPod supports](#what-minuspod-supports)
-- [What MinusPod does not support, and why](#what-minuspod-does-not-support-and-why)
 - [Podping](#podping)
 - [Feed identity](#feed-identity)
 - [Upstream namespace URIs](#upstream-namespace-uris)
@@ -100,9 +99,10 @@ returns 503 with a JIT-triggered processing job behind it.
 
 | Tag | Why it is regenerated |
 |---|---|
-| [`podcast:transcript`](https://podcasting2.org/docs/podcast-namespace/tags/transcript) | MinusPod generates a transcript aligned to the processed audio. An upstream transcript would be offset by the length of every removed ad, and would also point subscribers at the publisher's CDN. |
+| [`podcast:transcript`](https://podcasting2.org/docs/podcast-namespace/tags/transcript) | MinusPod generates a transcript aligned to the processed audio. An upstream transcript would be offset by the length of every removed ad, and would also point subscribers at the publisher's CDN. The upstream tag is still read internally, never served, to diff against MinusPod's own transcript for ad evidence; see [Upstream Transcript Differential](transcript-differential.md). |
 | [`podcast:chapters`](https://podcasting2.org/docs/podcast-namespace/tags/chapters) | MinusPod serves its own chapters JSON because upstream timestamps point into the original, uncut audio. Its contents depend on the effective chapter mode; see "Chapter modes" below. |
 | `itunes:duration` | Recomputed from the processed file's actual length. |
+| `enclosure length` | The processed file's byte size. An unprocessed episode passes through upstream's `length` when declared, omitting the attribute otherwise. |
 
 ### Chapter modes
 
@@ -111,23 +111,26 @@ Settings > Transcripts & Chapters sets the chapter mode: **Auto** (the default),
 choice; an explicit Feed Settings value overrides it. During normal processing,
 the mode is applied only when Generate Chapters is on.
 
-**Auto** preserves the podcast's own chapters when enough of them survive
-the cut, checking two sources before falling back to generation. The
-ffmpeg cut step already remaps any embedded ID3 chapter markers onto the
-cut audio's timeline, so once an episode is processed MinusPod first
-probes the finished file for what made it through. When at least two
-survive, they become the served `podcast:chapters` JSON: the publisher's
-own titles and boundaries, shifted to account for the removed ads.
+Encrypted, compressed, restricted, or malformed ID3 chapter tags stop processing
+before existing audio and chapter data are replaced.
 
-When fewer than two embedded chapters survive, or the episode has none,
-MinusPod checks whether the feed instead declares its chapters in a
-separate podcast:chapters JSON file, captured at the last feed refresh. If
-it does, MinusPod fetches that file, remaps its timestamps the same way,
-and uses the result when at least two chapters survive. A failed or
+The cut step remaps embedded ID3 chapters and preserves their images and links.
+**Auto** keeps surviving ID3 publisher chapters, including a single chapter.
+When preserving publisher chapters, recuts recover their metadata from the
+retained original and remap it to the new cut timeline.
+
+Chapter images are served locally when their JPEG or PNG data fits the artwork
+size limit. Other embedded image formats remain in the ID3 tags. Local image
+URLs retain the validated feed key supplied with the chapter request.
+
+When usable embedded chapters are unavailable, MinusPod checks whether the feed
+declares its chapters in a separate `podcast:chapters` JSON file, captured at the
+last feed refresh. If it does, MinusPod fetches that file, remaps its timestamps
+the same way, and uses the result when at least two chapters survive. A failed or
 malformed fetch counts as unknown, not as "no chapters", and it falls
 back to generation rather than losing chapters altogether.
 
-Only when neither source yields enough survivors does MinusPod fall back
+Only when neither source yields usable chapters does MinusPod fall back
 to AI-generated chapters. If the embedded probe itself fails (for example
 a transient ffprobe error), MinusPod treats that as unknown too, and skips
 the chapter step for that run rather than risk overwriting the ID3 frames
@@ -144,9 +147,6 @@ chapters they already have until they are reprocessed.
 Auto is the default because it keeps the publisher's chapters
 whenever they hold up across the cut; replacing accurate publisher
 chapters with generated ones is what prompted issue #560.
-
-## What MinusPod does not support, and why
-
 
 ### Chapters in episode descriptions
 
@@ -165,28 +165,45 @@ or unset to follow the global setting).
 ### Ad chapters
 
 A segment kept in the audio by its category action still sits in the file.
-**Ad chapters** (Settings > Transcripts & Chapters, `adChaptersEnabled`, off by
-default) adds a chapter at the start of each kept break and a resume chapter
-at its end. An app that skips by chapter can then jump past the break.
-Chapters have no end time, which is why the resume chapter exists. When
-a generated chapter already starts within two seconds of the end, that chapter
-is the resume point instead.
+Set a category's segment action to **Mark** (Settings > Segment actions, or
+a feed's own override; see [Configuration > Segment
+categories](configuration.md#segment-categories)) and MinusPod adds a
+chapter at the start of each marked break and a resume chapter at its end,
+so an app that skips by chapter can jump past it. **Keep** leaves the
+segment in the audio but publishes no chapter for it. Chapters have no end
+time, which is why the resume chapter exists. When a generated chapter
+already starts within two seconds of the end, that chapter is the resume
+point instead. A feed whose chapters mode is Off still gets no chapters,
+Mark or not.
 
-Only categories checked under **Chapter these categories** qualify (sponsor and
-cross-promo by default), and a kept segment needs a detection confidence of at
-least **Minimum confidence** (0.9 by default). Turn on **Include segments
-waiting for review** to chapter held segments too. They use the
-waiting-for-review title format, and rejecting one removes its chapter without
-a recut. Confirming one queues a recut, which rebuilds the chapter list when
-it runs.
+A marked segment needs a detection confidence of at least **Minimum
+confidence** (Settings > Transcripts & Chapters, 0.9 by default). Turn on
+**Include segments waiting for review** to chapter held segments too, when
+the category they are held under resolves to Mark on that feed. They use
+the waiting-for-review title format, and rejecting one removes its chapter
+without a recut. Confirming one queues a recut, which rebuilds the chapter
+list when it runs.
 
-Titles come from **Chapter title** (`Ad: {label}` by default), **Title while
-waiting for review** (`Possible ad: {label}`), and **Resume title** (`Show`).
-`{label}` is the category name, such as Sponsor. `{category}` is its id, such
-as `sponsor`, for players that match chapter titles by keyword. Each feed can
-turn ad chapters on or off and pick its own category list from Feed Settings;
-a feed whose chapters mode is Off gets none. Existing episodes are not
-backfilled: use Regenerate Chapters on an episode to add them.
+Titles come from **Chapter title** (`Ad: {label}` by default), **Title
+while waiting for review** (`Possible ad: {label}`), and **Resume title**
+(`Show`). `{label}` is the category name, such as Sponsor. `{category}` is
+its id, such as `sponsor`, for players that match chapter titles by
+keyword. Switching a category between Keep and Mark, globally or on one
+feed, takes effect the next time that feed's chapters are rebuilt:
+Regenerate Chapters on an episode, or Re-render episodes with current
+segment actions on the feed. Existing episodes are not backfilled
+automatically.
+
+The old global ad chapters toggle and the per-category chapter checklist
+are retired; a category's segment action is now the only switch. The
+`adChaptersEnabled` and `adChapterCategories` fields still work on the
+settings and feed APIs, deprecated and translated against the segment
+action map: `adChaptersEnabled` reads true when any category resolves to
+Mark; a `true` entry in `adChapterCategories` sets that category to Mark
+(from Keep or Mark), a `false` entry sets it back to Keep, and setting
+`adChaptersEnabled` to `false` demotes every Mark to Keep (`true` is
+accepted and has no effect). New integrations should set
+`segmentCategoryActions` to `mark` directly.
 
 ### Deliberately stripped
 
@@ -221,6 +238,14 @@ operations in them, and checks each announced feed URL against your
 configured feeds. On a match, MinusPod stamps that feed's "last
 podping" time and triggers an immediate refresh of that one feed,
 instead of waiting for the next scheduled RSS poll.
+
+When Podping is enabled, open **Podping servers** beneath the toggle to
+edit the Hive RPC node list. Add between 1 and 20 HTTP(S) endpoint URLs,
+remove or reorder them, then save. MinusPod
+normalizes and deduplicates the list, and rotates through it for listener
+traffic and health checks. **Reset defaults** restores the shipped node
+list. These RPC endpoints are separate from the observed feed hosts shown
+in System Health.
 
 Which senders count is up to each feed. A feed can name the accounts
 allowed to podping it with `<podcast:hiveAccount account="...">` inside
@@ -343,6 +368,14 @@ does not understand a tag ignores it; the standard RSS and `itunes:`
 elements it relies on are untouched. A basic podcast app sees a normal
 feed and plays the audio. Podcasting 2.0 apps see the additional tags.
 Nothing about this support breaks older clients.
+
+## Example served feed
+
+[docs/examples/served-feed.xml](examples/served-feed.xml) is a sanitized
+excerpt of a real feed served by a MinusPod instance, with the host,
+feed key, and episode identifiers replaced by placeholders. It shows the
+`podcast:guid`, `podcast:locked`, `podcast:funding`, `podcast:txt`,
+`podcast:transcript`, and `podcast:chapters` tags as MinusPod emits them.
 
 ## References
 

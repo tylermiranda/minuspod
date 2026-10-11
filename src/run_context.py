@@ -10,10 +10,29 @@ import time
 from collections import defaultdict
 from contextlib import contextmanager
 
+import llm_route
 from utils.url import url_has_userinfo
 
 _lock = threading.Lock()
 _by_thread: dict[int, 'RunContext'] = {}
+_background_thread_flag = threading.local()
+
+
+def mark_background_thread() -> None:
+    """Flag the calling thread as the background queue processor loop (R2)."""
+    _background_thread_flag.active = True
+
+
+def clear_background_thread() -> None:
+    """Undo mark_background_thread when the loop actually returns (tests
+    call background_queue_processor synchronously on a reused thread)."""
+    _background_thread_flag.active = False
+
+
+def in_background_thread() -> bool:
+    """True only inside the leader's background_queue_processor thread,
+    never in a web request thread, even on the leader process."""
+    return getattr(_background_thread_flag, 'active', False)
 
 
 class TokenAccumulator:
@@ -113,6 +132,7 @@ _FORBIDDEN_ROUTE_KEYS = {'api_key', 'apikey', 'authorization', 'headers', 'secre
 # Ledger attempt the calling thread is dispatching under, so a compatibility
 # retry inside a provider adapter can be counted against it.
 _dispatch = threading.local()
+_llm_call = threading.local()
 
 
 def begin_dispatch(attempt_id: str) -> None:
@@ -130,6 +150,32 @@ def current_dispatch_attempt() -> str | None:
     return getattr(_dispatch, 'attempt_id', None)
 
 
+def begin_llm_dispatch_context(metadata: dict) -> None:
+    """Expose secret-free logical-call metadata to a per-request transport."""
+    _llm_call.metadata = dict(metadata)
+    _llm_call.first_attempt_id = None
+
+
+def current_llm_dispatch_context() -> dict | None:
+    """Current logical-call metadata for a provider transport callback."""
+    return getattr(_llm_call, 'metadata', None)
+
+
+def note_llm_dispatch(attempt_id: str) -> None:
+    """Remember the first request row for the logical-call latency value."""
+    if getattr(_llm_call, 'first_attempt_id', None) is None:
+        _llm_call.first_attempt_id = attempt_id
+
+
+def first_llm_dispatch_attempt() -> str | None:
+    return getattr(_llm_call, 'first_attempt_id', None)
+
+
+def end_llm_dispatch_context() -> None:
+    _llm_call.metadata = None
+    _llm_call.first_attempt_id = None
+
+
 class RunContext:
     def __init__(self, slug: str, episode_id: str, run_id: str | None = None):
         self.slug = slug
@@ -141,8 +187,41 @@ class RunContext:
         self.timing = RunTiming()
         self.timing.add('ffmpeg', 0.0)
         self.route_snapshot = None
+        self.whisper_failover_used = False
+        self._llm_failover_used = set()
+        self._failover_usage_lock = threading.Lock()
+        self._failover_account_id = None
+        self.llm_cancel_check = lambda: None
+        self.llm_cancel_exceptions = ()
         self._thinking_notices = {}
         self._thinking_notice_lock = threading.Lock()
+
+    def note_llm_failover(self, phase: str, invoking_pass: int | None, original_slot: str | None = None) -> None:
+        route = (self.route_snapshot or {}).get(phase, {})
+        if phase == 'review' and route.get('gate', {}).get('review_provider') in (None, '', 'same_as_pass'):
+            phase = 'verification' if invoking_pass == 2 else 'detection'
+            route = (self.route_snapshot or {}).get(phase, {})
+        slot = route.get('credential_slot') or original_slot
+        if slot in ('primary', 'secondary'):
+            with self._failover_usage_lock:
+                self._llm_failover_used.add(slot)
+
+    def pin_failover_account(self, account_id: str | None) -> str | None:
+        """First standby account this run resolved; later routes compare against it."""
+        with self._failover_usage_lock:
+            if self._failover_account_id is None:
+                self._failover_account_id = account_id
+            return self._failover_account_id
+
+    def note_whisper_failover(self) -> None:
+        with self._failover_usage_lock:
+            self.whisper_failover_used = True
+
+    def failover_usage(self) -> dict | None:
+        with self._failover_usage_lock:
+            if self._llm_failover_used or self.whisper_failover_used:
+                return {'llm': sorted(self._llm_failover_used), 'whisper': self.whisper_failover_used}
+        return None
 
     def set_route_snapshot(self, snapshot: dict) -> None:
         """Store the non-secret per-phase route for this run. Rejects credential
@@ -209,13 +288,19 @@ def record_ffmpeg_elapsed(seconds: float) -> None:
         ctx.timing.add('ffmpeg', seconds)
 
 
-def route_for_phase(phase: str) -> dict | None:
-    """This thread's run route for `phase` ({provider_key, configured_model}),
-    or None outside a run or before the snapshot is resolved."""
+def route_for_phase(phase: str, *, apply_live_failover: bool = True) -> dict | None:
+    """Return the run phase route with an optional live standby override."""
     ctx = current()
     if ctx is None or not ctx.route_snapshot:
         return None
-    return ctx.route_snapshot.get(phase)
+    route = ctx.route_snapshot.get(phase)
+    if route is None or not apply_live_failover or route.get('credential_slot') == 'failover':
+        return route
+    overridden = llm_route.apply_failover_dict({**route, 'phase': phase})
+    if overridden.get('credential_slot') != 'failover':
+        return route  # not overridden: return the stored entry unchanged
+    overridden.pop('phase', None)
+    return overridden
 
 
 def run_in_worker_thread(fn):
@@ -240,3 +325,20 @@ def run_in_worker_thread(fn):
                 if _by_thread.get(ident) is ctx:
                     del _by_thread[ident]
     return bound
+
+
+_cleanup_review = threading.local()
+
+
+@contextmanager
+def cleanup_review(run_id, pattern_id):
+    previous = getattr(_cleanup_review, 'attribution', None)
+    _cleanup_review.attribution = {'cleanup_run_id': run_id, 'cleanup_pattern_id': pattern_id}
+    try:
+        yield
+    finally:
+        _cleanup_review.attribution = previous
+
+
+def current_cleanup_review():
+    return getattr(_cleanup_review, 'attribution', None) or {}

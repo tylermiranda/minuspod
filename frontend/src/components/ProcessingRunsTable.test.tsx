@@ -158,6 +158,28 @@ describe('ProcessingRunsTable', () => {
     expect(table.getByText('clean')).toBeTruthy();
   });
 
+  it('labels chapter regeneration runs without exposing the raw mode', () => {
+    const chapterRun = { ...statsRun, stats: { ...statsRun.stats!, mode: 'chapters' } };
+    const table = renderTable([chapterRun]);
+    expect(table.getByText('(Chapter regeneration)')).toBeTruthy();
+    expect(table.queryByText('(chapters)')).toBeNull();
+    const row = table.getByText('(Chapter regeneration)').closest('tr');
+    expect(row?.querySelectorAll('td')[8].textContent).toBe('-');
+  });
+
+  it('marks non-chapter timing stages as not applicable for chapter regeneration', () => {
+    const chapterRun: EpisodeProcessingRun = {
+      ...statsRun,
+      runNumber: 9,
+      stats: { mode: 'chapters', timings: { chaptersSeconds: 12, ffmpegSeconds: 2 } },
+    };
+    const table = renderTable([chapterRun]);
+    fireEvent.click(table.getByRole('button', { name: /show phase breakdown for run #9/i }));
+    expect(table.getByText('Detection').nextSibling?.textContent).toBe('Not applicable');
+    expect(table.getByText('Chapters').nextSibling?.textContent).toBe('0:12');
+    expect(table.getByText('FFmpeg').nextSibling?.textContent).toBe('0:02');
+  });
+
   it('shows the source time cut next to the net time when beeps were inserted', () => {
     const beepRun = {
       ...statsRun,
@@ -171,8 +193,8 @@ describe('ProcessingRunsTable', () => {
     const table = renderTable([legacyRun]);
     expect(table.getByText('#1')).toBeTruthy();
     expect(table.getByText('1 cut')).toBeTruthy();
-    // Downloaded, Windows, Stage hits, Removed, Second scan all dash out.
-    expect(table.getAllByText('-')).toHaveLength(5);
+    // Downloaded, Windows, Stage hits, Transcript diff, Removed, Second scan all dash out.
+    expect(table.getAllByText('-')).toHaveLength(6);
   });
 
   it('shows elapsed stage timings when the run has them', () => {
@@ -180,7 +202,7 @@ describe('ProcessingRunsTable', () => {
     fireEvent.click(table.getByRole('button', { name: /show phase breakdown for run #2/i }));
     expect(table.getByText('Elapsed by stage')).toBeTruthy();
     expect(table.getByText('Elapsed by stage').parentElement?.className).toContain('sm:w-[calc(100cqw-1.5rem)]');
-    expect(table.getByText(/Stage times can overlap/)).toBeTruthy();
+    expect(table.getByText('Stage times may overlap. FFmpeg totals include all tasks and retries.')).toBeTruthy();
     expect(table.getByText('0:42')).toBeTruthy();
     expect(table.getByText('0:12')).toBeTruthy();
     expect(table.getAllByText('Unavailable').length).toBeGreaterThan(0);
@@ -239,6 +261,14 @@ describe('ProcessingRunsTable', () => {
     expect(table.getByText('(no transcript)')).toBeTruthy();
   });
 
+  it('notes which targets ran on failover', () => {
+    const table = renderTable([{
+      ...statsRun,
+      stats: { ...statsRun.stats, failover: { llm: ['llm-a'], whisper: true } },
+    }]);
+    expect(table.getByText('(ran on failover: Provider A, transcriber)')).toBeTruthy();
+  });
+
   it('notes a large gap between downloaded and declared duration', () => {
     render(<ProcessingRunsTable runs={[statsRun]} rssDuration={2784} />);
     expect(screen.getByText(/longer\s+than the duration the feed declares/)).toBeTruthy();
@@ -289,6 +319,42 @@ describe('ProcessingRunsTable: phase breakdown', () => {
   });
 });
 
+describe('ProcessingRunsTable: transcript diff', () => {
+  const withDiff = (transcriptDiff: NonNullable<EpisodeProcessingRun['stats']>['transcriptDiff']) => ({
+    ...statsRun,
+    stats: {
+      ...statsRun.stats!,
+      stageHits: { ...statsRun.stats!.stageHits!, transcriptDifferential: 2 },
+      timings: { ...statsRun.stats!.timings, transcriptDiffSeconds: 3 },
+      transcriptDiff,
+    },
+  });
+
+  it('counts transcript hits in the stage hits column', () => {
+    const table = renderTable([withDiff({ status: 'ok', coverage: 0.93, spans: 2 })]);
+    expect(table.getByText('0 fingerprint / 3 text / 11 cross-fetch / 2 transcript / 11 LLM')).toBeTruthy();
+  });
+
+  it.each([
+    [{ status: 'ok', coverage: 0.934, spans: 2 }, '2 gaps (93% match)'],
+    [{ status: 'ok', coverage: 0.97, spans: 1 }, '1 gap (97% match)'],
+    [{ status: 'unreliable', coverage: 0.31, spans: 0 }, 'unreliable (31% match)'],
+    [{ status: 'error', coverage: null, spans: 0 }, 'failed'],
+    [{ status: 'none', coverage: null, spans: 0 }, '-'],
+  ] as const)('renders %o as %s', (diff, text) => {
+    const { container } = render(<ProcessingRunsTable runs={[withDiff({ ...diff })]} />);
+    const headers = [...container.querySelectorAll('thead th')].map((h) => h.textContent);
+    const cells = container.querySelectorAll('tbody tr:first-child td');
+    expect(cells[headers.indexOf('Transcript diff')].textContent).toBe(text);
+  });
+
+  it('lists the transcript diff timing', () => {
+    const table = renderTable([withDiff({ status: 'ok', coverage: 0.9, spans: 0 })]);
+    fireEvent.click(table.getByRole('button', { name: /show phase breakdown for run #2/i }));
+    expect(table.getByText('Transcript diff', { selector: 'dt' }).nextSibling?.textContent).toBe('0:03');
+  });
+});
+
 describe('ProcessingRunsTable: incomplete run cost', () => {
   it('labels the run total as known spend when a phase has no recorded cost', () => {
     const table = renderTable([retryPhaseRun]);
@@ -312,7 +378,7 @@ describe('ProcessingRunsTable: wide-table layout', () => {
 
   it('drops the low-priority columns below lg', () => {
     const table = renderTable([statsRun]);
-    for (const label of ['Downloaded', 'Windows', 'Stage hits', 'Second scan']) {
+    for (const label of ['Downloaded', 'Windows', 'Stage hits', 'Transcript diff', 'Second scan']) {
       expect(table.getByRole('columnheader', { name: label }).className).toContain('hidden lg:table-cell');
     }
     expect(table.getByRole('columnheader', { name: 'Cost' }).className).not.toContain('hidden');
@@ -352,5 +418,37 @@ describe('failed run error disclosure', () => {
     render(<ProcessingRunsTable runs={[{ ...failedRun, errorMessage: null }]} />);
     expect(screen.queryByRole('button', { name: /failed/i })).toBeNull();
     expect(screen.getAllByText('failed').length).toBeGreaterThan(0);
+  });
+});
+
+describe('chapter degradation result', () => {
+  it('warns for a completed fallback in the desktop table and mobile card', () => {
+    const degradedRun: EpisodeProcessingRun = {
+      ...statsRun,
+      stats: {
+        ...statsRun.stats!,
+        chaptersDegraded: true,
+        chaptersDegradedReason: 'Chapter AI is unavailable. Check Settings > AI Models, then try again.',
+      },
+    };
+    render(<ProcessingRunsTable runs={[degradedRun]} />);
+
+    expect(screen.getAllByText('completed with chapter warning')).toHaveLength(2);
+    expect(screen.getAllByText(degradedRun.stats!.chaptersDegradedReason!)).toHaveLength(2);
+    expect(screen.getAllByText(/regenerate chapters after recovery/i)).toHaveLength(2);
+  });
+
+  it('keeps legacy and failed runs on their existing result labels', () => {
+    render(<ProcessingRunsTable runs={[legacyRun, {
+      ...legacyRun,
+      runNumber: 8,
+      status: 'failed',
+      errorMessage: 'Audio processing failed',
+      stats: { chaptersDegraded: true, chaptersDegradedReason: 'Chapter warning' },
+    }]} />);
+
+    expect(screen.getAllByText('completed')).toHaveLength(2);
+    expect(screen.getAllByRole('button', { name: /failed/i })).toHaveLength(2);
+    expect(screen.queryByText('completed with chapter warning')).toBeNull();
   });
 });

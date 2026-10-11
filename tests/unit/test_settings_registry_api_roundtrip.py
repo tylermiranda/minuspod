@@ -81,10 +81,13 @@ def test_review_provider_round_trips(client):
 def test_ad_chapter_settings_round_trip(client):
     before = client.get(BASE).get_json()
     assert before['adChaptersEnabled']['value'] is False
-    assert before['adChapterCategories']['value']['sponsor'] is True
+    assert before['adChapterCategories']['value']['sponsor'] is False
     assert before['adChapterMinConfidence']['value'] == 0.9
 
+    # recap starts at keep so the adChapterCategories translation (true:
+    # keep -> mark) has something to promote (spec 1.4).
     r = client.put(f'{BASE}/ad-detection', data=json.dumps({
+        'segmentCategoryActions': {'recap': 'keep'},
         'adChaptersEnabled': True,
         'adChapterCategories': {'recap': True},
         'adChaptersIncludeHeld': True,
@@ -98,12 +101,46 @@ def test_ad_chapter_settings_round_trip(client):
     after = client.get(BASE).get_json()
     assert after['adChaptersEnabled']['value'] is True
     assert after['adChapterCategories']['value']['recap'] is True
-    assert after['adChapterCategories']['value']['sponsor'] is True
+    assert after['adChapterCategories']['value']['sponsor'] is False
     assert after['adChaptersIncludeHeld']['value'] is True
     assert after['adChapterTitleFormat']['value'] == 'Ad: {category}'
     assert after['adChapterHeldTitleFormat']['value'] == 'Maybe {category}'
     assert after['adChapterResumeTitle']['value'] == 'Back'
     assert after['adChapterMinConfidence']['value'] == 0.5
+
+
+def test_ad_chapter_categories_false_demotes_mark_leaves_other_actions(client):
+    """{sponsor: false} demotes mark to keep and leaves a remove category alone."""
+    r = client.put(f'{BASE}/ad-detection', data=json.dumps({
+        'segmentCategoryActions': {'sponsor': 'mark', 'cross_promo': 'remove'},
+    }), content_type='application/json')
+    assert r.status_code == 200, r.get_data(as_text=True)
+
+    r = client.put(f'{BASE}/ad-detection', data=json.dumps({
+        'adChapterCategories': {'sponsor': False},
+    }), content_type='application/json')
+    assert r.status_code == 200, r.get_data(as_text=True)
+
+    after = client.get(BASE).get_json()
+    assert after['segmentCategoryActions']['value']['sponsor'] == 'keep'
+    assert after['segmentCategoryActions']['value']['cross_promo'] == 'remove'
+
+
+def test_ad_chapters_enabled_false_demotes_every_mark(client):
+    r = client.put(f'{BASE}/ad-detection', data=json.dumps({
+        'segmentCategoryActions': {'sponsor': 'mark', 'recap': 'mark'},
+    }), content_type='application/json')
+    assert r.status_code == 200, r.get_data(as_text=True)
+
+    r = client.put(f'{BASE}/ad-detection', data=json.dumps({
+        'adChaptersEnabled': False,
+    }), content_type='application/json')
+    assert r.status_code == 200, r.get_data(as_text=True)
+
+    after = client.get(BASE).get_json()
+    assert after['adChaptersEnabled']['value'] is False
+    assert after['segmentCategoryActions']['value']['sponsor'] == 'keep'
+    assert after['segmentCategoryActions']['value']['recap'] == 'keep'
 
 
 @pytest.mark.parametrize('payload', [
@@ -158,7 +195,7 @@ def test_ad_chapter_settings_reject_without_partial_write(client):
     assert put({'adChaptersEnabled': False}).status_code == 200
     assert put({'adChaptersEnabled': True, 'adChapterTitleFormat': '{nope}'}).status_code == 400
     assert enabled() is False
-    assert put({'adChaptersEnabled': 'false'}).status_code == 200
+    assert put({'adChaptersEnabled': 'off'}).status_code == 200
     assert enabled() is False
 
 
@@ -192,3 +229,48 @@ def test_ad_detection_reset_turns_the_splice_veto_back_on(client):
     after = client.get(BASE).get_json()['spliceVetoEnabled']
     assert after['value'] is True
     assert after['isDefault'] is True
+
+
+@pytest.mark.parametrize('field,key,default', [
+    ('audioReplacementSoundEnabled', 'audio_replacement_sound_enabled', True),
+    ('audioMp3StreamCopyEnabled', 'audio_mp3_stream_copy_enabled', False),
+])
+def test_audio_output_explicit_choice_and_null_reset(client, preserve_setting, field, key, default):
+    preserve_setting(key)
+    response = client.put(f'{BASE}/ad-detection', json={field: not default})
+    assert response.status_code == 200
+    assert client.get(BASE).get_json()[field] == {'value': not default, 'isDefault': False}
+    response = client.put(f'{BASE}/ad-detection', json={field: None})
+    assert response.status_code == 200
+    assert client.get(BASE).get_json()[field] == {'value': default, 'isDefault': True}
+
+
+@pytest.mark.parametrize('field', ['audioReplacementSoundEnabled', 'audioMp3StreamCopyEnabled'])
+@pytest.mark.parametrize('invalid', ['false', 0, [], {}])
+def test_audio_output_invalid_value_is_atomic(client, preserve_setting, field, invalid):
+    preserve_setting('audio_bitrate')
+    before = client.get(BASE).get_json()['audioBitrate']
+    response = client.put(f'{BASE}/ad-detection', json={'audioBitrate': '256k', field: invalid})
+    assert response.status_code == 400
+    assert field in response.get_json()['error']
+    assert client.get(BASE).get_json()['audioBitrate'] == before
+
+
+@pytest.mark.parametrize('feed_type', ['subscribed', 'local'])
+def test_audio_feed_api_null_inherits_and_false_is_retained(client, temp_db, feed_type):
+    source = 'local://example-feed' if feed_type == 'local' else 'https://example.com/feed.xml'
+    temp_db.create_podcast('example-feed', source, feed_type=feed_type)
+    route = '/api/v1/feeds/example-feed'
+    response = client.patch(route, json={'audioReplacementSoundOverride': False, 'audioMp3StreamCopyOverride': True})
+    assert response.status_code == 200
+    body = client.get(route).get_json()
+    assert body['audioReplacementSoundOverride'] is False
+    assert body['audioMp3StreamCopyOverride'] is True
+    invalid = client.patch(route, json={'audioReplacementSoundOverride': 'false', 'audioMp3StreamCopyOverride': False})
+    assert invalid.status_code == 400
+    assert temp_db.resolve_audio_output('example-feed')['mp3_stream_copy_enabled'] is True
+    response = client.patch(route, json={'audioReplacementSoundOverride': None, 'audioMp3StreamCopyOverride': None})
+    assert response.status_code == 200
+    assert temp_db.resolve_audio_output('example-feed') == {
+        'replacement_sound_enabled': True, 'mp3_stream_copy_enabled': False,
+    }

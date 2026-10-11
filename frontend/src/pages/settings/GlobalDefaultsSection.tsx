@@ -4,6 +4,7 @@ import { LOW_AD_YIELD_ACTION_LABELS } from '../../utils/lowAdYield';
 import type { EpisodeLogLevel, LowAdYieldAction } from '../../api/types';
 import NumberInput from '../../components/NumberInput';
 import ToggleSwitch from '../../components/ToggleSwitch';
+import PodpingServersSection from './PodpingServersSection';
 
 interface GlobalDefaultsSectionProps {
   autoProcessEnabled: boolean;
@@ -143,8 +144,17 @@ function GlobalDefaultsSection({
             </span>
           </label>
           <p className="mt-2 text-sm text-muted-foreground">
-            Listen for Podping publish notifications and refresh a feed as soon as its host announces a new episode. Only some hosts send Podping; feeds keep refreshing on the normal schedule either way.
+            Refresh when a supported host announces an episode. Regular refreshes still run.
           </p>
+          <div hidden={!podpingEnabled}>
+            <CollapsibleSection
+              title="Podping servers"
+              defaultOpen
+              variant="subsection"
+            >
+              <PodpingServersSection enabled={podpingEnabled} />
+            </CollapsibleSection>
+          </div>
         </div>
 
         {/* Max feed episodes */}
@@ -267,7 +277,7 @@ function GlobalDefaultsSection({
             </span>
           </label>
           <p className="mt-2 text-sm text-muted-foreground">
-            Tells the ad detector which wording repeats across a show's recent episodes, as a hint for intros, credits, and other boilerplate. A hint only; nothing is cut from text matches alone. Experimental; off by default.
+            Experimental detection hints from repeated wording. Text matches alone never cut audio.
           </p>
         </div>
       </div>

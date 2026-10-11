@@ -31,15 +31,18 @@ dispatcher's blanket pause and the tick's cleanup react to any active
 hold, legacy or provider-scoped, as a unit.
 """
 import logging
+import time
 from datetime import timedelta
 
-from config import coerce_bool_setting, get_env_backed_int
+from config import coerce_bool_setting
 from database.settings import registry_current_value, registry_default
 from llm_client import (
     extract_retry_after, get_client_for_provider, get_effective_provider,
     is_rate_limit_error,
 )
-from llm_route import resolve_route
+from llm_route import ALL_CREDENTIAL_SLOTS, resolve_route
+from provider_budget import manual_rate_limit_caps, request_token_estimate
+from provider_probe import finalize_probe_success
 import run_context
 from utils.safe_http import safe_get, URLTrust
 from utils.time import ISO_FORMAT, epoch_to_iso, parse_iso_utc, utc_now, utc_now_iso
@@ -271,7 +274,7 @@ def active_held_pairs(db) -> set[tuple[str, str]]:
         if not hold_is_active(get_hold_until(db, suffix)):
             continue
         provider, _, slot = suffix.rpartition(':')
-        if slot not in ('primary', 'secondary'):
+        if slot not in ALL_CREDENTIAL_SLOTS:
             provider, slot = suffix, 'primary'
         pairs.add((provider, slot))
     return pairs
@@ -575,36 +578,6 @@ def hold_queue_for_provider_limit(db, error, *, slug: str, episode_id: str,
     return hold_until
 
 
-def _rate_limit_setting_keys(credential_slot: str) -> tuple[str, str, str]:
-    """(rpm_key, rpd_key, tpm_key) for a slot: secondary reads secondary_*."""
-    if credential_slot == 'secondary':
-        return ('secondary_provider_requests_per_min',
-                'secondary_provider_requests_per_day',
-                'secondary_provider_tokens_per_min')
-    return ('provider_requests_per_min', 'provider_requests_per_day',
-            'provider_tokens_per_min')
-
-
-def manual_rate_limit_caps(credential_slot: str = 'primary') -> dict:
-    """{rpm, rpd, tpm, minute_since, day_since} for one account slot.
-
-    The single definition of the manual caps and their windows, shared by the
-    pre-start evaluation and the atomic per-request reservation, so the two
-    can never disagree on what counts as "inside the window". All-zero caps
-    mean no manual limit is configured.
-    """
-    rpm_key, rpd_key, tpm_key = _rate_limit_setting_keys(credential_slot)
-    now = utc_now()
-    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
-    return {
-        'rpm': get_env_backed_int(rpm_key, floor=0),
-        'rpd': get_env_backed_int(rpd_key, floor=0),
-        'tpm': get_env_backed_int(tpm_key, floor=0),
-        'minute_since': (now - timedelta(seconds=60)).strftime(ISO_FORMAT),
-        'day_since': midnight.strftime(ISO_FORMAT),
-    }
-
-
 def _cap_reset_iso(blocked: str, oldest: str | None) -> str:
     """Reset time for the cap that refused a request reservation."""
     now = utc_now()
@@ -800,14 +773,67 @@ def _probe_via_completion(db, provider_key: str | None, credential_slot: str) ->
         logger.debug(f"Rate-limit probe: no stage routes to "
                      f"{target_provider}:{credential_slot}; leaving hold")
         return False
+    client = get_client_for_provider(target_provider, base_url=base_url,
+                                     credential_slot=credential_slot)
+    if getattr(client, 'uses_per_request_dispatch', False) is True:
+        started = time.monotonic()
+        attempts = []
+        cap_refused = False
+
+        def reserve(payload):
+            nonlocal cap_refused
+            attempt_id, hold_until = reserve_provider_request(
+                db, target_provider, credential_slot,
+                attempt={
+                    'run_id': None, 'podcast_id': None, 'episode_id': None,
+                    'phase_key': 'probe', 'invoking_pass': None,
+                    'configured_model': model,
+                    'window_label': 'rate_limit_probe',
+                    'dispatch_count': 0,
+                    'reserved_tokens': request_token_estimate(payload),
+                })
+            if attempt_id is None:
+                cap_refused = True
+                raise RuntimeError(f'probe refused until {hold_until}')
+            return attempt_id
+
+        try:
+            probe_result = client.probe_once(model, reserve_request=reserve,
+                                             note_dispatch=db.bump_llm_attempt_dispatches)
+            attempts = probe_result['attempts']
+            if not attempts:
+                raise RuntimeError('probe did not dispatch a request')
+        except Exception as error:
+            attempts = getattr(error, 'systemone_probe_attempts', [])
+            for attempt_id, response, dispatch_latency_ms in attempts:
+                db.finalize_llm_attempt_from_response(
+                    attempt_id, 'failure', response,
+                    dispatch_latency_ms=dispatch_latency_ms,
+                )
+            if cap_refused:
+                return False
+            if is_rate_limit_error(error):
+                hold_after = extract_retry_after(error, max_seconds=MAX_RESET_SECONDS)
+                if hold_after is not None:
+                    hold_until_iso = (utc_now() + timedelta(
+                        seconds=max(0.0, hold_after))).strftime(ISO_FORMAT)
+                    record_hold_until(db, provider_key, hold_until_iso,
+                                      credential_slot=credential_slot, force=True)
+                    logger.info(f"Rate-limit probe: completion probe re-stamped hold to {hold_until_iso}")
+            logger.debug(f"Rate-limit probe: completion probe failed, leaving hold: {error}")
+            return False
+        finalize_probe_success(db, attempts, started)
+        _, held_since = _lift_hold(db, provider_key, credential_slot)
+        fire_queue_resumed_event(held_since=held_since)
+        logger.info("Rate-limit probe: completion probe succeeded; resuming queue")
+        return True
+
     attempt_id = db.begin_llm_attempt(
         run_id=None, podcast_id=None, episode_id=None, phase_key='probe',
         invoking_pass=None, provider_key=target_provider,
         credential_slot=credential_slot, configured_model=model,
         window_label='rate_limit_probe')
     try:
-        client = get_client_for_provider(target_provider, base_url=base_url,
-                                         credential_slot=credential_slot)
         response = client.messages_create(
             model=model, max_tokens=1, system='',
             messages=[{"role": "user", "content": "hi"}],
@@ -871,7 +897,7 @@ def _active_hold_sources(db) -> list[tuple[str, str | None, str, str | None]]:
         if not hold_is_active(hold_until):
             continue
         held_provider, _, slot = suffix.rpartition(':')
-        if slot not in ('primary', 'secondary'):
+        if slot not in ALL_CREDENTIAL_SLOTS:
             held_provider, slot = suffix, 'primary'
         sources.append((hold_until, held_provider, slot, suffix))
     return sources

@@ -12,6 +12,7 @@ import {
 import { formatStorage } from './settingsUtils';
 import { btnPrimary, btnSecondary } from '../../components/buttonStyles';
 import SavedBadge from './SavedBadge';
+import CronScheduleField from './CronScheduleField';
 import NumberInput from '../../components/NumberInput';
 import { focusRing } from '../../components/fieldStyles';
 
@@ -104,30 +105,16 @@ function DatabaseBackupSection() {
             </span>
           </label>
           <p className="text-sm text-muted-foreground -mt-2">
-            Copies the SQLite database to the destination on a schedule so you
-            can restore after a bad upgrade or a lost volume. The copies are not
-            encrypted, so pick a destination you trust. Back up now works even
-            with scheduling off.
+            Backups are unencrypted. Choose a trusted destination. Back up now works with scheduling off.
           </p>
 
           {enabled && (
-            <div className="flex items-center gap-3">
-              <label
-                htmlFor="db-backup-cron"
-                className="text-sm text-muted-foreground whitespace-nowrap"
-              >
-                Schedule (cron):
-              </label>
-              <input
-                id="db-backup-cron"
-                type="text"
-                value={cron}
-                onChange={(e) => setDraft((d) => ({ ...d, cron: e.target.value }))}
-                placeholder="30 3 * * *"
-                className="w-40 px-3 py-1.5 rounded-lg border border-input bg-background text-foreground font-mono text-sm"
-              />
-              <span className="text-xs text-muted-foreground">UTC</span>
-            </div>
+            <CronScheduleField
+              id="db-backup-cron"
+              value={cron}
+              onChange={(v) => setDraft((d) => ({ ...d, cron: v }))}
+              placeholder="30 3 * * *"
+            />
           )}
 
           <div className="space-y-1">

@@ -3,9 +3,13 @@
 Covers the contract that begin_llm_attempt/finalize_llm_attempt
 are the single writer of billed LLM calls.
 """
+from unittest.mock import MagicMock, patch
+
 import run_context
-from llm_client import LLMResponse, ProviderRateLimitedError
+from llm_route import Route
+from llm_client import AnthropicClient, LLMResponse, ProviderRateLimitedError
 from utils.llm_call import EmptyCompletionError, call_llm
+from utils import llm_call
 
 
 class _FakeLLMClient:
@@ -164,6 +168,62 @@ def test_empty_completion_records_the_billed_usage_on_the_failure_row(temp_db, m
         run_context.end(ctx)
 
 
+def test_missing_structured_tool_retries_with_usage_on_each_ledger_attempt(
+        temp_db, monkeypatch):
+    monkeypatch.setattr('utils.llm_call.time.sleep', lambda s: None)
+    monkeypatch.setattr('utils.llm_call._sleep_before_retry', lambda d: True)
+    temp_db.create_podcast('show-tool-retry', 'https://example.com/tool.xml', 'Show')
+    ctx = run_context.begin('show-tool-retry', 'ep-tool-retry', run_id='run-tool-retry')
+    try:
+        client = AnthropicClient(api_key='test-key')
+        client._client = MagicMock()
+
+        def response(content, input_tokens):
+            value = MagicMock()
+            value.content = content
+            value.usage = MagicMock(input_tokens=input_tokens, output_tokens=2)
+            value.stop_reason = 'end_turn'
+            value.model = 'claude-sonnet-5-5'
+            return value
+
+        text = MagicMock(type='text', text='no tool call')
+        tool = MagicMock()
+        tool.type = 'tool_use'
+        tool.name = 'segments'
+        tool.input = {'segments': []}
+        client._client.messages.create.side_effect = [
+            response([text], 11), response([tool], 13),
+        ]
+
+        result, error = call_llm(
+            llm_client=client, model='claude-sonnet-5-5', system_prompt='s', prompt='p',
+            llm_timeout=30, max_retries=0, max_tokens=100,
+            slug='show-tool-retry', episode_id='ep-tool-retry',
+            call_label='structured output', phase_key='detection',
+            pass_name='ad_detection_pass_1', provider='anthropic',
+            response_format={
+                'type': 'json_schema',
+                'json_schema': {'name': 'segments', 'schema': {'type': 'object'}},
+            },
+        )
+
+        assert error is None
+        assert result.content == '{"segments": []}'
+        rows = temp_db.get_connection().execute(
+            "SELECT * FROM llm_call_usage WHERE episode_id = ? ORDER BY rowid",
+            ('ep-tool-retry',),
+        ).fetchall()
+        assert len(rows) == 2
+        assert [row['state'] for row in rows] == ['failure', 'success']
+        assert [row['input_tokens'] for row in rows] == [11, 13]
+        assert [row['output_tokens'] for row in rows] == [2, 2]
+        totals = temp_db.get_run_usage_totals('run-tool-retry')
+        assert totals['input_tokens'] == 24
+        assert totals['output_tokens'] == 4
+    finally:
+        run_context.end(ctx)
+
+
 def test_manual_cap_crossed_mid_retry_defers(temp_db, monkeypatch):
     """A per-minute cap reached after the first dispatch must defer the retry
     with a manual hold, not keep spending requests (#747)."""
@@ -273,5 +333,75 @@ def test_secondary_slot_fallback_retry_tags_ledger_secondary(temp_db, monkeypatc
         rows = _rows_for_episode(temp_db, 'ep-slot')
         assert len(rows) == 2
         assert [r['credential_slot'] for r in rows] == ['secondary', 'secondary']
+    finally:
+        run_context.end(ctx)
+
+
+def test_actual_standby_dispatch_retains_both_origins_after_failure(temp_db):
+    temp_db.create_podcast('standby-usage', 'https://example.com/feed.xml', 'Route Test')
+    ctx = run_context.begin('standby-usage', 'episode', run_id='usage-run')
+    ctx.set_route_snapshot({
+        'detection': {'credential_slot': 'primary'},
+        'verification': {'credential_slot': 'secondary'},
+        'review': {'gate': {'review_provider': 'same_as_pass'}}})
+    try:
+        for phase, pass_name, outcome in (
+                ('detection', 'ad_detection_pass_1', LLMResponse(content='ok', model='standby')),
+                ('review', 'ad_review_pass_2', _Other422Error('standby failed'))):
+            call_llm(
+                llm_client=_FakeLLMClient([outcome]), model='standby', system_prompt='s', prompt='p',
+                llm_timeout=1, max_retries=0, max_tokens=10, slug='standby-usage', episode_id='episode',
+                call_label=phase, phase_key=phase, pass_name=pass_name,
+                provider='openai-compatible', credential_slot='failover')
+        assert ctx.failover_usage() == {'llm': ['primary', 'secondary'], 'whisper': False}
+        assert len(_rows_for_episode(temp_db, 'episode')) == 2
+    finally:
+        run_context.end(ctx)
+
+
+def test_refused_standby_reservation_records_no_usage(temp_db, monkeypatch):
+    ctx = run_context.begin('standby-usage', 'refused', run_id='refused-run')
+    ctx.set_route_snapshot({'detection': {'credential_slot': 'primary'}})
+    monkeypatch.setattr(llm_call, 'reserve_provider_request', lambda *a, **k: (None, None))
+    monkeypatch.setattr(llm_call, '_reservation_refused',
+                        lambda *a: ProviderRateLimitedError('manual cap', 10, manual=True))
+    client = _FakeLLMClient([])
+    try:
+        try:
+            llm_call._ledger_call_once(
+                client, {}, 'standby', phase_key='detection', invoking_pass=1,
+                provider_key='openai-compatible', credential_slot='failover',
+                slug='standby-usage', episode_id='refused', call_label='window')
+        except ProviderRateLimitedError:
+            pass
+        else:
+            raise AssertionError('reservation should fail')
+        assert ctx.failover_usage() is None
+        assert client.calls == 0
+    finally:
+        run_context.end(ctx)
+
+
+def test_standby_dispatch_without_snapshot_records_explicit_original_slot(temp_db):
+    temp_db.create_podcast('unresolved-route', 'https://example.com/feed.xml', 'Route Test')
+    ctx = run_context.begin('unresolved-route', 'episode', run_id='unresolved-route')
+    try:
+        primary = _FakeLLMClient([ConnectionError('primary unavailable')])
+        standby = _FakeLLMClient([LLMResponse(content='ok', model='standby')])
+        route = Route(phase='detection', provider_key='openai-compatible', model_id='standby',
+                      base_url='http://example.com/v1', slot='failover', credential_slot='failover')
+        with patch.object(llm_call, '_manual_rate_limit_error', return_value=None), \
+                patch.object(llm_call, '_sleep_before_retry', return_value=False), \
+                patch.object(llm_call.failover, 'is_configured', return_value=True), \
+                patch.object(llm_call.failover, 'trigger', return_value=True), \
+                patch.object(llm_call, '_failover_route', return_value=route), \
+                patch.object(llm_call, 'client_for_route', return_value=standby):
+            response, error = call_llm(
+                llm_client=primary, model='primary', system_prompt='s', prompt='p',
+                llm_timeout=1, max_retries=0, max_tokens=10, slug='unresolved-route', episode_id='episode',
+                call_label='window', phase_key='detection', provider='openai-compatible', credential_slot='secondary')
+        assert error is None and response.content == 'ok'
+        assert standby.calls == 1
+        assert ctx.failover_usage() == {'llm': ['secondary'], 'whisper': False}
     finally:
         run_context.end(ctx)

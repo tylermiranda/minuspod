@@ -6,13 +6,31 @@
 
 ## Contents
 
+- [Using Anthropic directly](#using-anthropic-directly)
 - [Using Claude Code Wrapper (Max Subscription)](#using-claude-code-wrapper-max-subscription)
 - [Using Ollama (Local or Cloud)](#using-ollama-local-or-cloud)
 - [Using OpenRouter](#using-openrouter)
+- [Using System One](#using-system-one)
 - [Per-Stage Providers](#per-stage-providers)
 - [LLM Pricing](#llm-pricing)
 - [Custom model pricing](#custom-model-pricing)
 - [Reviewer Calibration Self-Test](#reviewer-calibration-self-test)
+
+## Using Anthropic directly
+
+Select Anthropic and save an API key under Settings > AI & Processing. Each stage can use its own model. MinusPod chooses a tool-call format that the selected model supports. Models that reject forced tool calls use automatic tool choice with a strict schema. A response without the requested tool result follows the normal bounded retry policy; its token usage still counts.
+
+### Reasoning settings
+
+Under LLM Tunables, use **Reasoning budget** for models that accept manual thinking budgets, such as Claude 4.5 and 4.6. Use **Reasoning effort** for adaptive-only models, including Opus 4.7, Opus 4.8, and Claude 5 models. MinusPod sends the applicable setting for the model assigned to each stage. Both values persist when switching models or providers.
+
+Leave effort blank to use the configured default; without an environment default, the provider decides. `none` disables thinking where supported; models that require thinking use low effort instead. A numeric budget is not converted into an effort level. Model restrictions follow [Anthropic's thinking API](https://platform.claude.com/docs/en/build-with-claude/thinking).
+
+### Prompt caching
+
+MinusPod requests a 5-minute cache for static Anthropic system prompts. Transcript snippets and other per-call messages remain outside that cache boundary. Caching is automatic; there is no setting to enable it. Short prompts may not meet the provider's minimum cache size, and a changed prompt or expired cache causes a miss. See [Anthropic's prompt caching guide](https://platform.claude.com/docs/en/build-with-claude/prompt-caching).
+
+Input token totals include cache reads and writes. Processing history reports these counts separately as subsets of input tokens. For direct Anthropic calls, estimated cost uses the model's cache-read discount and the 5-minute cache-write rate. A provider-reported cost takes precedence; calls without known pricing remain unpriced. Existing usage records are unchanged.
 
 ## Using Claude Code Wrapper (Max Subscription)
 
@@ -237,25 +255,52 @@ The `openrouter/free` and `openrouter/auto` aliases are not in OpenRouter's `/ap
 
 All of these can be changed at runtime from the Settings UI. No container restart needed.
 
+## Using System One
+
+Select TypeSafe or System One compatible under Settings > AI & Processing > LLM Provider. Each slot keeps its own credentials, endpoint, and tuning profiles. TypeSafe uses a fixed endpoint. Compatible endpoints require their own base URL; `OPENAI_BASE_URL` is not reused. See [System One](system-one.md) for setup and manual migration from the Jev proxy.
+
+Detection, verification, and the ad category pass are supported. Review is experimental, including both passes when the reviewer inherits the pass route. Chapter generation and Pattern Cleanup require a chat provider. Disabled unsupported routes remain editable, but enabling or manually running them is blocked until the route is repaired. Failover supports chat providers only.
+
+### System One request limits
+
+System One tuning retains four profiles: TypeSafe and compatible settings for each credential slot. The logical request deadline covers every adapter stage, queue wait, retry, and upstream request. Each HTTP request also uses the slot timeout. The default logical deadline is 75 seconds; the default HTTP timeout is 60 seconds. Blank protocol caps remove local limits, but do not prevent upstream truncation. Truncated responses are rejected.
+
+The per-slot retry setting controls retries after the initial request; TypeSafe and compatible providers default to two retries. Retries use the shared backoff policy. The first retry can honor a rate-limit reset or Retry-After hint, capped by the selected profile's maximum Retry-After wait. That cap defaults to 5 seconds and accepts zero, within the remaining logical deadline. Each actual HTTP attempt has its own usage record. Missing usage stays unknown.
+
+The maximum concurrent operations setting defaults to 4 operations per process. Operations sharing a normalized endpoint and credential share capacity across slots and provider types. Conflicting profile limits use the stricter active or queued limit. This is not a cluster-wide limit. A local queue timeout sends no HTTP request and does not trigger the provider circuit breaker or chat failover.
+
+System One preserves caller prompts, policy, and context in its structured questions. It ignores saved temperature, thinking budgets, token caps, JSON-schema settings, and Ollama context settings. Those values are retained for later chat routes. Use the dedicated System One controls for supported adapter tuning.
+
 ## Per-Stage Providers
 
-MinusPod supports up to two full provider configurations: the primary LLM Provider, and one optional secondary provider with its own type, base URL, and API key. Secondary is off by default (see [Secondary provider](configuration.md#secondary-provider)). Each pipeline stage then picks one of the two, not a provider type directly. Settings > AI & Processing > AI Models shows a slot selector next to each model selector:
+MinusPod supports up to two full provider configurations: Provider A, and one optional Provider B with its own type, base URL, and API key. Provider B is off by default (see [Provider B](configuration.md#provider-b)). Each pipeline stage then picks one of the two, not a provider type directly. Settings > AI & Processing > AI Models shows a slot selector next to each model selector:
 
-- **Ad Detection Provider** - `Default (Primary)` or `Secondary`. Secondary only appears in the list once the secondary provider is enabled and configured.
-- **Verification Provider** - `Same as detection` (default), `Default (Primary)`, or `Secondary`. Pointing it at the other slot is useful for cost control (a cheap pass-2 sanity check) or comparing two providers' output on the same episode.
-- **Chapters Provider** - `Same as detection` (default), `Default (Primary)`, or `Secondary`, independent of the other two.
+- **Ad Detection Provider** - `Default (Provider A)` or `Provider B`. Provider B only appears in the list once it is enabled and configured.
+- **Verification Provider** - `Same as detection` (default), `Default (Provider A)`, or `Provider B`. Pointing it at the other slot is useful for cost control (a cheap pass-2 sanity check) or comparing two providers' output on the same episode.
+- **Chapters Provider** - `Same as detection` (default), `Default (Provider A)`, or `Provider B`, independent of the other two.
 
-The Ad Reviewer section has its own slot selector, described in [Ad Reviewer](configuration.md#ad-reviewer). `Same as pass` inherits both the provider and model of whichever pass is being reviewed. `Primary` or `Secondary` runs the reviewer on that slot instead, and enables the Review Model selector for its catalog.
+The Ad Reviewer section has its own slot selector, described in [Ad Reviewer](configuration.md#ad-reviewer). `Same as pass` inherits both the provider and model of whichever pass is being reviewed. `Provider A` or `Provider B` runs the reviewer on that slot instead, and enables the Review Model selector for its catalog.
 
-Switching a stage's slot only changes that stage. Model discovery re-runs for the newly selected slot, so the model dropdown next to it shows that slot's own catalog. Every other stage's slot and model stay exactly as you left them. A stage still accepts a hand-typed model ID (the "Type a model ID" link) for models a slot's catalog does not list, the same as the single-provider case. If a stage is set to Secondary and the secondary provider is later disabled, that stage falls back to Primary until Secondary is turned back on.
+[Pattern Cleanup](pattern-cleanup.md), under Settings > Experiments, also has
+its own provider and model selectors. Each can inherit detection's choice.
+Choose a higher-quality model when reviewing patterns: an approved pattern
+can affect matches in many later episodes.
+
+Switching a stage's slot only changes that stage. Model discovery re-runs for the newly selected slot, so the model dropdown next to it shows that slot's own catalog. Other stages keep their slot and model unless their provider account also changes.
+
+When a provider type, custom endpoint, or stage route changes the account used by a stage, MinusPod clears that stage's saved model. Empty fields show a reminder to choose a model and stay blank after reload until you choose a replacement. A stage still accepts a hand-typed model ID (the "Type a model ID" link) for models a slot's catalog does not list. Changing only an API key keeps model selections. If a stage is set to Provider B and Provider B is later disabled, that stage falls back to Provider A until Provider B is turned back on.
 
 Each slot needs its own API key and, where relevant, base URL configured under Settings > LLM Provider before a stage can use it; an unconfigured slot's model list comes back empty until credentials are saved.
 
-### The slots are routes, not a failover chain
+### Routing versus failover
 
-Primary and Secondary are two independent accounts a stage can be pointed at. They are not a chain, and nothing at runtime moves a call from one to the other. When a call fails, it retries against the same slot and endpoint, then gives up; the episode never spills onto the other provider. Credentials can change if a key is rotated between attempts; see [provider key rotation and active runs](configuration.md#rotating-or-clearing-a-provider-key). A rate-limit pause behaves the same way: the episode waits in the queue for that account's reset instead of rerouting.
+Provider A and Provider B are two independent accounts a stage can be pointed at. Picking one at configuration time is routing: it is not a chain, and nothing at runtime moves a call from one to the other on its own. When a call fails, it retries against the same slot and endpoint, then gives up; the episode does not spill onto the other provider through routing alone. Credentials can change if a key is rotated between attempts; see [provider key rotation and active runs](configuration.md#rotating-or-clearing-a-provider-key). A rate-limit pause behaves the same way: the episode waits in the queue for that account's reset instead of rerouting.
 
-The one time a stage changes slot is at configuration time, not on failure. A stage set to Secondary while the secondary provider is disabled or has no type saved resolves to Primary, and logs a warning once. That is a fail-safe for an incomplete configuration, evaluated when the route is resolved, not a response to an error.
+The one time a stage's slot changes on its own, outside failover, is at configuration time: a stage set to Provider B while Provider B is disabled or has no type saved resolves to Provider A, and logs a warning once. That is a fail-safe for an incomplete configuration, evaluated when the route is resolved, not a response to an error.
+
+A separate feature, failover, does move work between providers at runtime: a dedicated standby provider (and transcriber) takes over a slot when the active one is unreachable, times out, or rejects the key, model, or billing, then switches back once it recovers. See [Failover](failover.md) for triggers, mid-run behavior, health probes, and manual control.
+
+System One routes do not participate in chat failover. Choose a supported chat provider for the standby account.
 
 A run's routes are frozen when it starts. Each phase's provider, model, and endpoint are snapshotted at run start and reused for the whole run, so editing a provider or a stage's model mid-run does not re-route work already underway. The change applies to the next run. Credentials are the exception: they are read when the client is built, so a rotated key is picked up without a restart. See [Rotating a provider key](configuration.md#rotating-or-clearing-a-provider-key).
 
@@ -269,7 +314,9 @@ MinusPod tracks token usage and cost for every LLM call. The Settings page and `
 
 ### Custom model pricing
 
-Settings > AI & Processing > AI Models shows pricing fields for each configured model ID, including IDs you type. Enter input and output rates in USD per 1 million tokens. An operator override wins over catalog pricing and appears as `pricingSource: "operator"`. Leave both fields blank to use the catalog. Save both as `0` to mark a model explicitly free; missing pricing is different.
+Settings > AI & Processing > AI Models shows pricing fields for configured routes, including enabled standby and supported manual chapter and Cleanup models. Enter input and output rates in USD per 1 million tokens. An operator override wins over catalog pricing and appears as `pricingSource: "operator"`. Leave both fields blank to use the catalog. Save both as `0` to mark a model explicitly free; missing pricing is different.
+
+Inactive prices stay saved and reappear when those models are selected again. Recorded call costs stay unchanged.
 
 ### Where pricing data comes from
 
@@ -281,6 +328,8 @@ Pricing is fetched automatically based on your configured provider:
 | OpenRouter | OpenRouter API (`/api/v1/models`) | JSON API |
 | OpenAI, Groq, Mistral, DeepSeek, xAI, Together, Fireworks, Perplexity, Google | [pricepertoken.com](https://pricepertoken.com) | HTML scrape |
 | Ollama / localhost | N/A | Always $0 |
+| TypeSafe | Fixed official Jev pricing | $0.042 USD per 1 million input tokens; output tokens are free |
+| System One compatible | Operator pricing override | Unknown unless configured |
 
 Pricing refreshes once every 24 hours in the background. You can also force a refresh from the API:
 

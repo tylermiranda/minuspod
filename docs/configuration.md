@@ -8,6 +8,8 @@
 
 - [Configuration](#configuration)
 - [Global feed defaults](#global-feed-defaults)
+- [Audio leveling](#audio-leveling)
+- [Output audio](#output-audio)
 - [Experiments](#experiments)
 - [Reprocessing](#reprocessing)
 - [Community Patterns (Optional)](#community-patterns-optional)
@@ -34,6 +36,10 @@ New feeds use each global choice. A feed set to Inherit continues using that cho
 
 Upgrades preserve existing feed choices instead of switching them to inheritance. The earlier cross-fetch enabled flag becomes an explicit On or Off, while an unset legacy flag becomes explicit Auto.
 
+### Audio leveling
+
+Audio Leveling evens out quiet and loud passages in the processed audio. It runs an additional ffmpeg pass using the `dynaudnorm` filter after ad removal, with Gentle, Normal, Aggressive, Extreme, and Maximum intensity presets. The additional pass adds processing time; it does not change detection or ad-cut boundaries.
+
 ### Ad Detection Settings
 
 Customize ad detection in Settings:
@@ -41,10 +47,12 @@ Customize ad detection in Settings:
 - **AI Model** - Model for first pass ad detection. A provider selector sits beside it; leave it on Default to use the LLM Provider above, or pick a different configured provider to run detection there instead
 - **Verification Model** - Separate model for the post-cut verification pass. Its provider selector defaults to Same as detection and can be pointed at any other configured provider
 - **Chapters Model** - Model for chapter generation (a small model like Haiku works well here). Its provider selector also defaults to Same as detection
-- **Ad chapters** - Publish segments left in the audio as their own chapters, so a chapter-aware player can skip them. Off by default. See [Podcasting 2.0 > Ad chapters](podcasting-2.0.md#ad-chapters)
+- **Ad chapters** - Set a category's segment action to Mark (see Segment categories below) to publish it as a skippable chapter instead of just leaving it in the audio. See [Podcasting 2.0 > Ad chapters](podcasting-2.0.md#ad-chapters)
 - **Audio Bitrate** - Output bitrate for processed audio (default 128k)
+- **Audio Encoder Compression Level** - ffmpeg's `libmp3lame` `-compression_level`: 0 is slowest and best quality, 9 is fastest. Default `default` leaves the flag unset, so ffmpeg's own encoding behavior is unchanged
 - **System Prompts** - Customizable prompts for first pass and verification detection
 - **Ad break filler gap threshold** - ads in the same break separated by less than this many seconds of speech are merged into one cut. Default 12 seconds. Set to 0 to disable. Merges that would exceed 5 minutes total are skipped. See [Nearby-Ad Merge](how-it-works.md#nearby-ad-merge)
+- **Compare with the publisher transcript** - diffs the Whisper transcript against the feed's `podcast:transcript` tag, when one exists, and uses missing speech as ad evidence. On by default; each feed can override it (Feed Settings > Advanced > Transcript diff). See [Upstream Transcript Differential](transcript-differential.md)
 - **LLM Tunables** - See below
 
 Each customizable prompt (first pass system, verification, chapter, and the Ad Reviewer's review and resurrect prompts under AI & Processing) has its own **Reset** button next to its label, in addition to the section-wide "Reset Prompts to Default" / "Reset Reviewer Prompts to Default" buttons. The per-prompt button is a two-click confirm; it stays visible but disabled (with a tooltip) while that prompt is already at its default, so a customized prompt is easy to spot and revert without resetting every prompt at once.
@@ -66,12 +74,12 @@ When to enable it:
 - Hosts who organically mention their own other shows or Patreon, where the detector flags a non-ad as promotional
 - Episodes where you have noticed the cut is starting a few seconds late or ending a few seconds early
 
-Cost is one extra LLM call per detected ad (and one extra call per rejected detection in the resurrection band). With a typical pass-1 model and a typical episode that produces 4 to 8 ad detections, expect a small percentage increase in per-episode token spend rather than a doubling.
+Cost is one extra LLM call per detected ad, and one extra call per rejected detection in the resurrection band.
 
 Settings live under AI & Processing -> Ad Reviewer:
 
 - **Enable ad reviewer** - master toggle, off by default
-- **Review provider** - `Same as pass` (default) runs the reviewer on whichever provider and model resolved the pass it is reviewing, and ignores the review model setting below. Pick `Primary` or `Secondary` to run the reviewer on that slot instead, such as detection on primary with review on a cheaper secondary account
+- **Review provider** - `Same as pass` (default) runs the reviewer on whichever provider and model resolved the pass it is reviewing, and ignores the review model setting below. Pick `Provider A` or `Provider B` to run the reviewer on that slot instead, such as detection on Provider A with review on a cheaper Provider B account
 - **Review model** - only used when Review provider is not `Same as pass`. `Same as pass model` reuses the pass-1 detection model on pass-1 review and the verification model on pass-2 review. You can override to a single specific model for both reviewer passes (for example, run pass-1 detection on a smaller cheap model and run reviewer on a larger model that is better at boundary work)
 - **Max boundary shift** - caps how far the reviewer can move start or end timestamps when it chooses adjust. Default 60 seconds. Enforced in code regardless of what the prompt says
 - **Review prompt** - system prompt for the confirm/adjust/reject reviewer
@@ -134,13 +142,13 @@ Controls available on each:
 |---|---|---|
 | Temperature | 0.0 - 2.0 | 0.0 is fully reproducible. Keep detection and chapter boundaries low. |
 | Max tokens | 128 - 32768 | Response cap. Truncated JSON fails parsing; the salvage helper only recovers single-ad cases. |
-| Reasoning | Provider-aware | Anthropic takes a numeric token budget (1024-65536) for the `thinking` block. OpenAI, OpenRouter, and Ollama take an effort level (`none`, `low`, `medium`, `high`). |
+| Reasoning | Provider-aware | Older Anthropic models use a token budget (1024-65536 tokens). Adaptive-only Anthropic models, OpenAI, OpenRouter, and Ollama use an effort level (`none`, `low`, `medium`, `high`). |
 
-Defaults match what the code used before this feature, so existing installs behave identically until you touch a control.
+Anthropic stages expose both controls. The stage's model determines which setting applies; the other value stays saved for later use. Leave effort blank to use the configured default; without an environment default, the provider decides. `none` disables thinking when supported and selects low effort on models that require thinking. See [Anthropic reasoning](llm-providers.md#reasoning-settings).
 
 #### Fallback when the provider rejects a value
 
-If a provider rejects temperature, reasoning, or thinking settings, that in-flight call can retry once with a compatible fallback. A concurrent call that records the same incompatibility does not consume the retry. Reasoning exhaustion retries with reasoning disabled. Processing history stores a sanitized notice for each pass whose reasoning or thinking value was rejected. The notice includes requested and fallback values but no provider error text. The episode page shows notices from the latest completed run. A later pass tries its configured values again.
+If a provider rejects temperature, reasoning, or thinking settings, that in-flight call can retry once with a compatible fallback. A concurrent call that records the same incompatibility does not consume the retry. Reasoning exhaustion can retry with low effort on adaptive-only Anthropic models, or with reasoning disabled on other models. Processing history stores a sanitized notice for each pass whose reasoning or thinking value was rejected. The notice includes requested and fallback values but no provider error text. The episode page shows notices from the latest completed run. A later pass tries its configured values again.
 
 #### Env-var defaults
 
@@ -188,22 +196,40 @@ Two things have to be in place first:
 
 If the passphrase is missing, the key inputs collapse to a "Setup required" note, the API returns `409 provider_crypto_unavailable`, and env-var credentials keep working. GET responses never include key values, only booleans plus a `db`/`env`/`none` source marker.
 
-### Secondary provider
+### Provider B
 
-Alongside the primary provider above, you can configure one secondary provider: a separate provider type, base URL, and API key that a stage's provider selector can route to instead of primary. This is useful for splitting cost or capacity across two accounts, or across two different providers, without switching your main configuration back and forth.
+Alongside Provider A above, you can configure one Provider B: a separate provider type, base URL, and API key that a stage's provider selector can route to instead of Provider A. This is useful for splitting cost or capacity across two accounts, or across two different providers, without switching your main configuration back and forth.
 
-The secondary provider is off by default, so an install with only a primary provider configured behaves exactly as before. Configure it via `PUT /api/v1/settings/ad-detection`:
+Provider B is off by default, so an install with only Provider A configured behaves exactly as before. Configure it via `PUT /api/v1/settings/ad-detection`:
 
-- `secondaryProviderEnabled` (boolean) - turns the slot on or off. A stage set to route to secondary while this is off falls back to primary.
-- `secondaryProvider` - the provider type: `anthropic`, `openrouter`, `openai-compatible`, or `ollama`. An empty value clears it.
-- `secondaryProviderBaseUrl` - base URL, used only when the type is `openai-compatible` or `ollama`. SSRF-validated the same way as the primary provider's base URL. Empty clears it back to the default.
-- `secondaryProviderApiKey` - API key for the secondary provider, encrypted the same way as every other provider key. Omit to leave it unchanged; null or empty clears it.
+- `secondaryProviderEnabled` (boolean) - turns the slot on or off. A stage set to route to Provider B while this is off falls back to Provider A. Alias: `providerBEnabled`.
+- `secondaryProvider` - the provider type: `anthropic`, `openrouter`, `openai-compatible`, or `ollama`. An empty value clears it. Alias: `providerB`.
+- `secondaryProviderBaseUrl` - base URL, used only when the type is `openai-compatible` or `ollama`. SSRF-validated the same way as Provider A's base URL. Empty clears it back to the default. Alias: `providerBBaseUrl`.
+- `secondaryProviderApiKey` - API key for Provider B, encrypted the same way as every other provider key. Omit to leave it unchanged; null or empty clears it. Alias: `providerBApiKey`.
+- `secondaryProviderRequestsPerMin`, `secondaryProviderRequestsPerDay`, `secondaryProviderTokensPerMin` - manual rate caps; see [Manual request-rate limits](#manual-request-rate-limits). Aliases: `providerBRequestsPerMin`, `providerBRequestsPerDay`, `providerBTokensPerMin`.
 
-`GET /api/v1/settings` reports the current configuration as `secondaryProviderEnabled`, `secondaryProvider`, and `secondaryProviderBaseUrl`, plus `secondaryProviderApiKeyConfigured` (a boolean; the key itself is never returned). `POST /api/v1/settings/providers/secondary/test-connection` runs the same staged connection probe used for the primary provider, but against the secondary type, base URL, and key, so you can confirm it works before pointing a stage at it.
+The `providerB*` spellings are the current ones; the `secondary*` keys above keep working on both read and write, so an existing integration needs no change. `GET /api/v1/settings` reports both spellings side by side (`secondaryProviderEnabled` and `providerBEnabled`, and so on), plus `secondaryProviderApiKeyConfigured` (a boolean; the key itself is never returned). `POST /api/v1/settings/providers/secondary/test-connection` runs the same staged connection probe used for Provider A, but against Provider B's type, base URL, and key, so you can confirm it works before pointing a stage at it.
 
-Changing any secondary provider field lifts an active rate-limit hold for that account, the same as changing the primary provider's credentials does.
+Changing any Provider B field lifts an active rate-limit hold for that account, the same as changing Provider A's credentials does.
 
 Base URLs for either slot are rejected if they embed credentials in the `user:pass@host` form, on save and on a connection test alike. The URL is copied into each run's non-secret route snapshot and returned by `GET /api/v1/settings`, so an embedded password would leak. Put the key in the API key field instead. Remote Whisper is exempt, since its endpoint is not part of that snapshot.
+
+### Per-provider timeout and retries
+
+Each of Provider A, Provider B, and the LLM failover provider has its own request timeout and max-retries override, blank by default. A blank value falls back to the provider-type default: 120 seconds and 3 retries for Anthropic and OpenRouter, 600 seconds and 2 retries for OpenAI-compatible endpoints and Ollama. Set via `PUT /api/v1/settings/ad-detection`:
+
+| Payload key | DB setting | Range |
+|---|---|---|
+| `providerATimeoutSeconds` | `llm_timeout_seconds` | 10-3600 seconds, or blank |
+| `providerAMaxRetries` | `llm_max_retries` | 0-10, or blank |
+| `providerBTimeoutSeconds` | `secondary_llm_timeout_seconds` | 10-3600 seconds, or blank |
+| `providerBMaxRetries` | `secondary_llm_max_retries` | 0-10, or blank |
+| `failoverLlmTimeoutSeconds` | `failover_llm_timeout_seconds` | 10-3600 seconds, or blank |
+| `failoverLlmMaxRetries` | `failover_llm_max_retries` | 0-10, or blank |
+
+Every value here must be a JSON integer or `null`/omitted; a numeric string (`"30"`) is rejected with a 400 rather than coerced. `null` or an empty string clears the override back to the provider-type default. A max-retries value of 0 sends exactly one request and also skips the two per-window retries, so a failing call reaches the failover provider without delay. These were previously read only from Provider A's values regardless of which slot a stage used; each slot now reads its own override. See [Failover](failover.md#per-provider-timeouts-and-retries) for how the failover provider's timeout and retries are used mid-run.
+
+Transcription uses `whisperMaxAttempts` for upload attempts per chunk, including the first upload. `failoverWhisperMaxAttempts` independently sets failover transcriber upload attempts from 1 to 10. Null or blank inherits the current `whisperMaxAttempts`; omitting it leaves the override unchanged. Configure it under Settings > Failover, including when the active transcriber runs locally.
 
 ### Rotating or clearing a provider key
 
@@ -282,6 +308,7 @@ Each category maps to one action:
 | Remove | Cut from the audio. Default for every category. |
 | Beep | Replaced with a tone; the episode's duration is unchanged. |
 | Keep | Left in the audio untouched. |
+| Mark | Left in the audio untouched, and published as a skippable chapter. See [Podcasting 2.0 > Ad chapters](podcasting-2.0.md#ad-chapters). |
 
 Resolution order: a per-feed override, if set, wins; otherwise the global default applies; otherwise the action is remove. Segment actions have their own dedicated **Segment actions** card in Settings (a sibling of Global Defaults, not nested inside it). Set the global map there. Set per-feed overrides on the feed's settings page under the same **Segment actions** heading; each category starts inherited from the global map until you set it explicitly. API: global map is `segmentCategoryActions` on `PUT /api/v1/settings/ad-detection` (a partial map, merged over the stored global map); per-feed overrides are `segmentCategoryActions` on `PATCH /api/v1/feeds/{slug}` (replaces the stored override map outright; `null` clears every override).
 
@@ -311,13 +338,33 @@ Changing a feed's queue priority restamps every episode of that feed still pendi
 
 ### Title blacklist
 
-Each feed can list glob patterns under **Skip episodes by title** on its settings page. An episode whose title matches any pattern is skipped: it is never queued for automatic processing, and just-in-time processing (playing it) does not detect or cut it either.
+Each feed can list glob patterns under **Episode filters > Skip episodes by title** on its detail page. An episode whose title matches any pattern is skipped: it is never queued for automatic processing, and just-in-time processing (playing it) does not detect or cut it either.
 
 Matching is against the whole title, case-insensitive. `*` is a wildcard; a pattern with no wildcard must match the entire title exactly, so a substring match needs `*` on both sides. For example `Bonus Episode *` skips any title starting with "Bonus Episode", and `*live show*` skips any title containing "live show" anywhere.
 
-A per-feed **Skipped episodes** choice decides how a skipped episode is served: **Keep in feed with original audio** (default) serves it unmodified in the RSS feed, or **Hide from feed** drops it from the served feed entirely. Either way the episode is unaffected by the blacklist if you reprocess it manually: a manual reprocess always overrides the blacklist and processes the episode normally.
+The shared **Skipped episodes** choice applies to title, description, and duration filters. **Keep in feed with original audio** (default) serves the episode unmodified. **Hide from feed** removes it from served RSS. Either way the episode is unaffected by the blacklist if you reprocess it manually: a manual reprocess always overrides the blacklist and processes the episode normally.
 
 API: `titleSkipPatterns` (array of strings, max 50 patterns, 200 characters each) and `titleSkipAction` (`serve_original` or `hide`) on `PATCH /api/v1/feeds/{slug}`.
+
+### Skip episodes by description
+
+Add glob patterns under **Episode filters > Skip episodes by description**. Use them for phrases absent from the title, such as *This is a preview*. Matches skip automatic and just-in-time processing, as title matches do.
+
+Matching is against the description's plain text, with HTML tags removed, as a single whole-text string, case-insensitive. `*` is a wildcard, so a phrase needs `*` on both sides, for example `*This is a preview. To hear the entire episode*`.
+
+The shared **Skipped episodes** choice applies to title, description, and duration filters.
+
+API: `descriptionSkipPatterns` (array of strings, max 50 patterns, 200 characters each) on `PATCH /api/v1/feeds/{slug}`; `titleSkipAction` governs served-RSS visibility for all three filters.
+
+### Episode duration filters
+
+The feed's **Episode filters** section has optional **Minimum (minutes)** and **Maximum (minutes)** fields. Leave either blank for no limit, then choose **Save duration limits**.
+
+Limits include their endpoints and use the publisher's RSS duration, before any download or ad removal. Episodes with missing, invalid, or zero duration stay eligible. The minimum cannot exceed the maximum.
+
+An episode outside the range skips automatic and just-in-time processing. **Skipped episodes** decides whether it stays in the served feed with original audio or is hidden. Manual reprocessing overrides duration, title, and description filters. Local feeds ignore these upstream filters.
+
+API: `minDurationSeconds` and `maxDurationSeconds` on `PATCH /api/v1/feeds/{slug}` accept finite, nonnegative numbers in seconds. Null clears a limit; omitted fields keep their saved values. Configuration Import / Export preserves both limits.
 
 ### Recents feed
 
@@ -357,6 +404,35 @@ Matching is case-insensitive, and a bare pattern matches anywhere in the agent s
 
 API: `jitBlockedUserAgents` (array of strings) on `PUT /api/v1/settings/ad-detection`.
 
+## Output audio
+
+Settings > Output > Audio has independent **Replacement sound** and **MP3 stream
+copy** choices. Replacement sound is on by default; stream copy is off. Feed
+Settings > Served feed and storage can override either choice or inherit it.
+Turning replacement sound off omits the clip even when a cut falls back to
+re-encoding. Explicit Beep actions still use the replacement clip.
+
+Stream copy tries compatible, unprotected MPEG-1 Layer III MP3 cuts, preserving
+source-coded audio outside splice transitions. When replacement sound is on, its clip is
+encoded to match the source. The copy path repairs frame packing around joins
+and validates the output before publishing it.
+
+Cuts snap to the nearest MP3 frame. Chapters and transcript timing use those
+actual cuts and the encoded replacement duration. Validation uses temporary
+decoded-audio files, limited to 4 GiB each, and checks free disk space. Unsupported
+headers or gapless tags, protected boundaries and failed resource checks fall
+back to re-encoding.
+
+Leveling, Beep actions, unsupported audio, cuts at the start or end, unsafe joins
+or failed validation use the existing encoder. Output Bitrate applies to that
+re-encoded output. Bitrate and leveling remain configurable with stream copy on.
+
+API: `audioReplacementSoundEnabled` and `audioMp3StreamCopyEnabled` on
+`PUT /api/v1/settings/ad-detection`; null resets the global choice to its default.
+Feed `audioReplacementSoundOverride` and `audioMp3StreamCopyOverride` accept
+true, false or null on `PATCH /api/v1/feeds/{slug}`; null means inherit.
+These settings are stored in the database, without environment variables.
+
 ## Experiments
 
 The Experiments section in Settings holds opt-in features that are still being evaluated. Everything here is disabled by default. Turning a feature on does not change behavior on existing processed episodes; it applies only to subsequent processing runs.
@@ -369,11 +445,10 @@ How often each mode's LLM contract is actually honored shows up on the Stats pag
 
 Default `timestamps`. API: `PUT /api/v1/settings/ad-detection` with `adAddressingMode` (`timestamps`, `segment_ids`, or `random`).
 
-The Stats page tracks two things per mode. Contract compliance says whether
-the model used the requested output shape; both modes hold near 100%
-and it exists mostly as a canary. Ad yield is the comparison that matters:
-how many ads each mode proposed, how many survived into the pipeline, and
-why the rest were dropped. The "invalid ref" drop count only exists for
+The Stats page tracks two things per mode. Contract compliance reports whether
+the model used the requested output shape. Ad yield compares how many ads each
+mode proposed, how many survived into the pipeline, and why the rest were
+dropped. The "invalid ref" drop count only exists for
 segment IDs, and that asymmetry is the point of the experiment: a made-up
 segment ID is caught and dropped, while a made-up timestamp sails through
 and has to be caught by later validation, if it is caught at all.
@@ -406,13 +481,25 @@ Audio cue detection snaps ad cuts to a show's recurring chime or stinger, and is
 off by default. Setup, cue types, the find-audio-cues scan, and every tuning
 control are documented in [Audio Cue Detection](audio-cues.md).
 
+### Pattern Cleanup
+
+Pattern Cleanup runs an LLM review of your learned ad patterns on a schedule,
+suggesting trims, splits, sponsor renames, and retirements for patterns that
+carry extra show content or have stopped matching. Off by default, and
+nothing it suggests changes a pattern until you approve it on the Patterns
+page. Choose its provider, model, UTC cron schedule, model-review batch size,
+and unused-days threshold under Settings > Experiments. Run now also works
+with scheduling off. Statistics checks can flag new false positives without
+repeating model reviews. Full documentation, including force recheck,
+approve/reject/undo, and the API: [Pattern Cleanup](pattern-cleanup.md).
+
 ## Reprocessing
 
 Reprocessing an episode re-runs detection without re-fetching it from the source feed. The episode menu offers four modes; the bulk feed actions offer the same set apart from Recut Audio:
 
 - **Reprocess** (default) - uses the learned pattern database plus the LLM. Fastest option for routine re-detection.
 - **Full Analysis** - skips the pattern database for a fresh LLM-only pass.
-- **Recut Audio** - re-cuts the retained original from the episode's current ad list and re-times the saved transcript, without re-transcribing or calling the LLM. Use it after editing ads by hand to regenerate the output file. Because no LLM runs, generated chapters are not refreshed: the rebuilt file carries the source feed's own chapters remapped to the new cut, and the podcast:chapters JSON keeps its old timestamps. Run Regenerate Chapters afterward if chapters matter for the episode.
+- **Recut Audio** - re-cuts the retained original from the episode's current ad list and re-times the saved transcript, without re-transcribing or calling the LLM. Use it after editing ads by hand to regenerate the output file. Because no LLM runs, chapter topics are not regenerated. The MP3 and chapter JSON are kept in sync when their timestamps are remapped.
 - **Re-detect Ads** - reruns detection and re-cuts using the transcript already saved for the episode, skipping the transcription step that dominates processing time on local hardware. Requires an existing transcript; episodes without one are skipped, and it is also offered for failed episodes that still have a transcript. Use it to iterate on detection settings or models without paying for transcription each time. Not available on a feed set to Pass-through, skip ad detection, or `cue_only` mode (returns a 409): none of those modes has a detection LLM call to rerun, so **Recut Audio** is the equivalent action after editing ad markers by hand.
 
 ## Community Patterns (Optional)
@@ -489,20 +576,22 @@ While a hold is active, a probe re-checks it instead of waiting out the provider
 
 A hold on one provider is lifted automatically when you update that provider's own credentials in Settings > Providers, or when you turn this toggle off. Changing several provider settings together in one save does not clear a hold that belongs to just one of them.
 
-Holds are scoped per credential, not just per provider type. If primary and secondary use the same provider type, for example two Anthropic accounts, a 429 on one does not pause the other. Updating a slot's credentials lifts only that slot's hold.
+Holds are scoped per credential, not just per provider type. If Provider A and Provider B use the same provider type, for example two Anthropic accounts, a 429 on one does not pause the other. Updating a slot's credentials lifts only that slot's hold.
+
+A 429 never triggers failover: the rate-limit hold above handles it by waiting out the reset, since the provider answered and only needs time, not a different account. See [Failover > What triggers it](failover.md#what-triggers-it).
 
 ### Manual request-rate limits
 
 The rate-limit hold above reacts to a 429 after it happens. Manual request-rate limits check recent ledger usage before a tracked call. They are best-effort controls: concurrent calls can pass the check together, and adapter-internal compatibility retries are not recorded as separate requests. Token limits use recorded usage, not a reservation for the next request, so a call can cross the configured token limit. Both features share the same queue-hold machinery, so a manual limit pauses the queue exactly like a real 429 and resumes on its own. A manual hold clears only when its reset time passes, and is never cleared early by the usage probe (that probe sends a real request, which would burn the quota the cap protects).
 
-Limits are scoped to one provider account, meaning one credential slot on one provider type: primary and secondary count separately even when both point at the same provider. Counting comes from the LLM call ledger: requests in the last 60 seconds against the per-minute cap (RPM), input plus output tokens of finalized calls in the last 60 seconds against the tokens-per-minute cap (TPM), and requests since the last UTC midnight against the per-day cap (RPD). When any cap is reached, that account's queue is paused. A per-minute pause (RPM or TPM) lifts about 60 seconds after the oldest contributing call in the window; the per-day pause lifts at the next UTC midnight, which is the fixed reset boundary regardless of your server's timezone or the provider's own billing day. When more than one cap is over, the later reset wins.
+Limits are scoped to one provider account, meaning one credential slot on one provider type: Provider A and Provider B count separately even when both point at the same provider. Counting comes from the LLM call ledger: requests in the last 60 seconds against the per-minute cap (RPM), input plus output tokens of finalized calls in the last 60 seconds against the tokens-per-minute cap (TPM), and requests since the last UTC midnight against the per-day cap (RPD). When any cap is reached, that account's queue is paused. A per-minute pause (RPM or TPM) lifts about 60 seconds after the oldest contributing call in the window; the per-day pause lifts at the next UTC midnight, which is the fixed reset boundary regardless of your server's timezone or the provider's own billing day. When more than one cap is over, the later reset wins.
 
 All are off by default (0 means unlimited), so existing installs are unaffected. Configure them under **Settings > AI & Processing > LLM Provider**, or via `PUT /api/v1/settings/ad-detection`:
 
-- `providerRequestsPerMin`, `providerRequestsPerDay`, `providerTokensPerMin` - caps for the primary provider account (env `PROVIDER_REQUESTS_PER_MIN`, `PROVIDER_REQUESTS_PER_DAY`, `PROVIDER_TOKENS_PER_MIN`).
-- `secondaryProviderRequestsPerMin`, `secondaryProviderRequestsPerDay`, `secondaryProviderTokensPerMin` - caps for the secondary provider account (env `SECONDARY_PROVIDER_REQUESTS_PER_MIN`, `SECONDARY_PROVIDER_REQUESTS_PER_DAY`, `SECONDARY_PROVIDER_TOKENS_PER_MIN`).
+- `providerRequestsPerMin`, `providerRequestsPerDay`, `providerTokensPerMin` - caps for the Provider A account (env `PROVIDER_REQUESTS_PER_MIN`, `PROVIDER_REQUESTS_PER_DAY`, `PROVIDER_TOKENS_PER_MIN`).
+- `secondaryProviderRequestsPerMin`, `secondaryProviderRequestsPerDay`, `secondaryProviderTokensPerMin` - caps for the Provider B account (env `SECONDARY_PROVIDER_REQUESTS_PER_MIN`, `SECONDARY_PROVIDER_REQUESTS_PER_DAY`, `SECONDARY_PROVIDER_TOKENS_PER_MIN`); aliases `providerBRequestsPerMin`, `providerBRequestsPerDay`, `providerBTokensPerMin`.
 
-Example, using figures that were current for one provider's free tier at the time of writing: an account allowed 5 requests per minute and 20 per day. Providers change their tiers often, so read your own account's limits rather than trusting this number, then set `providerRequestsPerMin` to 5 and `providerRequestsPerDay` to 20. Pair this with a large detection window size (see [Detection window geometry](#detection-window-geometry)) so each episode spends fewer requests, and a whole episode can fit inside a small daily budget. The token-per-minute allowance on a tier like that is often generous enough that TPM is not the binding limit, but you can set `providerTokensPerMin` if your account has a tighter token budget.
+For an account limited to 5 requests per minute and 20 per day, set `providerRequestsPerMin` to 5 and `providerRequestsPerDay` to 20. Check your account limits before choosing values. A larger [detection window](#detection-window-geometry) uses fewer requests per episode. Set `providerTokensPerMin` if the account also has a token cap.
 
 A held or limited provider never reroutes to another provider: the episode waits in the queue for that account's reset.
 
@@ -547,6 +636,12 @@ with any OpenAI-compatible Whisper server. That one happens to expose the
 fields described above.
 
 ## Outbound Requests
+
+Feed settings > Advanced > Download User-Agent overrides the global download string for one feed's audio, artwork, chapters, and upstream transcripts. Save a printable ASCII string of up to 512 characters, or choose Use global to clear it. The API field `downloadUserAgentOverride` accepts a string or `null`; blank also clears it. Configuration export and import preserve the override. Changing the effective download string also allows a fresh attempt for artwork that failed with the previous string.
+
+Feed settings > Advanced > RSS User-Agent overrides the global RSS string for that feed's own fetches, the same way the download override works. The API field `feedUserAgentOverride` accepts a string or `null`; blank also clears it. Configuration export and import preserve the override. An override that fails validation (e.g. edited directly in the database) is ignored in favor of the global RSS string, with a warning logged once per feed until the stored value changes.
+
+Cross-fetch still selects a random alternate from its podcast-client pool. It excludes the feed's effective download string and any accepted fallback string, so setting an override preserves request variation.
 
 MinusPod identifies itself with two User-Agent strings, and hosts treat them differently. Bot mitigation on some CDNs refuses browser identifiers below a version floor that moves as new browsers ship. A string that worked last year starts drawing a 403 on download, even though the file is there. Other feed hosts do the reverse and answer only a declared podcast client. One string cannot satisfy both, so there are two.
 

@@ -1,10 +1,12 @@
 import { apiRequest } from './client';
 import type { LlmProvider, ProviderSlot, WhisperHealthProbe } from './types';
 
-// 'secondary' has no dedicated /settings/providers/secondary REST surface
-// (unlike the others): its key saves/clears through PUT /settings and its
-// test hits /settings/providers/secondary/test-connection directly.
-export type ProviderName = 'anthropic' | 'openai' | 'openrouter' | 'whisper' | 'ollama' | 'secondary';
+// 'secondary' and the two failover accounts have no dedicated
+// /settings/providers/<name> REST surface (unlike the others): their keys
+// save/clear through PUT /settings and their tests hit test-connection directly.
+export type ProviderName =
+  | 'anthropic' | 'openai' | 'openrouter' | 'whisper' | 'ollama' | 'typesafe' | 'systemone-compatible' | 'secondary'
+  | 'failover' | 'failover-whisper';
 
 export interface ProviderStatus {
   configured: boolean;
@@ -20,6 +22,8 @@ export interface ProvidersResponse {
   openrouter: ProviderStatus;
   whisper: ProviderStatus;
   ollama: ProviderStatus;
+  typesafe: ProviderStatus;
+  'systemone-compatible': ProviderStatus;
 }
 
 export interface ProviderUpdatePayload {
@@ -31,6 +35,9 @@ export interface ProviderUpdatePayload {
 export interface ProviderTestResult {
   ok: boolean;
   error?: string;
+  detail?: string;
+  validation?: 'model_catalog';
+  inferenceChecked?: boolean;
 }
 
 export function listProviders() {
@@ -87,6 +94,8 @@ export interface ConnectionTestResult {
   reachable: boolean;
   status?: number;
   detail: string;
+  validation?: 'model_catalog';
+  inferenceChecked?: boolean;
   // whisper only, present when ok is true.
   health?: WhisperHealthProbe;
 }
@@ -104,7 +113,7 @@ export function testWhisperConnection(baseUrl: string, model: string, skipFlacCo
 // baseUrl applies to the configurable providers (openai, ollama); anthropic
 // and openrouter have fixed public endpoints and ignore the body.
 export function testLlmConnection(
-  name: 'openai' | 'ollama' | 'anthropic' | 'openrouter',
+  name: 'openai' | 'ollama' | 'anthropic' | 'openrouter' | 'typesafe' | 'systemone-compatible',
   baseUrl?: string,
 ) {
   return apiRequest<ConnectionTestResult>(`/settings/providers/${name}/test-connection`, {
@@ -123,6 +132,28 @@ export function testSecondaryProviderConnection(provider?: LlmProvider | '', bas
   return apiRequest<ConnectionTestResult>('/settings/providers/secondary/test-connection', {
     method: 'POST',
     body,
+  });
+}
+
+// Probes the failover LLM account (#806) using its saved key; provider and
+// baseUrl override the saved type/base URL, same unsaved-draft pattern as
+// testSecondaryProviderConnection above.
+export function testFailoverProviderConnection(provider?: LlmProvider | '', baseUrl?: string) {
+  const body: Record<string, string> = {};
+  if (provider) body.provider = provider;
+  if (baseUrl !== undefined) body.baseUrl = baseUrl;
+  return apiRequest<ConnectionTestResult>('/settings/providers/failover/test-connection', {
+    method: 'POST',
+    body,
+  });
+}
+
+// Probes the failover Whisper account (#806); same unsaved-draft contract
+// as testWhisperConnection, against the failover-whisper endpoint.
+export function testFailoverWhisperConnection(baseUrl: string, model: string, skipFlacCompression: boolean) {
+  return apiRequest<ConnectionTestResult>('/settings/providers/failover-whisper/test-connection', {
+    method: 'POST',
+    body: { baseUrl, model, skipFlacCompression },
   });
 }
 

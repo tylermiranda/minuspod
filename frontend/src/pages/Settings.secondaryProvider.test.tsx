@@ -63,6 +63,7 @@ vi.mock('./settings/SegmentActionsSection', () => ({ default: () => null }));
 vi.mock('./settings/Podcasting20Section', () => ({ default: () => null }));
 vi.mock('./settings/AudioCueDetectionSection', () => ({ default: () => null }));
 vi.mock('./settings/PositionalPriorSection', () => ({ default: () => null }));
+vi.mock('./settings/PatternCleanupSection', () => ({ default: () => null }));
 vi.mock('./settings/CommunityPatternsSection', () => ({ default: () => null }));
 vi.mock('./settings/DatabaseBackupSection', () => ({ default: () => null }));
 vi.mock('./settings/QueueControlSection', () => ({ default: () => null }));
@@ -139,6 +140,7 @@ vi.mock('../api/providers', () => ({
 
 vi.mock('../api/feeds', () => ({
   refreshAllArtwork: vi.fn(),
+  feedsQueryOptions: { queryKey: ['feeds'], queryFn: vi.fn().mockResolvedValue({ feeds: [] }) },
 }));
 
 function sv(value: string, isDefault: boolean): SettingValue {

@@ -20,8 +20,13 @@ from typing import Any, Union
 from config import (
     PROVIDER_ANTHROPIC,
     PROVIDER_OPENROUTER,
-    PROVIDER_OPENAI_COMPATIBLE,
     PROVIDER_OLLAMA,
+    PROVIDER_OPENAI_COMPATIBLE,
+    PROVIDER_TYPESAFE,
+    PROVIDER_SYSTEMONE_COMPATIBLE,
+    anthropic_model_allows_disabled_thinking,
+    anthropic_model_requires_adaptive_thinking,
+    anthropic_model_supports_forced_tools as anthropic_model_supports_forced_tools,
 )
 
 logger = logging.getLogger(__name__)
@@ -114,21 +119,39 @@ def classify_reasoning_rejection(error: Exception) -> str | None:
 def translate_reasoning_effort(
     provider: str,
     value: Union[int, str] | None,
+    model: str | None = None,
 ) -> dict[str, Any]:
     """Map a per-stage reasoning value to provider-native request kwargs.
 
     Returns {} when the value should be omitted from the request.
     """
-    if value is None:
-        return {}
-
     provider = provider.lower()
 
     if provider == PROVIDER_ANTHROPIC:
+        if value is None:
+            return {}
+        if anthropic_model_requires_adaptive_thinking(model):
+            if isinstance(value, int):
+                return {}
+            if isinstance(value, str) and value.lower() == 'none':
+                if anthropic_model_allows_disabled_thinking(model):
+                    return {"thinking": {"type": "disabled"}}
+                return {
+                    "thinking": {"type": "adaptive"},
+                    "output_config": {"effort": "low"},
+                }
+            if isinstance(value, str) and value.lower() in ("low", "medium", "high"):
+                return {
+                    "thinking": {"type": "adaptive"},
+                    "output_config": {"effort": value.lower()},
+                }
+            return {}
         if isinstance(value, int):
             return {"thinking": {"type": "enabled", "budget_tokens": value}}
         return {}
 
+    if value is None:
+        return {}
     if not isinstance(value, str):
         return {}
     normalized = value.lower()
@@ -155,6 +178,7 @@ _ANTHROPIC_NO_SAMPLING_MODELS = (
     "claude-sonnet-5",
     "claude-fable-5",
     "claude-mythos-5",
+    "claude-haiku-5-5",
 )
 
 # Per-process memo of models discovered at runtime to reject temperature
@@ -200,11 +224,8 @@ def model_omits_temperature(
                for token in _ANTHROPIC_NO_SAMPLING_MODELS)
 
 
-# Anthropic is the only provider with a proven, enforced structured-output
-# path (json_schema response_format forces a tool_choice call in
-# AnthropicClient.messages_create, guaranteeing schema-matching output).
-# Other providers front arbitrary/inconsistent backends lacking strict JSON
-# schema mode; extend this set only after verifying a provider's actual contract.
+# Anthropic supports structured output through tool schemas. Extend this
+# set only after verifying another provider's schema-enforcement contract.
 _JSON_SCHEMA_SUPPORTED_PROVIDERS = frozenset({PROVIDER_ANTHROPIC})
 
 
@@ -214,6 +235,41 @@ STAGE_MODEL_SETTING_KEYS = (
     'claude_model', 'verification_model', 'review_model', 'chapters_model',
 )
 SAME_AS_PASS = 'same_as_pass'
+
+_SYSTEMONE_PROXY_MODELS = frozenset({'jev-latest', 'jev-preview', 'typesafe/jev'})
+_SYSTEMONE_PHASES = frozenset({'detection', 'verification', 'review'})
+
+
+def systemone_supported_phases(provider: str, model: str | None) -> frozenset[str] | None:
+    """Return Jev-supported phases for explicit System One provider/model IDs."""
+    provider = (provider or '').lower()
+    if provider in (PROVIDER_TYPESAFE, PROVIDER_SYSTEMONE_COMPATIBLE):
+        return _SYSTEMONE_PHASES
+    if (model or '').strip().casefold() in _SYSTEMONE_PROXY_MODELS:
+        return _SYSTEMONE_PHASES
+    return None
+
+
+def chapters_capability_error(
+    db, provider: str | None = None, model: str | None = None,
+) -> str | None:
+    """Resolve the effective chapters provider/model (unless given) and check System One support."""
+    # Local imports: llm_route and llm_client both import this module.
+    from llm_client import get_effective_provider_from_snapshot
+    from llm_route import SLOT_SECONDARY, resolved_stage_slot
+
+    if provider is None and model is None:
+        slot = resolved_stage_slot(db, 'chapters')
+        provider = (db.get_setting('secondary_provider') if slot == SLOT_SECONDARY
+                    else get_effective_provider_from_snapshot({'llm_provider': db.get_setting('llm_provider')}))
+        model = db.get_setting('chapters_model')
+        if model is None:
+            model = db.get_setting('claude_model')
+    supported = systemone_supported_phases(provider or '', model)
+    if supported is not None and 'chapters' not in supported:
+        return (f"chapters is unsupported for effective provider {provider!r} and "
+                f"model {model!r}. Use a supported chat provider and model.")
+    return None
 
 
 def configured_stage_models(get_setting) -> list[str]:

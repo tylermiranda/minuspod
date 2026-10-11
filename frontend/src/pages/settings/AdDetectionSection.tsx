@@ -33,6 +33,8 @@ interface AdDetectionSectionProps {
   onDaiDifferentialOverridesKeepChange: (value: boolean) => void;
   spliceVetoEnabled: boolean;
   onSpliceVetoEnabledChange: (value: boolean) => void;
+  transcriptDifferentialEnabled: boolean;
+  onTranscriptDifferentialEnabledChange: (value: boolean) => void;
 }
 
 // Same shape as AudioCueDetectionSection's numRow, adapted to this section's
@@ -93,6 +95,8 @@ function AdDetectionSection({
   onDaiDifferentialOverridesKeepChange,
   spliceVetoEnabled,
   onSpliceVetoEnabledChange,
+  transcriptDifferentialEnabled,
+  onTranscriptDifferentialEnabledChange,
 }: AdDetectionSectionProps) {
   return (
     <CollapsibleSection title="Ad Detection">
@@ -196,6 +200,19 @@ function AdDetectionSection({
           </label>
           <p className="mt-2 text-sm text-muted-foreground ml-14">
             A long cut found only in the transcript is held for review unless the audio shows an edit point at its edges. Each feed can override this.
+          </p>
+        </div>
+        <div>
+          <label className="flex items-center gap-3 cursor-pointer">
+            <ToggleSwitch
+              checked={transcriptDifferentialEnabled}
+              onChange={onTranscriptDifferentialEnabledChange}
+              ariaLabel="Compare with the publisher transcript"
+            />
+            <span className="text-sm font-medium text-foreground">Compare with the publisher transcript</span>
+          </label>
+          <p className="mt-2 text-sm text-muted-foreground ml-14">
+            When an episode links the publisher's own transcript and it leaves the ads out, speech missing from it backs up detected ads and flags missed ones for review. It never cuts on its own. Each feed can override this.
           </p>
         </div>
 
@@ -310,7 +327,7 @@ function AdDetectionSection({
                 <span className="text-sm font-medium text-foreground">Cut inserted ads in kept categories</span>
               </label>
               <p className="mt-2 text-sm text-muted-foreground ml-14">
-                Audio that differs between two fetches was inserted, so it is cut even when its category is set to keep. A category cannot tell a guest plugging their own show from a paid ad for another podcast; this can. Turn it off to let a kept category keep inserted ads too.
+                Cut dynamically inserted ads even when their category is set to Keep. Turn off to let category actions control them.
               </p>
             </div>
           </div>

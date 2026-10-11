@@ -3,7 +3,9 @@ import DashboardControlsMenu from '../components/DashboardControlsMenu';
 import SegmentedToggle from '../components/SegmentedToggle';
 import { keepPreviousData, useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useNavigate, Link } from 'react-router';
+import { Download, PanelsTopLeft } from 'lucide-react';
 import { feedsQueryOptionsFor, refreshFeed, refreshAllFeeds, deleteFeed } from '../api/feeds';
+import { FeedOpmlExportDialog } from '../components/FeedOpmlExportDialog';
 import DropdownMenu from '../components/DropdownMenu';
 import FeedCard from '../components/FeedCard';
 import FeedListItem from '../components/FeedListItem';
@@ -56,6 +58,9 @@ function Dashboard() {
   // outside the 1-10 range the select and the backend projection expect.
   const episodesPerPodcast = clampEpisodesPerPodcast(episodesPerPodcastRaw);
   const [actionError, setActionError] = useState<string | null>(null);
+  // The modified OPML is what a podcast app imports, so it's offered here and
+  // not only under Settings > Data Management.
+  const [opmlExportOpen, setOpmlExportOpen] = useState(false);
   const deleteTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const [feedsPage, setFeedsPage] = useState(1);
@@ -177,6 +182,8 @@ function Dashboard() {
     );
   }
 
+  const dashboardViewLabel = DASHBOARD_VIEW_OPTIONS.find((option) => option.value === dashboardView)?.label ?? 'Podcasts';
+
   return (
     <div>
       <div
@@ -244,7 +251,7 @@ function Dashboard() {
       </div>
 
       <div className="flex flex-wrap justify-between items-center gap-y-2 mb-6">
-        <div className="w-full sm:w-auto flex flex-wrap items-baseline gap-x-3">
+        <div className="w-full sm:w-auto flex min-w-0 flex-wrap items-baseline gap-x-3">
           <h1 className="text-2xl font-bold text-foreground">Feeds</h1>
           {lastRefreshCompletedAt && (
             <span
@@ -256,13 +263,31 @@ function Dashboard() {
           )}
         </div>
         <div className="w-full sm:w-auto flex gap-2 items-center justify-between sm:justify-start overflow-x-auto no-scrollbar sm:overflow-visible">
-          <SegmentedToggle
-            options={DASHBOARD_VIEW_OPTIONS}
-            value={dashboardView}
-            onChange={setDashboardView}
-            ariaLabel="Dashboard view"
-            variant="toolbar"
-          />
+          <div className="hidden sm:block">
+            <SegmentedToggle
+              options={DASHBOARD_VIEW_OPTIONS}
+              value={dashboardView}
+              onChange={setDashboardView}
+              ariaLabel="Dashboard view"
+              variant="toolbar"
+            />
+          </div>
+          <div className="sm:hidden">
+            <DropdownMenu
+              triggerLabel={<PanelsTopLeft className="h-5 w-5" aria-hidden="true" />}
+              triggerClassName={`${touchTarget} h-11 w-11 min-w-11 px-2.5 rounded ${btnSecondary} transition-colors`}
+              chevronClassName="hidden"
+              ariaLabel={`View by ${dashboardViewLabel}`}
+              title={`View by ${dashboardViewLabel}`}
+              align="left"
+              centerOnMobile={false}
+              items={DASHBOARD_VIEW_OPTIONS.map((option) => ({
+                title: option.label,
+                checked: dashboardView === option.value,
+                onClick: () => setDashboardView(option.value),
+              }))}
+            />
+          </div>
           <div className="flex gap-2 items-center shrink-0">
           <DashboardControlsMenu
             dashboardView={dashboardView}
@@ -302,6 +327,16 @@ function Dashboard() {
               },
             ]}
           />
+          <button
+            type="button"
+            onClick={() => setOpmlExportOpen(true)}
+            className={`${touchTarget} px-2.5 sm:px-4 h-11 text-sm rounded shrink-0 ${btnSecondary} transition-colors inline-flex items-center justify-center whitespace-nowrap ${focusRing}`}
+            title="Export feeds as OPML for a podcast app"
+            aria-label="Export OPML"
+          >
+            <Download className="h-5 w-5 sm:hidden" aria-hidden="true" />
+            <span className="hidden sm:inline">Export OPML</span>
+          </button>
           <Link
             to="/add"
             className={`h-11 min-w-11 sm:px-4 inline-flex items-center justify-center rounded shrink-0 ${btnPrimary} transition-colors ${focusRing}`}
@@ -414,6 +449,7 @@ function Dashboard() {
         </div>
       )}
 
+      <FeedOpmlExportDialog open={opmlExportOpen} onClose={() => setOpmlExportOpen(false)} />
     </div>
   );
 }

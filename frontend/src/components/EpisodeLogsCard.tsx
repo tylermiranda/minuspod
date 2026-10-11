@@ -19,8 +19,7 @@ function EpisodeLogsCard({ slug, episodeId, runs }: EpisodeLogsCardProps) {
     <div>
       {!anyStored && (
         <p className="text-sm text-muted-foreground mb-3">
-          No run has stored a log yet. Turn on log storage in Settings, or in this feed's own
-          settings.
+          No stored logs. Enable log storage in Settings or this feed&apos;s settings.
         </p>
       )}
 
@@ -32,6 +31,9 @@ function EpisodeLogsCard({ slug, episodeId, runs }: EpisodeLogsCardProps) {
           >
             <span className="font-medium">Run {run.runNumber}</span>
             <span className="text-muted-foreground">{formatDateTime(run.processedAt)}</span>
+            <span className="text-muted-foreground">
+              {run.stats?.mode === 'chapters' ? 'Chapter regeneration' : 'Audio processing'}
+            </span>
             {run.status === 'failed' && <span className="text-destructive">failed</span>}
             <span className="ml-auto">
               {run.hasLog ? (

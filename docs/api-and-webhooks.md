@@ -22,17 +22,19 @@ Key endpoints:
 - `GET /api/v1/health/live` - Liveness probe (process up); always 200, safe for frequent polling
 - `GET /api/v1/feeds` - List feeds. With no `page`/`limit`, returns every feed (unchanged default). Passing `page`/`limit` paginates the list; `includeLatestEpisodes=true` (with optional `episodesPerFeed`, default 3, max 20) adds each feed's newest episodes without a separate request per feed
 - `POST /api/v1/feeds` - Add a new feed (supports `maxEpisodes` for RSS cap, `onlyExposeProcessedEpisodes` to hide unprocessed episodes from the served feed, `retentionDaysOverride` for a per-feed retention window or archive, `keepOriginalAudioOverride` for the pre-cut original audio)
-- `PATCH /api/v1/feeds/{slug}` - Update a feed's settings: `queuePriority` (`high`/`normal`/`low`, restamps the feed's already-queued pending episodes immediately), `retentionDaysOverride`, `keepOriginalAudioOverride`, `maxEpisodes`, `onlyExposeProcessedEpisodes`, `processingMode`, `chaptersMode`, title blacklist, and the other per-feed overrides listed in the OpenAPI spec
+- `PATCH /api/v1/feeds/{slug}` - Update feed settings, including title and description rules and duration limits. The OpenAPI spec lists all supported fields.
 - `POST /api/v1/feeds/import-opml` - Import feeds from OPML file
-- `GET /api/v1/feeds/export-opml?mode=original|modified` - Export feeds as OPML (original or ad-free URLs)
+- `GET /api/v1/feeds/export-opml?mode=original|modified` - Export feeds as OPML (original or ad-free URLs). Optional `slugs=a,b` filters the export
+- `POST /api/v1/feeds/export-opml?mode=original|modified` - Export selected feeds; send `{"slugs":["a","b"]}` in the JSON body
 - `POST /api/v1/feeds/refresh-artwork` - Re-render every feed's cover art (used after toggling the cover-art badge or swapping the badge asset)
 - `POST /api/v1/feeds/{slug}/refresh` - Refresh one subscribed feed. Success includes a structured `outcome` with status, new and queued episode counts, plus refresh timestamps; source fetch or parse failures return 502.
 - `POST /api/v1/feeds/refresh` - Refresh every subscribed feed. Returns per-feed outcomes and totals; HTTP 207 means the pass completed with at least one feed failure.
 - `GET/HEAD /api/v1/feeds/{slug}/artwork` - Serve cached feed artwork without admin authentication. Traversal-like or over-200-character legacy slugs are rejected before this public exemption.
 - `GET /api/v1/podcast-search?q=query` - Search podcasts via PodcastIndex.org
-- `GET /api/v1/feeds/{slug}/episodes` - List episodes (supports `sort_by`, `sort_dir`, `status` filter, pagination). Each episode carries a `jobState` (`idle`, `queued`, or `processing`) alongside the lifecycle `status`; it is read from the live queue, so a `pending` episode with no queue row reports `idle` rather than `queued`.
+- `GET /api/v1/feeds/{slug}/episodes` - List episodes with sorting, status, pagination, and literal case-insensitive title `search`. Search applies across the full feed before pagination. `jobState` reports live queue state.
+- `GET /api/v1/feeds/{slug}/episodes?selection=true` - Return matching episode IDs and action eligibility without loading full episode rows, capped at 501 rows (`truncated` is `true` past that cap). The `selection` array contains `id`, `status`, `jobState`, `titleSkipped`, `descriptionSkipped`, and `durationSkipped`; `episodes` is empty. Pagination is ignored for this projection; bulk actions still accept at most 500 episode IDs.
 - `POST /api/v1/feeds/{slug}/episodes/bulk` - Bulk episode actions (process, reprocess, reprocess_full, reprocess_llm, delete)
-- `GET /api/v1/feeds/{slug}/episodes/{id}` - Get episode detail with ad markers, transcript, live `jobState`, and processing-run statistics. New runs include elapsed totals, stage timings, and aggregate FFmpeg time; older runs can have no timing data. The elapsed total ends after the episode and feed are saved; history recording and notifications follow outside it
+- `GET /api/v1/feeds/{slug}/episodes/{id}` - Get episode detail with ad markers, transcript, live `jobState`, and processing-run statistics. New runs include elapsed totals, stage timings, and aggregate FFmpeg time; older runs can have no timing data. The elapsed total ends after the episode and feed are saved; history recording and notifications follow outside it. `upstreamTranscript` reports the publisher-transcript diff (status, coverage, spans) when the stage ran; an ad marker it corroborates carries `corroborated_by: "transcript_differential"`. See [Upstream Transcript Differential](transcript-differential.md) and `openapi.yaml`
 - `GET /api/v1/feeds/{slug}/episodes/{id}/artwork` - Serve an episode's cover, fetching and caching it from the publisher on first request. Publishers block images requested with a cross-site Referer, so the web UI asks here instead of loading them directly. Redirects to the feed cover when the episode has none or the fetch is refused. The URL comes from the episode record, never from the caller
 - `POST /api/v1/episodes/{slug}/{id}/reprocess` - Reprocess an episode (body `mode`: reprocess/full/llm/recut; `llm` re-detects on the existing transcript and `recut` re-cuts from the saved ad list, both skipping transcription). See [Reprocessing](configuration.md#reprocessing) for the full mode reference. The older `POST /api/v1/feeds/{slug}/episodes/{id}/reprocess` ignores `mode` and always runs a full reprocess.
 - `POST /api/v1/feeds/{slug}/episodes/{id}/cancel` - Cancel processing for a stuck episode
@@ -61,6 +63,15 @@ Key endpoints:
 - `GET /api/v1/detections` - List ad detections across all feeds with status filter (`needs_review`, `pending`, `rejected`, `accepted`, `all`; default `needs_review`), optional podcast slug (`feed`), free-text search (`q`), sort (`date`, `confidence`, `podcast`), order (`asc`, `desc`), and pagination (`page`, `limit` 1-100, default 20). Powers the Patterns > Ad Review tab.
 - `GET /api/v1/patterns` - List ad patterns (filter by scope)
 - `GET /api/v1/patterns/stats` - Pattern database statistics
+- `GET /api/v1/patterns/cleanup` - Pattern cleanup settings plus live state: `inProgress`, `lastRun`, `lastError`, `lastSummary`, pending suggestion counts by kind (Experiments). See [Pattern Cleanup](pattern-cleanup.md#api)
+- `PUT /api/v1/settings/pattern-cleanup` - Update pattern cleanup settings (`enabled`, `cron`, `batchSize`, `unusedDays`, `provider`, `model`)
+- `POST /api/v1/patterns/cleanup/run` - Start a cleanup batch; `{"force": true}` resets all active learned patterns and replaces their pending suggestions. Later normal batches continue the remaining work. Returns 202 with `{"runId"}`, 400 for invalid input, or 409 if already running; rate limited to 6/hour
+- `GET /api/v1/patterns/cleanup/runs` - Recent pattern cleanup runs, newest first
+- `GET /api/v1/patterns/cleanup/suggestions` - List suggestions by `status` and `kind`; `limit` and `before_id` paginate older decisions without skipping rows after an approval or rejection; the cursor overrides the older `offset` parameter. Includes original text and optional retained transcript context; trim proposals can also correct the sponsor
+- `POST /api/v1/patterns/cleanup/suggestions/{id}/approve` - Approve one suggestion, applying it to the pattern in place
+- `POST /api/v1/patterns/cleanup/suggestions/{id}/reject` - Reject one suggestion
+- `POST /api/v1/patterns/cleanup/suggestions/{id}/undo` - Undo an approval without overwriting later manual edits; unsafe or out-of-order undo returns 409
+- `POST /api/v1/patterns/cleanup/suggestions/bulk` - Approve or reject several suggestion ids at once
 - `GET /api/v1/sponsors` - List/create/update/delete sponsors (full CRUD)
 - `GET /api/v1/search?q=query` - Full-text search across all content, grouped into shows, episodes, transcripts, patterns and sponsors. Optional `groups` (comma-separated subset of those five, default all) limits which are computed; an unrequested group is returned empty rather than omitted. Names are case-sensitive, empty tokens from a stray comma are ignored, and duplicates are tolerated. A query shorter than two characters returns every group empty. The old `type` parameter was removed; a request that still sends it gets a 400
 - `GET /api/v1/episodes/processing` - List episodes currently processing
@@ -95,8 +106,14 @@ Key endpoints:
 - `GET/PUT /api/v1/settings/update-check` - Get or update the update-check settings (`enabled` for the daily auto-check, `channel`: `stable` or `edge`)
 - `GET /api/v1/feeds/{slug}/episodes/{id}/original.mp3` - Stream the retained pre-cut audio (used by ad editor Review mode)
 - `PUT /api/v1/settings/ad-detection` - Update ad detection config, including a partial `modelPricingOverrides` map. Each model entry has input and output prices in USD per 1 million tokens; `null` removes an override.
-- `GET /api/v1/settings/models` - List available AI models from current provider
-- `POST /api/v1/settings/models/refresh` - Force refresh model list from provider. Optional JSON body `{"slot": "primary" | "secondary"}` picks the credential slot (default primary).
+- `GET /api/v1/settings/models` - List available AI models from current provider. Optional `?slot=` picks the credential slot to probe: `primary` (default), `secondary`, `failover`, or the `a`/`b` aliases for primary/secondary.
+- `POST /api/v1/settings/models/refresh` - Force refresh model list from provider. Optional JSON body `{"slot": "primary" | "secondary" | "failover" | "a" | "b"}` picks the credential slot (default primary).
+- `GET /api/v1/failover` - Current state, probe results, policy, and recent events for every failover target. See [Failover](failover.md#manual-control).
+- `POST /api/v1/failover/{target}/trigger` - Manually switch `target` (`llm-a`, `llm-b`, or `transcriber`) onto its failover configuration. Body `{"reason": "..."}` is optional. 409 when that target has no failover configured.
+- `POST /api/v1/failover/{target}/cancel` - Manually switch `target` back to its own configuration.
+- `POST /api/v1/failover/probe` - Run a health probe for every enabled target immediately and return the results.
+- `POST /api/v1/settings/providers/failover/test-connection` - Test the shared LLM failover provider's connection, the same contract as the secondary provider test.
+- `POST /api/v1/settings/providers/failover-whisper/test-connection` - Test the transcriber failover connection, including the sample-audio upload.
 - `POST /api/v1/settings/rate-limit-hold/reset` - Clear every active rate-limit hold without disabling the hold feature
 - `GET/POST/PUT/DELETE /api/v1/settings/webhooks` - Webhook CRUD
 - `POST /api/v1/settings/webhooks/{id}/test` - Fire test webhook
@@ -149,6 +166,8 @@ Key endpoints:
 
 `jobs` lists every running job, oldest first, with the same fields as `currentJob`, which stays as the oldest one. `whisper` is the pool snapshot: whether it is on and active, the request cap, and how many requests and episodes are in flight. Pool counters are per gunicorn worker, so `inFlight` and `transcribingEpisodes` are only meaningful when `leader` is true; a non-leader worker always reports those as 0.
 
+Both frames also carry a `failover` block: `{"active": ["llm-a"], "targets": {"llm-a": {"active": true, "source": "auto", "since": "2026-01-01T12:00:00Z"}, "llm-b": {...}, "transcriber": {...}}}`. `active` lists the targets currently on their failover configuration; `targets` gives every target's state regardless. See [Failover](failover.md) for what drives a switch. `GET /api/v1/system/status` additionally carries `failover.targets` (with the `configured` flag) and `failover.probes` (the health-probe results behind auto-trigger and auto-recovery).
+
 ### Public feed-domain routes
 
 A handful of routes live on the feed domain itself, outside `/api/v1`, and are not part of the OpenAPI spec: the served RSS feed at `/{slug}`, episode audio at `/episodes/{slug}/{episodeId}.mp3`, transcripts and chapters (`.vtt`, `/chapters.json`), feed cover art at `/{slug}/cover-minuspod.jpg`, and:
@@ -161,7 +180,9 @@ GET and HEAD enforce the same feed key on every public route. A HEAD request for
 
 ## Notifications
 
-MinusPod can notify you when episodes complete processing or permanently fail, and when the LLM provider rejects requests (bad credentials, exhausted spend limits, oversized requests). It can also alert you when a rate-limit hold or an unreachable endpoint parks the queue. Two channels share the same events: webhooks (HTTP POST to any endpoint) and native email through your own SMTP server. Configure both in **Settings > Notifications** in the web UI, or via the REST API.
+MinusPod can notify you when episodes complete processing or permanently fail, and when the LLM provider rejects requests (bad credentials, exhausted spend limits, oversized requests). It can also alert you when a rate-limit hold or an unreachable endpoint parks the queue. Two channels share the same events: webhooks (HTTP POST to any endpoint) and native email through your own SMTP server. Configure them on the Settings page under **Notifications > Email** and **Notifications > Webhooks**, or via the REST API.
+
+The **Notifications** section contains the timezone setting and separate **Email** and **Webhooks** subsections. Each subsection collapses independently and remembers its open or closed state.
 
 Every payload carries `timestamp` (UTC, `Z`-suffixed) and `timestamp_local` (the same instant in the configured `notification_timezone`, with a UTC offset). `notification_timezone` is an IANA zone name (default `UTC`, or the container's `TZ` env var when it names a valid zone); get or set it at `GET`/`PUT /api/v1/settings/notifications/timezone`. Email shows `timestamp_local` in the Timestamp row, falling back to `timestamp` when the zone is UTC.
 
@@ -185,8 +206,17 @@ Webhooks fire an HTTP POST to configured URLs. Works with any HTTP endpoint. Use
 | `Queue Resumed` | The rate-limit hold cleared and the queue is claiming work again. One alert per 5 minutes. |
 | `Service Offline` | An episode deferred because the LLM or Whisper endpoint was unreachable (Offline queue). One alert per service per 5 minutes. |
 | `Service Reachable` | The offline probe found a service back up and re-queued its deferred episodes. One alert per service per 5 minutes. |
+| `Failover Triggered` | A target (`llm-a`, `llm-b`, or `transcriber`) switched to its failover configuration, automatically or by hand. Every state change sends an event. See [Failover](failover.md). |
+| `Failover Cancelled` | A target switched back to its own configuration. Every state change sends an event. |
 
 The **Test** button sends one sample payload per event the webhook is subscribed to, each shaped like that event's real payload (see Default Payloads below) with `test: true` set. A webhook subscribed to three events gets three test deliveries in one click; a custom payload template renders against each event's own variable set (episode-shaped for `Episode Processed`/`Episode Failed`, provider-shaped for the alert events, and so on).
+
+If a custom template can't render for an event (for example it uses `episode.title`, which alert events don't have), MinusPod dispatches a default body. Network or endpoint errors can still prevent delivery:
+
+- `text/*` content types get a one-line summary, such as `MinusPod Auth Failure: anthropic claude-sonnet-4 - Invalid API key provided`.
+- Any other content type gets the default JSON payload.
+
+The Test result lists each event's `delivered` status and `templateFallback` flag, so a fallback remains visible when delivery fails.
 
 ### Template Variables
 
@@ -194,7 +224,7 @@ Custom payload templates are Jinja2 strings rendered against these variables:
 
 | Variable | Type | Description |
 |---|---|---|
-| `event` | string | `Episode Processed`, `Episode Failed`, `Auth Failure`, `Limit Exceeded`, `Rate Limit Structural`, `Feed Refresh Failed`, `Update Available`, `Cue Template Quiet`, `Queue Held`, `Queue Resumed`, `Service Offline`, or `Service Reachable` |
+| `event` | string | `Episode Processed`, `Episode Failed`, `Auth Failure`, `Limit Exceeded`, `Rate Limit Structural`, `Feed Refresh Failed`, `Update Available`, `Cue Template Quiet`, `Queue Held`, `Queue Resumed`, `Service Offline`, `Service Reachable`, `Failover Triggered`, or `Failover Cancelled` |
 | `timestamp` | string | ISO 8601 UTC timestamp |
 | `timestamp_local` | string | ISO 8601 local timestamp with UTC offset, per the notification_timezone setting |
 | `podcast.name` | string | Podcast title (falls back to slug if unavailable) |
@@ -336,6 +366,17 @@ Custom payload templates are Jinja2 strings rendered against these variables:
 | `timestamp_local` | string | ISO 8601 local timestamp with UTC offset, per the notification_timezone setting |
 | `service` | string | `llm` or `whisper` |
 | `requeued` | int | Deferred episodes the probe pass sent back to the queue |
+
+**Failover Triggered and Failover Cancelled events use a different payload:**
+
+| Variable | Type | Description |
+|---|---|---|
+| `event` | string | `Failover Triggered` or `Failover Cancelled` |
+| `timestamp` | string | ISO 8601 UTC timestamp |
+| `timestamp_local` | string | ISO 8601 local timestamp with UTC offset, per the notification_timezone setting |
+| `target` | string | `llm-a`, `llm-b`, or `transcriber` |
+| `source` | string | `auto` (mid-run trigger error), `probe` (two failed health probes), or `manual` |
+| `reason` | string | Free text: the triggering error, or empty on a manual cancel |
 
 ### Default Payloads
 
@@ -547,11 +588,37 @@ When no custom template is configured, MinusPod sends these JSON payloads.
 }
 ```
 
+**Failover Triggered:**
+
+```json
+{
+  "event": "Failover Triggered",
+  "timestamp": "2026-04-12T00:15:42Z",
+  "timestamp_local": "2026-04-12T00:15:42+00:00",
+  "target": "llm-a",
+  "source": "auto",
+  "reason": "HTTP 503"
+}
+```
+
+**Failover Cancelled:**
+
+```json
+{
+  "event": "Failover Cancelled",
+  "timestamp": "2026-04-12T00:15:42Z",
+  "timestamp_local": "2026-04-12T00:15:42+00:00",
+  "target": "llm-a",
+  "source": "manual",
+  "reason": ""
+}
+```
+
 ## Email notifications
 
 Point MinusPod at an SMTP server and it emails you for the events you pick. Community webhook-to-email sidecars like minuspod-webhook-mailer are no longer needed. One configuration: SMTP host, port, security (None, STARTTLS, or SSL/TLS), optional username and password, a from address, and a comma-separated recipient list. The password is stored encrypted like provider API keys, so saving one needs `MINUSPOD_MASTER_PASSPHRASE` set.
 
-Emails are HTML with the MinusPod logo embedded inline (no external image fetch) and a plain-text fallback part for text-only clients. Each event renders a subject like `[MinusPod] Episode Failed: My Show - Episode 42` with a short table of facts and, for alert events, the action to take. Alert events (`Auth Failure`, `Limit Exceeded`, `Rate Limit Structural`, `Queue Held`, `Queue Resumed`, `Service Offline`, `Service Reachable`) keep their 5-minute dedup window, shared with webhooks, so a burst of failures produces one email. The webhook Test button never emails; the email form has its own **Send test email** button that delivers a real message through the saved settings.
+Emails are HTML with the MinusPod logo embedded inline (no external image fetch) and a plain-text fallback part for text-only clients. Each event renders a subject like `[MinusPod] Episode Failed: My Show - Episode 42` with a short table of facts and, for alert events, the action to take. Alert events (`Auth Failure`, `Limit Exceeded`, `Rate Limit Structural`, `Queue Held`, `Queue Resumed`, `Service Offline`, `Service Reachable`) keep their 5-minute dedup window, shared with webhooks, so a burst of failures produces one email. `Failover Triggered` and `Failover Cancelled` are sent once per state change with no dedup window. The webhook Test button never emails; the email form has its own **Send test email** button that delivers a real message through the saved settings.
 
 By default the failure and alert events, including the four new hold and offline events, are checked and `Episode Processed` is not, so a working setup stays quiet. SMTP sending runs with a 10 second timeout in a background thread; a down mail server never blocks or fails episode processing. An `Episode Processed` email adds an "Ads held for review" and/or "Detections not cut" row when the run produced either, so a quiet run's table stays short. A send failure logs the full traceback (issue #571) rather than just the exception message, for easier SMTP troubleshooting from container logs.
 
@@ -560,7 +627,7 @@ By default the failure and alert events, including the four new hold and offline
 Pushover supports native webhook ingestion with data extraction selectors. No custom payload template needed. MinusPod's default JSON payload works directly.
 
 1. Create a webhook at [pushover.net/dashboard](https://pushover.net/dashboard) and copy its URL.
-2. In MinusPod Settings > Webhooks: paste the URL, select events, **leave payload template blank**.
+2. In MinusPod Settings, open **Notifications > Webhooks**: paste the URL, select events, **leave payload template blank**.
 3. Click Test in MinusPod to fire a sample payload to Pushover.
 4. In Pushover, load the last payload and configure data extraction selectors:
 
@@ -578,7 +645,7 @@ Pushover supports native webhook ingestion with data extraction selectors. No cu
 ntfy requires a custom payload template to match its expected JSON format.
 
 1. Self-hosted or ntfy.sh: set your topic name
-2. Add a webhook in Settings > Webhooks:
+2. Add a webhook under **Notifications > Webhooks** in Settings:
    - **URL:** `https://ntfy.sh/your-topic` (or your self-hosted instance)
    - **Payload template:**
      ```json
@@ -589,6 +656,20 @@ ntfy requires a custom payload template to match its expected JSON format.
        "actions": [{"action": "view", "label": "Open Episode", "url": "{{ episode.url }}"}]
      }
      ```
+
+The template above only renders for the episode events. To receive alert events (Auth Failure, Queue Held, ...) on the same webhook, use a plain-text template instead:
+
+- **URL:** `https://ntfy.sh/your-topic` (the topic is in the URL, so the template has no `topic` field)
+- **Content type:** `text/plain` (ntfy shows the body as the message)
+
+Episode failures put the error under `episode.error_message`, while alert events use top-level `error_message`. Use this template:
+
+- **Payload template:**
+  ```
+  {{ event }}{% if episode is defined %}: {{ podcast.name }} - {{ episode.title }}{% endif %}{% if error_message is defined and error_message %} - {{ error_message }}{% elif episode is defined and episode.error_message is defined and episode.error_message %} - {{ episode.error_message }}{% endif %}
+  ```
+
+This renders for every event, for example `Episode Processed: My Show - Episode 42` and `Auth Failure - Invalid API key provided`. Use **Test** to confirm that no subscribed event falls back.
 
 > ntfy also supports header-based delivery (`X-Title`, `X-Message`, `X-Click` headers with plain text body); either approach works with MinusPod's template system.
 

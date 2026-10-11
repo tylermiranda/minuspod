@@ -10,14 +10,13 @@ import {
 } from '../api/history';
 import { feedsQueryOptions } from '../api/feeds';
 import { feedDisplayTitle } from '../utils/feedTitle';
-import { formatDateTime } from '../utils/format';
+import { formatDateTime, formatDurationPrecise } from '../utils/format';
 import { ProcessingHistoryEntry } from '../api/types';
 import { SkeletonPageHeader, SkeletonRows } from '../components/Skeleton';
 import { Pagination } from '../components/Pagination';
 import { SortHeader, useSortState } from '../components/SortHeader';
 import { btnSecondary } from '../components/buttonStyles';
-import { selectBase } from '../components/fieldStyles';
-import { focusRing } from '../components/fieldStyles';
+import { selectBase, focusRing, filterGrid, filterLabel, filterControl } from '../components/fieldStyles';
 import { badgeBase, tint } from '../components/badgeStyles';
 
 type StatusFilter = 'all' | 'completed' | 'failed';
@@ -80,19 +79,6 @@ function HistoryPage() {
     } finally {
       setExporting(null);
     }
-  };
-
-  const formatDuration = (seconds: number | null) => {
-    if (seconds === null || seconds === undefined) {
-      return '-';
-    }
-    if (seconds < 60) {
-      return `${seconds.toFixed(1)}s`;
-    }
-    const roundedSeconds = Math.round(seconds);
-    const mins = Math.floor(roundedSeconds / 60);
-    const secs = roundedSeconds % 60;
-    return `${mins}m ${secs}s`;
   };
 
   if (isLoading) {
@@ -175,26 +161,33 @@ function HistoryPage() {
 
       {/* Filters */}
       <div className="flex flex-col sm:flex-row gap-4 mb-6">
-        <div className="flex flex-col sm:flex-row gap-2">
+        <div className={`${filterGrid} w-full sm:flex-1`}>
+          <div className="min-w-0">
+          <label htmlFor="history-status" className={filterLabel}>Status</label>
           <select
+            id="history-status"
             value={statusFilter}
             onChange={(e) => {
               setStatusFilter(e.target.value as StatusFilter);
               setPage(1);
             }}
-            className={`w-full sm:w-auto ${selectBase}`}
+            className={`${filterControl} ${selectBase}`}
           >
             <option value="all">All Status</option>
             <option value="completed">Completed</option>
             <option value="failed">Failed</option>
           </select>
+          </div>
+          <div className="min-w-0">
+          <label htmlFor="history-podcast" className={filterLabel}>Podcast</label>
           <select
+            id="history-podcast"
             value={podcastFilter}
             onChange={(e) => {
               setPodcastFilter(e.target.value);
               setPage(1);
             }}
-            className={`w-full sm:w-auto ${selectBase}`}
+            className={`${filterControl} ${selectBase}`}
           >
             <option value="">All Podcasts</option>
             {[...(feeds ?? [])]
@@ -205,10 +198,11 @@ function HistoryPage() {
                 </option>
               ))}
           </select>
+          </div>
         </div>
         {stats && (
           <div className="text-sm text-muted-foreground self-center">
-            Avg processing time: {formatDuration(stats.avgProcessingTimeSeconds)}
+            Avg processing time: {formatDurationPrecise(stats.avgProcessingTimeSeconds)}
           </div>
         )}
       </div>
@@ -251,6 +245,9 @@ function HistoryPage() {
                 >
                   {entry.episodeTitle}
                 </Link>
+                {entry.mode === 'chapters' && (
+                  <p className="text-xs text-muted-foreground">Chapter regeneration</p>
+                )}
                 {entry.status !== 'completed' && entry.errorMessage && (
                   <p
                     className="text-xs text-destructive truncate cursor-help mt-1"
@@ -262,13 +259,13 @@ function HistoryPage() {
               </div>
               <div className="flex items-center gap-4 text-xs text-muted-foreground">
                 <span>{formatDateTime(entry.processedAt)}</span>
-                <span>{formatDuration(entry.processingDurationSeconds)}</span>
+                <span>{formatDurationPrecise(entry.processingDurationSeconds)}</span>
                 {entry.downloadedDuration != null && (
                   <span title="Length of the downloaded copy this run processed">
-                    Audio: {formatDuration(entry.downloadedDuration)}
+                    Audio: {formatDurationPrecise(entry.downloadedDuration)}
                   </span>
                 )}
-                <span>Ads: {entry.adsDetected}</span>
+                <span>Ads: {entry.mode === 'chapters' ? '-' : entry.adsDetected}</span>
                 {entry.llmCost != null && entry.llmCost > 0 && <span>${entry.llmCost.toFixed(2)}</span>}
                 {entry.reprocessNumber > 1 && <span>#{entry.reprocessNumber}</span>}
               </div>
@@ -333,6 +330,9 @@ function HistoryPage() {
                       >
                         {entry.episodeTitle}
                       </Link>
+                      {entry.mode === 'chapters' && (
+                        <span className="block text-xs text-muted-foreground">Chapter regeneration</span>
+                      )}
                       {entry.status !== 'completed' && entry.errorMessage && (
                         <span
                           className="block text-xs text-destructive truncate max-w-[200px] cursor-help mt-1"
@@ -346,15 +346,15 @@ function HistoryPage() {
                       {formatDateTime(entry.processedAt)}
                     </td>
                     <td className="px-4 py-3 text-sm text-muted-foreground hidden md:table-cell">
-                      {formatDuration(entry.processingDurationSeconds)}
+                      {formatDurationPrecise(entry.processingDurationSeconds)}
                     </td>
                     <td className="px-4 py-3 text-sm text-muted-foreground hidden lg:table-cell">
                       {entry.downloadedDuration != null
-                        ? formatDuration(entry.downloadedDuration)
+                        ? formatDurationPrecise(entry.downloadedDuration)
                         : '-'}
                     </td>
                     <td className="px-4 py-3 text-sm text-foreground">
-                      {entry.adsDetected}
+                      {entry.mode === 'chapters' ? '-' : entry.adsDetected}
                     </td>
                     <td className="px-4 py-3 text-sm text-muted-foreground hidden md:table-cell">
                       {entry.llmCost != null && entry.llmCost > 0 ? `$${entry.llmCost.toFixed(2)}` : '-'}

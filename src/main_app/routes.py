@@ -9,6 +9,7 @@ import time
 from datetime import datetime, timezone
 from functools import wraps
 from pathlib import Path
+from urllib.parse import urlencode
 
 import requests
 import requests.exceptions
@@ -21,11 +22,12 @@ from config import (
     HTTP_TIMEOUT_API,
     JIT_RETRY_COOLDOWN_SECONDS,
     MAX_EPISODE_RETRIES,
+    episode_matches_feed_filters,
     resolve_jit_blocked_user_agents,
-    title_matches_skip_patterns,
     user_agent_is_jit_blocked,
 )
-from ad_chapters import public_chapters
+from ad_chapters import ID3_CHAPTER_SOURCE_KEY, public_chapters
+from storage import is_chapter_image_filename
 from database.podcasts import has_upstream, is_local_feed
 from database.queue import compute_queue_priority
 from main_app.feeds import is_served_rss_stale
@@ -37,6 +39,7 @@ from rss_parser import (
 )
 from user_agent import download_user_agent
 from utils.constants import EpisodeStatus, REPROCESS_SOURCE_JIT
+from utils.episode_paths import published_episode_version
 from utils.safe_http import URLTrust, safe_head
 from utils.time import parse_iso_datetime, utc_now_iso
 from utils.url import SSRFError
@@ -66,7 +69,6 @@ from utils.opml import build_opml_xml
 
 # Resolved once at registration time
 STATIC_DIR = None
-ROOT_DIR = None
 
 
 def _personalize_rss_for_subscriber(cached_rss: str) -> str:
@@ -112,6 +114,7 @@ PUBLIC_FEED_ENDPOINTS = frozenset({
     'serve_episode',
     'serve_transcript_vtt',
     'serve_chapters_json',
+    'serve_chapter_image',
     'serve_episode_artwork',
     'serve_opml',
     'serve_minuspod_cover',
@@ -208,7 +211,7 @@ def _lookup_episode(slug, episode_id, feed_map, episode_row=None):
     # lookup.
     podcast = db.get_podcast_by_slug(slug)
     # An unknown row keeps the historical fetch; only local/recents rows skip it.
-    original_feed = (rss_parser.fetch_feed(feed_map[slug]['in'])
+    original_feed = (rss_parser.fetch_feed(feed_map[slug]['in'], podcast=podcast)
                      if podcast is None or has_upstream(podcast) else None)
     if original_feed:
         parsed_feed = rss_parser.parse_feed(original_feed, source=slug)
@@ -264,7 +267,7 @@ def _head_upstream(slug, episode_id, original_url):
             # Real-world podcast CDNs (Megaphone, Art19, Acast, simplecast)
             # chain 6-8 redirects per asset request.
             max_redirects=HTTP_MAX_REDIRECTS_FEED,
-            headers={'User-Agent': download_user_agent()},
+            headers={'User-Agent': download_user_agent(db.get_podcast_by_slug(slug))},
         )
     except SSRFError as e:
         feed_logger.warning(f"[{slug}:{episode_id}] SSRF blocked in HEAD upstream: {e}")
@@ -284,21 +287,35 @@ def _head_upstream(slug, episode_id, original_url):
     abort(503)
 
 
-def _head_local(slug, episode_id):
-    """HEAD response for a not-yet-processed local-feed episode.
-
-    Local feeds have no upstream to proxy (original_url is the
-    local://<episode_id> sentinel), so report on whatever audio is already
-    held: the retained original, or a processed file left over from an
-    earlier version. 404 when neither exists.
-    """
-    for path in (storage.get_original_path(slug, episode_id),
-                 storage.get_episode_path(slug, episode_id)):
+def _published_processed_path(slug, episode_id, episode,
+                             requested_version=None):
+    current_version = published_episode_version(episode)
+    if current_version is None:
+        return None
+    versions = []
+    if (type(requested_version) is int
+            and 0 <= requested_version <= current_version):
+        versions.append(requested_version)
+    if current_version not in versions:
+        versions.append(current_version)
+    for version in versions:
+        path = storage.get_episode_path(slug, episode_id, version=version)
         if path.exists():
-            proxy_resp = Response('', status=200)
-            proxy_resp.headers['Content-Type'] = 'audio/mpeg'
-            proxy_resp.content_length = path.stat().st_size
-            return proxy_resp
+            return path
+    return None
+
+
+def _head_local(slug, episode_id, episode, requested_version=None):
+    """HEAD the published local cut or retained original."""
+    path = _published_processed_path(
+        slug, episode_id, episode, requested_version)
+    if path is None:
+        path = storage.get_original_path(slug, episode_id)
+    if path.exists():
+        proxy_resp = Response('', status=200)
+        proxy_resp.headers['Content-Type'] = 'audio/mpeg'
+        proxy_resp.content_length = path.stat().st_size
+        return proxy_resp
     abort(404)
 
 
@@ -321,21 +338,15 @@ def _local_original_response(slug, episode_id, requested_version=None):
     normal response) when nothing at all is retained.
     """
     episode = db.get_episode(slug, episode_id)
-    current_version = (episode or {}).get('processed_version') or 0
-    candidate_versions = []
-    if requested_version is not None:
-        candidate_versions.append(requested_version)
-    if current_version not in candidate_versions:
-        candidate_versions.append(current_version)
-    for version in candidate_versions:
-        processed_path = storage.get_episode_path(slug, episode_id, version=version)
-        if processed_path.exists():
-            feed_logger.info(
-                f"[{slug}:{episode_id}] serving processed file (v={version}) "
-                f"during reprocess window")
-            response = send_file(processed_path, mimetype='audio/mpeg', conditional=True)
-            response.headers['Accept-Ranges'] = 'bytes'
-            return response
+    processed_path = _published_processed_path(
+        slug, episode_id, episode, requested_version)
+    if processed_path is not None:
+        feed_logger.info(
+            f"[{slug}:{episode_id}] serving published processed file "
+            "during reprocess window")
+        response = send_file(processed_path, mimetype='audio/mpeg', conditional=True)
+        response.headers['Accept-Ranges'] = 'bytes'
+        return response
 
     original_path = storage.get_original_path(slug, episode_id)
     if not original_path.exists():
@@ -349,12 +360,16 @@ def _local_original_response(slug, episode_id, requested_version=None):
 
 def register_routes(app):
     """Register all routes on the Flask app."""
-    global STATIC_DIR, ROOT_DIR
+    global STATIC_DIR
 
     STATIC_DIR = Path(__file__).parent.parent.parent / 'static' / 'ui'
-    ROOT_DIR = Path(__file__).parent.parent.parent
 
     # ========== Web UI Static File Serving ==========
+
+    @app.route('/')
+    def root_redirect():
+        """Send a bare host:port visit to the UI instead of a 404."""
+        return redirect('/ui/', code=302)
 
     @app.route('/ui/')
     @app.route('/ui/<path:path>')
@@ -385,8 +400,9 @@ def register_routes(app):
             return response
 
         response = send_from_directory(STATIC_DIR, path)
-        # The service worker script must always revalidate, or a cached copy delays update detection.
-        no_cache = path == 'sw.js'
+        # sw.js, index.html, and manifest.webmanifest must always revalidate,
+        # or a cached copy delays update detection.
+        no_cache = path in ('sw.js', 'index.html', 'manifest.webmanifest')
         response.headers['Cache-Control'] = 'no-cache, must-revalidate' if no_cache else 'public, max-age=3600'
         return response
 
@@ -429,7 +445,7 @@ def register_routes(app):
             # bots probe random slugs (`/foo`, `/.hidden`, `/etc`, ...) and
             # each probe would otherwise fire an outbound request per
             # subscribed feed. The scheduled refresher keeps feed_map
-            # current within `RSS_REFRESH_INTERVAL`; a bogus slug just 404s.
+            # current on its own interval; a bogus slug just 404s.
             feed_logger.info(f"[{slug}] Feed not found (no refresh-on-miss)")
             abort(404)
 
@@ -551,26 +567,16 @@ def register_routes(app):
         status = episode['status'] if episode else None
 
         if status == EpisodeStatus.PROCESSED:
-            current_version = (episode or {}).get('processed_version') or 0
-            # Pick the version to serve. If client asked for a specific version
-            # and that file is present, serve it; otherwise fall through to current.
-            serve_version = current_version
-            if requested_version is not None:
-                versioned_path = storage.get_episode_path(
-                    slug, episode_id, version=requested_version
-                )
-                if versioned_path.exists():
-                    serve_version = requested_version
-            file_path = storage.get_episode_path(
-                slug, episode_id, version=serve_version
-            )
-            if file_path.exists():
+            file_path = _published_processed_path(
+                slug, episode_id, episode, requested_version)
+            if file_path is not None:
                 feed_logger.info(
-                    f"[{slug}:{episode_id}] Cache hit (v={serve_version})"
+                    f"[{slug}:{episode_id}] Cache hit for published audio"
                 )
                 return send_file(file_path, mimetype='audio/mpeg')
             else:
-                feed_logger.error(f"[{slug}:{episode_id}] Processed file missing")
+                feed_logger.error(
+                    f"[{slug}:{episode_id}] Published processed file missing")
                 status = None
 
         # Fetched once and reused below (status branches, HEAD branch,
@@ -654,7 +660,8 @@ def register_routes(app):
             ep_data, _ = _routes._lookup_episode(slug, episode_id, feed_map, episode_row=episode)
             if ep_data:
                 if local_feed:
-                    return _routes._head_local(slug, episode_id)
+                    return _routes._head_local(
+                        slug, episode_id, episode, requested_version)
                 return _routes._head_upstream(slug, episode_id, ep_data['url'])
             abort(404)
 
@@ -677,14 +684,16 @@ def register_routes(app):
         episode_description = ep_data.get('description')
         episode_artwork_url = ep_data.get('artwork_url')
 
-        # Title blacklist: serve the upstream audio untouched, never process.
-        # Local feeds have no upstream to redirect to -- original_url is the
-        # unreachable local:// sentinel -- so the blacklist never applies to
-        # them; a matching title on a local episode just processes normally.
+        # Filtered subscribed episodes serve upstream audio without processing.
+        # Reuses the podcast row fetched above instead of separate per-column queries.
         if not local_feed:
-            title_skip_patterns = db.get_podcast_title_skip_patterns(slug)
-            if title_matches_skip_patterns(episode_title, title_skip_patterns):
-                feed_logger.info(f"[{slug}:{episode_id}] Title-blacklisted, serving original: {episode_title}")
+            jit_episode = {
+                'title': episode_title,
+                'description': episode_description,
+                'rss_duration': ep_data.get('rss_duration', (episode or {}).get('rss_duration')),
+            }
+            if episode_matches_feed_filters(jit_episode, podcast):
+                feed_logger.info(f"[{slug}:{episode_id}] Matched feed filters, serving original: {episode_title}")
                 return redirect(original_url, code=302)
 
         # A crawler gets the origin audio rather than a processing run it will
@@ -801,8 +810,36 @@ def register_routes(app):
         # Podcasting 2.0 chapters.json is fetched cross-origin by
         # podcast players; the wildcard Access-Control-Allow-Origin
         # is intentional. No credentials travel with the request.
-        body = {**chapters, 'chapters': public_chapters(chapters.get('chapters'))}
+        entries = public_chapters(chapters.get('chapters'))
+        image_prefix = f'/episodes/{slug}/{episode_id}/chapter-images/'
+        supplied_key = request.args.get('key') if feed_auth_enabled(db) else None
+        for chapter in entries:
+            image = chapter.get('img')
+            if (isinstance(image, str)
+                    and image.startswith(image_prefix)
+                    and is_chapter_image_filename(image[len(image_prefix):])):
+                chapter['img'] = rss_parser._resolved_base_url().rstrip('/') + image
+                if supplied_key:
+                    chapter['img'] += '?' + urlencode({'key': supplied_key})
+        body = {key: value for key, value in chapters.items() if key != ID3_CHAPTER_SOURCE_KEY}
+        body['chapters'] = entries
         response = Response(json.dumps(body), mimetype='application/json+chapters')
+        response.headers['Access-Control-Allow-Origin'] = '*'
+        return response
+
+    @app.route('/episodes/<slug>/<episode_id>/chapter-images/<filename>')
+    @validate_slug_and_episode_params
+    @require_feed_key
+    @log_request_detailed
+    def serve_chapter_image(slug, episode_id, filename):
+        """Serve a local JPEG/PNG extracted from an embedded chapter."""
+        result = storage.get_chapter_image(slug, episode_id, filename)
+        if not result:
+            abort(404)
+        image_data, content_type = result
+        response = Response(image_data, mimetype=content_type)
+        response.headers['X-Content-Type-Options'] = 'nosniff'
+        response.headers['Content-Security-Policy'] = "default-src 'none'"
         response.headers['Access-Control-Allow-Origin'] = '*'
         return response
 

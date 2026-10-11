@@ -11,16 +11,13 @@ import ChevronCaret from './ChevronCaret';
 // then tracks toggles: pass `storageKey` and wire the setter to `onToggle`.
 // Lives here so knowledge of the storage-key contract stays next to the
 // component that owns it.
-/**
- * Whether a section's content is on screen: its persisted open flag, or a
- * settings search revealing it. Use to gate a query on visibility. The search
- * path matters because a search expands a section without ever calling
- * onToggle, so the persisted flag alone would leave a matched section stuck
- * on "Loading..." with no way to reach its settings.
- */
+/** Search matches override saved openness when gating section queries. */
+export function sectionVisible(matchKeys: Set<string> | null, storageKey: string, open: boolean): boolean {
+  return matchKeys !== null ? matchKeys.has(storageKey) : open;
+}
+
 export function useSectionVisible(storageKey: string, open: boolean): boolean {
-  const matchKeys = useSettingsSearch();
-  return open || (matchKeys !== null && matchKeys.has(storageKey));
+  return sectionVisible(useSettingsSearch(), storageKey, open);
 }
 
 export function useCollapsibleOpen(
@@ -30,6 +27,12 @@ export function useCollapsibleOpen(
   const [open, setOpen] = useState(
     () => readStoredValue<boolean>(storageKey, defaultOpen) === true,
   );
+  // Re-read a new key so reused feed panels restore that feed's saved state.
+  const [prevKey, setPrevKey] = useState(storageKey);
+  if (storageKey !== prevKey) {
+    setPrevKey(storageKey);
+    setOpen(readStoredValue<boolean>(storageKey, defaultOpen) === true);
+  }
   return [open, setOpen];
 }
 
@@ -40,6 +43,7 @@ interface CollapsibleSectionProps {
   children: ReactNode;
   headerRight?: ReactNode;
   storageKey?: string;
+  variant?: 'card' | 'subsection';
   onToggle?: (isOpen: boolean) => void;
   // When true, children are only mounted while the section is open. Use for
   // children that misbehave when rendered into a zero-size collapsed container
@@ -62,10 +66,12 @@ function CollapsibleSection({
   children,
   headerRight,
   storageKey,
+  variant = 'card',
   onToggle,
   unmountWhenClosed = false,
   forceOpen = false,
 }: CollapsibleSectionProps) {
+  const subsection = variant === 'subsection';
   const resolvedKey = storageKey || `settings-section-${title.toLowerCase().replace(/\s+/g, '-')}`;
 
   const [isOpen, setIsOpen] = useLocalStorageState<boolean>(resolvedKey, defaultOpen);
@@ -145,11 +151,14 @@ function CollapsibleSection({
   });
 
   return (
-    <div data-search-key={resolvedKey} className={`bg-card rounded-lg border border-border${hiddenBySearch ? ' hidden' : ''}`}>
+    <div
+      data-search-key={resolvedKey}
+      className={`${subsection ? 'border-t border-border first:border-t-0' : 'bg-card rounded-lg border border-border'}${hiddenBySearch ? ' hidden' : ''}`}
+    >
       {/* The row div (not a wrapping button) carries the click target so a
           button passed via headerRight never nests inside a button. */}
       <div
-        className="w-full flex items-start justify-between p-4 sm:p-6 cursor-pointer"
+        className={`w-full flex justify-between cursor-pointer ${subsection ? 'min-h-11 items-center sm:py-3' : 'items-start p-4 sm:p-6'}`}
         onClick={() => {
           // While searching, expansion follows the match, not isOpen, so a
           // toggle would silently flip the persisted state with no visible
@@ -165,9 +174,11 @@ function CollapsibleSection({
         <button
           type="button"
           aria-expanded={expanded}
-          className={`flex-1 min-w-0 text-left ${focusRing}`}
+          className={`flex-1 min-w-0 text-left ${subsection ? 'flex min-h-11 flex-col items-start justify-center sm:min-h-0' : ''} ${focusRing}`}
         >
-          <h2 className="text-lg font-semibold text-foreground">{title}</h2>
+          {subsection
+            ? <h3 className="text-base font-semibold text-foreground">{title}</h3>
+            : <h2 className="text-lg font-semibold text-foreground">{title}</h2>}
           {subtitle && expanded && (
             <p className="text-sm text-muted-foreground mt-0.5">{subtitle}</p>
           )}
@@ -192,7 +203,7 @@ function CollapsibleSection({
         style={{ maxHeight: contentMaxHeight }}
         className={`${contentMaxHeight !== 'none' ? 'overflow-hidden' : ''} ${animating ? 'transition-[max-height] duration-300 ease-in-out' : ''}`}
       >
-        <div className="px-4 pb-4 sm:px-6 sm:pb-6">
+        <div className={subsection ? 'pb-4' : 'px-4 pb-4 sm:px-6 sm:pb-6'}>
           {(!unmountWhenClosed || keepMounted || openState || matchesSearch) && children}
         </div>
       </div>

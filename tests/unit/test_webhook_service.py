@@ -163,7 +163,7 @@ class TestBuildContext:
         mock_db = MagicMock()
         mock_db.get_setting.return_value = 'America/New_York'
         payload = _make_payload()
-        with patch('webhook_service.Database', return_value=mock_db):
+        with patch('webhook_service.database.Database', return_value=mock_db):
             ctx = _build_context(payload)
         assert ctx['timestamp'].endswith('Z')
         assert ctx['timestamp_local'].endswith(('-04:00', '-05:00'))
@@ -430,7 +430,7 @@ class TestFireTestEvent:
 
         results = fire_test_event(config)
 
-        assert results == [{'event': EVENT_AUTH_FAILURE, 'delivered': True}]
+        assert results == [{'event': EVENT_AUTH_FAILURE, 'delivered': True, 'templateFallback': False}]
         mock_post.assert_called_once()
         body = json.loads(mock_post.call_args.kwargs['data'])
         assert body['event'] == EVENT_AUTH_FAILURE
@@ -456,9 +456,9 @@ class TestFireTestEvent:
             results = fire_test_event(config)
 
         assert results == [
-            {'event': EVENT_EPISODE_FAILED, 'delivered': True},
-            {'event': EVENT_RATE_LIMIT_STRUCTURAL, 'delivered': True},
-            {'event': EVENT_UPDATE_AVAILABLE, 'delivered': True},
+            {'event': EVENT_EPISODE_FAILED, 'delivered': True, 'templateFallback': False},
+            {'event': EVENT_RATE_LIMIT_STRUCTURAL, 'delivered': True, 'templateFallback': False},
+            {'event': EVENT_UPDATE_AVAILABLE, 'delivered': True, 'templateFallback': False},
         ]
         assert mock_post.call_count == 3
         bodies = [json.loads(c.kwargs['data']) for c in mock_post.call_args_list]
@@ -481,7 +481,7 @@ class TestFireTestEvent:
         with patch('database.Database', return_value=mock_db):
             results = fire_test_event(config)
 
-        assert results == [{'event': EVENT_EPISODE_PROCESSED, 'delivered': True}]
+        assert results == [{'event': EVENT_EPISODE_PROCESSED, 'delivered': True, 'templateFallback': False}]
         mock_post.assert_called_once()
 
     @patch('webhook_service.safe_post')
@@ -495,7 +495,7 @@ class TestFireTestEvent:
         with patch('database.Database', return_value=mock_db):
             results = fire_test_event(config)
 
-        assert results == [{'event': EVENT_EPISODE_PROCESSED, 'delivered': True}]
+        assert results == [{'event': EVENT_EPISODE_PROCESSED, 'delivered': True, 'templateFallback': False}]
 
     @patch('webhook_service.safe_post')
     def test_unrecognized_event_reports_the_sample_it_actually_sent(self, mock_post):
@@ -510,7 +510,7 @@ class TestFireTestEvent:
         with patch('database.Database', return_value=mock_db):
             results = fire_test_event(config)
 
-        assert results == [{'event': EVENT_EPISODE_PROCESSED, 'delivered': True}]
+        assert results == [{'event': EVENT_EPISODE_PROCESSED, 'delivered': True, 'templateFallback': False}]
         body = json.loads(mock_post.call_args.kwargs['data'])
         assert body['event'] == EVENT_EPISODE_PROCESSED
 
@@ -530,8 +530,8 @@ class TestFireTestEvent:
         results = fire_test_event(config)
 
         assert results == [
-            {'event': EVENT_AUTH_FAILURE, 'delivered': True},
-            {'event': EVENT_LIMIT_EXCEEDED, 'delivered': False},
+            {'event': EVENT_AUTH_FAILURE, 'delivered': True, 'templateFallback': False},
+            {'event': EVENT_LIMIT_EXCEEDED, 'delivered': False, 'templateFallback': False},
         ]
 
     @patch('webhook_service.safe_post')
@@ -552,7 +552,255 @@ class TestFireTestEvent:
                     'payloadTemplate': template,
                 }
                 results = fire_test_event(config)
-                assert results == [{'event': event, 'delivered': True}]
+                assert [(r['event'], r['delivered']) for r in results] == [(event, True)]
+
+    @patch('webhook_service.safe_post')
+    def test_template_fallback_flagged_only_for_events_that_cannot_render(self, mock_post):
+        """An episode-only template renders for episode events and falls back
+        for alert events; each result says which."""
+        mock_post.return_value = MagicMock(status_code=200)
+        mock_db = MagicMock()
+        mock_db.get_latest_completed_processing.return_value = None
+        config = {
+            'url': 'https://hook.example.com',
+            'events': [EVENT_EPISODE_PROCESSED, EVENT_AUTH_FAILURE],
+            'payloadTemplate': '{{ podcast.name }} - {{ episode.title }}',
+        }
+
+        with patch('database.Database', return_value=mock_db):
+            results = fire_test_event(config)
+
+        assert results == [
+            {'event': EVENT_EPISODE_PROCESSED, 'delivered': True, 'templateFallback': False},
+            {'event': EVENT_AUTH_FAILURE, 'delivered': True, 'templateFallback': True},
+        ]
+
+    @patch('webhook_service.safe_post')
+    def test_documented_ntfy_template_renders_every_event_and_episode_failure(self, mock_post):
+        mock_post.return_value = MagicMock(status_code=200)
+        mock_db = MagicMock()
+        mock_db.get_latest_completed_processing.return_value = None
+        template = (
+            '{{ event }}{% if episode is defined %}: {{ podcast.name }} - {{ episode.title }}{% endif %}'
+            '{% if error_message is defined and error_message %} - {{ error_message }}'
+            '{% elif episode is defined and episode.error_message is defined and episode.error_message %}'
+            ' - {{ episode.error_message }}{% endif %}'
+        )
+        config = {
+            'url': 'https://hook.example.com',
+            'events': sorted(VALID_EVENTS),
+            'contentType': 'text/plain',
+            'payloadTemplate': template,
+        }
+
+        with patch('database.Database', return_value=mock_db):
+            results = fire_test_event(config)
+
+        assert [result['event'] for result in results] == sorted(VALID_EVENTS)
+        assert all(result['delivered'] and not result['templateFallback'] for result in results)
+        bodies = [call.kwargs['data'].decode('utf-8') for call in mock_post.call_args_list]
+        failed_body = next(body for body in bodies if body.startswith(EVENT_EPISODE_FAILED))
+        assert failed_body == (
+            'Episode Failed: My Favorite Podcast - Episode 42: The Answer - '
+            'Transcription failed: audio file is corrupt or unsupported format'
+        )
+
+    @pytest.mark.parametrize('exception_type', [RuntimeError, webhook_service.SSRFError])
+    def test_dispatch_exception_log_redacts_url_and_exception(self, caplog, exception_type):
+        url = 'https://user:password@hook.example.com/private/path?token=secret-value'
+        with patch('webhook_service.safe_post', side_effect=exception_type(
+                f'transport failed for {url}')):
+            _prepare_and_dispatch({'url': url}, {'event': EVENT_AUTH_FAILURE}, max_attempts=1)
+
+        if exception_type is webhook_service.SSRFError:
+            expected_message = 'Webhook URL blocked by SSRF check: https://hook.example.com (SSRFError)'
+        else:
+            expected_message = 'Webhook attempt 1/1 failed for https://hook.example.com (RuntimeError)'
+        assert [record.getMessage() for record in caplog.records] == [expected_message]
+        for sensitive_value in ('user', 'password', '/private/path', 'secret-value', 'transport failed'):
+            assert sensitive_value not in caplog.text
+
+    @pytest.mark.parametrize('dispatch_kind', ['episode', 'alert'])
+    def test_unexpected_dispatch_logs_redact_url_and_exception(self, caplog, dispatch_kind):
+        url = 'https://user:password@hook.example.com/private/path?token=secret-value'
+        webhook = {'url': url, 'enabled': True, 'events': [EVENT_EPISODE_PROCESSED]}
+        with patch('webhook_service.load_webhooks', return_value=[webhook]), \
+                patch('webhook_service._prepare_and_dispatch', side_effect=ValueError(
+                    f'unexpected render failure for {url}')), \
+                patch('webhook_service._timestamp_fields', return_value={}), \
+                patch('email_service.send_event_email'), \
+                patch.object(threading, 'Thread', SyncThread):
+            if dispatch_kind == 'episode':
+                _fire_event_sync(_make_payload())
+            else:
+                webhook['events'] = [EVENT_AUTH_FAILURE]
+                webhook_service._fire_alert_event(
+                    EVENT_AUTH_FAILURE, {}, 'test', dedup=False)
+
+        if dispatch_kind == 'episode':
+            expected_message = 'Unexpected error dispatching webhook to https://hook.example.com (ValueError)'
+        else:
+            expected_message = 'Failed to send Auth Failure webhook to https://hook.example.com (ValueError)'
+        assert [record.getMessage() for record in caplog.records] == [expected_message]
+        for sensitive_value in ('user', 'password', '/private/path', 'secret-value', 'unexpected render failure'):
+            assert sensitive_value not in caplog.text
+
+    @patch('webhook_service.safe_post')
+    def test_no_template_never_reports_fallback(self, mock_post):
+        mock_post.return_value = MagicMock(status_code=200)
+        config = {'url': 'https://hook.example.com', 'events': [EVENT_AUTH_FAILURE]}
+
+        results = fire_test_event(config)
+
+        assert results[0]['templateFallback'] is False
+
+
+# ---------------------------------------------------------------------------
+# Template render failure: body fallback by content type
+# ---------------------------------------------------------------------------
+
+class TestTemplateFallbackBody:
+
+    EPISODE_ONLY = '{{ podcast.name }} - {{ episode.title }}'
+
+    def _alert_context(self):
+        return {
+            'event': EVENT_AUTH_FAILURE,
+            'provider': 'anthropic',
+            'model': 'claude-sonnet-4',
+            'error_message': 'Invalid API key provided',
+        }
+
+    def _config(self, content_type=None, template=EPISODE_ONLY):
+        config = {'url': 'https://hook.example.com', 'payloadTemplate': template}
+        if content_type is not None:
+            config['contentType'] = content_type
+        return config
+
+    @staticmethod
+    def _sent_body(mock_post):
+        return mock_post.call_args.kwargs['data'].decode('utf-8')
+
+    @patch('webhook_service.safe_post')
+    def test_text_plain_sends_readable_line(self, mock_post):
+        mock_post.return_value = MagicMock(status_code=200)
+
+        _prepare_and_dispatch(self._config('text/plain'), self._alert_context())
+
+        assert self._sent_body(mock_post) == (
+            'MinusPod Auth Failure: anthropic claude-sonnet-4 - Invalid API key provided'
+        )
+
+    @pytest.mark.parametrize('content_type', [
+        'Text/Plain; charset=utf-8',
+        'text/markdown',
+    ])
+    @patch('webhook_service.safe_post')
+    def test_other_text_content_types_get_readable_line(self, mock_post, content_type):
+        mock_post.return_value = MagicMock(status_code=200)
+
+        _prepare_and_dispatch(self._config(content_type), self._alert_context())
+
+        assert self._sent_body(mock_post).startswith('MinusPod Auth Failure: ')
+
+    @pytest.mark.parametrize('content_type', ['application/json', None])
+    @patch('webhook_service.safe_post')
+    def test_json_and_default_content_types_keep_json_fallback(self, mock_post, content_type):
+        mock_post.return_value = MagicMock(status_code=200)
+        context = self._alert_context()
+
+        _prepare_and_dispatch(self._config(content_type), context)
+
+        assert json.loads(mock_post.call_args.kwargs['data']) == context
+
+    @patch('webhook_service.safe_post')
+    def test_test_flag_prefixes_readable_line(self, mock_post):
+        mock_post.return_value = MagicMock(status_code=200)
+
+        _prepare_and_dispatch(
+            self._config('text/plain'), self._alert_context(), add_test_flag=True
+        )
+
+        assert self._sent_body(mock_post).startswith('[test] MinusPod Auth Failure: ')
+
+    @patch('webhook_service.safe_post')
+    def test_readable_line_for_episode_event(self, mock_post):
+        """A template that fails on an episode event still names the podcast,
+        the episode and the error."""
+        mock_post.return_value = MagicMock(status_code=200)
+        context = _build_context(_make_payload(
+            event=EVENT_EPISODE_FAILED,
+            podcast_name='My Show',
+            episode_title='Pilot',
+            error_message='Transcription failed',
+        ))
+
+        _prepare_and_dispatch(self._config('text/plain', '{{ nonexistent.field }}'), context)
+
+        assert self._sent_body(mock_post) == (
+            'MinusPod Episode Failed: My Show - Pilot - Transcription failed'
+        )
+
+    @pytest.mark.parametrize('event', sorted(VALID_EVENTS))
+    @patch('webhook_service.safe_post')
+    def test_readable_line_for_every_event(self, mock_post, event):
+        """Every event's test context yields a readable line, not JSON."""
+        mock_post.return_value = MagicMock(status_code=200)
+        mock_db = MagicMock()
+        mock_db.get_latest_completed_processing.return_value = None
+        config = {
+            'url': 'https://hook.example.com',
+            'events': [event],
+            'contentType': 'text/plain',
+            'payloadTemplate': '{{ episode.title.x.y }}',
+        }
+
+        with patch('database.Database', return_value=mock_db):
+            results = fire_test_event(config)
+        assert results[0]['templateFallback'] is True
+
+        body = mock_post.call_args.kwargs['data'].decode('utf-8')
+        assert body.startswith(f'[test] MinusPod {event}')
+        assert not body.startswith('{')
+
+    @pytest.mark.parametrize('context, expected', [
+        ({'event': 'Update Available', 'version': '2.74.0', 'channel': 'stable'},
+         'MinusPod Update Available: 2.74.0'),
+        ({'event': 'Failover Triggered', 'source': 'auto', 'target': 'llm-a', 'reason': 'HTTP 503'},
+         'MinusPod Failover Triggered: auto -> llm-a - HTTP 503'),
+        ({'event': 'Queue Held', 'hold_until_local': '2026-01-01T12:30:00+00:00',
+          'error_message': 'retry later'},
+         'MinusPod Queue Held: held until 2026-01-01T12:30:00+00:00 - retry later'),
+        ({'event': 'Service Reachable', 'service': 'llm', 'requeued': 3},
+         'MinusPod Service Reachable: llm - requeued 3'),
+        ({'event': 'Cue Template Quiet', 'podcast': 'My Show', 'template': {'label': 'stinger'}},
+         'MinusPod Cue Template Quiet: My Show - stinger'),
+    ])
+    def test_readable_line_uses_alert_specific_fields(self, context, expected):
+        assert webhook_service._plain_text_fallback(context) == expected
+
+    @patch('webhook_service.safe_post')
+    def test_readable_line_without_details_is_just_the_event(self, mock_post):
+        mock_post.return_value = MagicMock(status_code=200)
+
+        _prepare_and_dispatch(self._config('text/plain'), {'event': 'Queue Resumed'})
+
+        assert self._sent_body(mock_post) == 'MinusPod Queue Resumed'
+
+    def test_plain_text_fallback_collapses_field_whitespace(self):
+        body = webhook_service._plain_text_fallback({
+            'event': EVENT_EPISODE_FAILED,
+            'source': 'primary\nroute',
+            'target': 'secondary\r\nroute',
+            'reason': 'upstream\n failed',
+            'episode': {'title': 'Pilot\n Episode'},
+            'error_message': 'request\r\n failed',
+        })
+
+        assert body == (
+            'MinusPod Episode Failed: Pilot Episode - primary route -> secondary route '
+            '- upstream failed - request failed'
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -712,6 +960,41 @@ class TestQueueAndServiceAlerts:
         assert webhook_service.fire_service_offline_event('llm', 'down', 's', 'e', 'P') is False
         # A different service is its own key but shares the 60s burst cap.
         assert webhook_service.fire_service_offline_event('whisper', 'down', 's', 'e', 'P') is False
+
+    @patch('webhook_service.threading.Thread', SyncThread)
+    @patch('webhook_service.email_service.send_event_email')
+    @patch('webhook_service._prepare_and_dispatch')
+    @patch('webhook_service.load_webhooks')
+    @patch('webhook_service.time.time')
+    def test_failover_triggered_dedups_per_target_not_globally(
+            self, mock_time, mock_load, mock_dispatch, _mock_email):
+        """Each target gets its own 300s dedup key; past the shared 60s burst
+        cap, a second target's trigger still fires (#806 review finding)."""
+        mock_load.return_value = []
+        mock_time.side_effect = [1000.0, 1070.0]
+        assert webhook_service.fire_failover_event(
+            'trigger', 'llm:primary', 'auto', 'HTTP 503') is True
+        assert webhook_service.fire_failover_event(
+            'trigger', 'whisper', 'auto', 'down') is True
+
+    @patch('webhook_service.threading.Thread', SyncThread)
+    @patch('webhook_service.email_service.send_event_email')
+    @patch('webhook_service._prepare_and_dispatch')
+    @patch('webhook_service.load_webhooks')
+    @patch('webhook_service.time.time')
+    def test_failover_transitions_are_never_deduplicated(
+            self, mock_time, mock_load, mock_dispatch, _mock_email):
+        mock_load.return_value = [{'url': 'https://example.com/h', 'enabled': True,
+                                   'events': ['Failover Triggered', 'Failover Cancelled']}]
+        clock = iter(range(1000, 2000, 5))
+        mock_time.side_effect = lambda: float(next(clock))
+        assert webhook_service.fire_failover_event('trigger', 'llm:primary', 'auto', 'HTTP 503')
+        assert webhook_service.fire_failover_event('cancel', 'llm:primary', 'auto', None)
+        assert webhook_service.fire_failover_event('trigger', 'llm:primary', 'auto', 'HTTP 503')
+        assert webhook_service.fire_failover_event('trigger', 'whisper', 'auto', 'down')
+        events = [c[0][1]['event'] for c in mock_dispatch.call_args_list]
+        assert events == ['Failover Triggered', 'Failover Cancelled',
+                          'Failover Triggered', 'Failover Triggered']
 
     @patch('webhook_service.threading.Thread', SyncThread)
     @patch('webhook_service.email_service.send_event_email')

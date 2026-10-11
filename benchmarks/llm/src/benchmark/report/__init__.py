@@ -1,11 +1,11 @@
-"""Render Markdown report from calls.jsonl + episode_results.jsonl + corpus."""
+"""Render Markdown reports from calls.jsonl and the benchmark corpus."""
 from __future__ import annotations
 
 import logging
 
 from pathlib import Path
 
-from .. import pricing
+from .. import jev, pricing
 from ..corpus import Episode
 from ..storage import read_jsonl
 from .aggregate import (
@@ -65,12 +65,13 @@ def render(
     cfg,
     episodes: list[Episode],
     calls_path: Path,
-    episode_results_path: Path,
     pricing_snapshot: pricing.PricingSnapshot,
     output_path: Path,
     assets_dir: Path,
     prompt_source: str = "live",
     addressing_mode: str = "timestamps",
+    include_jev: bool = False,
+    jev_passes: int = 1,
 ) -> None:
     """Render results/report.md from calls.jsonl.
 
@@ -106,6 +107,12 @@ def render(
     by_model, extras = _aggregate(calls, episodes, pricing_snapshot=pricing_snapshot)
     deprecated_ids = {m.id for m in cfg.models if m.deprecated}
     active = {mid: s for mid, s in by_model.items() if mid not in deprecated_ids}
+    if include_jev:
+        try:
+            jev.merge_into_stats(active, episodes, cache_path=calls_path.parent / "jev_cache.json",
+                                 passes=jev_passes)
+        except KeyError as exc:
+            logger.warning("jev rows skipped: %s", exc)
     deprecated = {mid: s for mid, s in by_model.items() if mid in deprecated_ids}
 
     extras_active = extras.without(deprecated_ids)

@@ -9,7 +9,7 @@ import type { ModelsRefresh } from '../../hooks/useModelsRefresh';
 import { formatModelLabel } from './settingsUtils';
 import { selectBase } from '../../components/fieldStyles';
 import type { ModelCatalog } from '../../hooks/useModelCatalog';
-import { SAME_AS_PASS, SLOT_PRIMARY, SLOT_SECONDARY } from '../../api/types';
+import { SAME_AS_PASS, SLOT_LABELS, SLOT_PRIMARY, SLOT_SECONDARY } from '../../api/types';
 
 export interface ReviewerState {
   enabled: boolean;
@@ -43,6 +43,7 @@ interface AdReviewerSectionProps {
   // Per-prompt reset (issue #626); the override fields have no button of
   // their own since resetting the base prompt clears its override too.
   reviewPromptIsDefault?: boolean;
+  systemOneReview?: boolean;
   resurrectPromptIsDefault?: boolean;
   onResetReviewPrompt?: () => void;
   onResetResurrectPrompt?: () => void;
@@ -57,6 +58,7 @@ function AdReviewerSection({
   modelsRefresh,
   secondaryProviderEnabled = false,
   reviewPromptIsDefault,
+  systemOneReview = false,
   resurrectPromptIsDefault,
   onResetReviewPrompt,
   onResetResurrectPrompt,
@@ -75,13 +77,19 @@ function AdReviewerSection({
     Boolean(reviewer.model) &&
     reviewer.model !== SAME_AS_PASS &&
     !models.some((m) => m.id === reviewer.model);
+  const reviewModelMissing = reviewer.provider !== SAME_AS_PASS && !reviewer.model;
 
   return (
     <CollapsibleSection
       title="Ad Reviewer"
       subtitle="Reviews each detected ad and decides confirm, adjust, or reject before the cut. Off by default."
     >
-      <div className="space-y-6">
+      <div className="space-y-6 max-sm:[&_input]:min-h-11 max-sm:[&_select]:min-h-11 max-sm:[&_button]:min-h-11">
+        {reviewer.enabled && systemOneReview && (
+          <div role="status" className="rounded-lg border border-warning/30 bg-warning/10 p-3 text-sm text-warning">
+            Ad review with System One models is experimental.
+          </div>
+        )}
         {/* Reviewer behavior */}
         <div className="space-y-6">
           <div>
@@ -96,7 +104,7 @@ function AdReviewerSection({
               </span>
             </label>
             <p className="mt-2 text-sm text-muted-foreground ml-14">
-              Adds one LLM call per detected ad. Worth it on comedy, fiction, and sponsor-adjacent news podcasts where the detector struggles with editorial mentions.
+              {systemOneReview ? 'Reviews each detected ad and may send several requests.' : 'Adds one LLM call per detected ad.'} Worth it on comedy, fiction, and sponsor-adjacent news podcasts where the detector struggles with editorial mentions.
             </p>
           </div>
 
@@ -112,17 +120,17 @@ function AdReviewerSection({
                 className={`w-full ${selectBase}`}
               >
                 <option value={SAME_AS_PASS}>Same as pass</option>
-                <option value={SLOT_PRIMARY}>Primary</option>
+                <option value={SLOT_PRIMARY}>{SLOT_LABELS.primary}</option>
                 {secondaryProviderEnabled && (
-                  <option value={SLOT_SECONDARY}>Secondary</option>
+                  <option value={SLOT_SECONDARY}>{SLOT_LABELS.secondary}</option>
                 )}
                 {strandedOnSecondary && (
-                  <option value={SLOT_SECONDARY}>Secondary (provider off)</option>
+                  <option value={SLOT_SECONDARY}>{SLOT_LABELS.secondary} (off)</option>
                 )}
               </select>
               {strandedOnSecondary && (
                 <p className="mt-1 text-sm text-warning">
-                  Secondary provider is off, so the reviewer runs on the primary.
+                  {SLOT_LABELS.secondary} is off, so the reviewer runs on {SLOT_LABELS.primary}.
                 </p>
               )}
               <p className="mt-1 text-sm text-muted-foreground">
@@ -148,8 +156,11 @@ function AdReviewerSection({
                 value={reviewer.model}
                 onChange={(e) => update('model', e.target.value)}
                 disabled={reviewer.provider === SAME_AS_PASS}
+                aria-invalid={reviewModelMissing || undefined}
+                aria-describedby={reviewModelMissing ? 'reviewModel-required-message' : undefined}
                 className={`w-full ${selectBase} disabled:opacity-50`}
               >
+                {reviewModelMissing && <option value="">Choose a model</option>}
                 <option value={SAME_AS_PASS}>Same as pass model</option>
                 {modelIsOrphan && (
                   <option value={reviewer.model}>{reviewer.model} (current, not in catalog)</option>
@@ -165,6 +176,11 @@ function AdReviewerSection({
                 error={catalog?.isError}
                 refreshError={modelsRefresh?.error ?? null}
               />
+              {reviewModelMissing && (
+                <p id="reviewModel-required-message" className="mt-1 text-sm text-destructive" role="status">
+                  Choose a model for the selected review provider.
+                </p>
+              )}
               <p className="mt-1 text-sm text-muted-foreground">
                 {reviewer.provider === SAME_AS_PASS
                   ? 'Ignored while the review provider is "Same as pass": the model comes from the pass too.'
@@ -213,7 +229,7 @@ function AdReviewerSection({
               <span className="text-sm text-muted-foreground">ads at a time (1-32)</span>
             </div>
             <p className="mt-2 text-sm text-muted-foreground">
-              How many ads the reviewer asks the LLM about at once. 1 is sequential (the original behavior). Higher values cut review time but add concurrent load on your LLM provider. Default 4.
+              Higher values increase provider load.
             </p>
           </div>
         </div>

@@ -19,8 +19,8 @@ function catalog(overrides: Partial<ModelCatalog> = {}): ModelCatalog {
   return { models, isLoading: false, isError: false, ...overrides };
 }
 
-function renderSection(overrides: Partial<Parameters<typeof AIModelsSection>[0]> = {}) {
-  return render(
+function section(overrides: Partial<Parameters<typeof AIModelsSection>[0]> = {}) {
+  return (
     <AIModelsSection
       detectionCatalog={catalog()}
       verificationCatalog={catalog()}
@@ -34,18 +34,28 @@ function renderSection(overrides: Partial<Parameters<typeof AIModelsSection>[0]>
       detectionProvider="primary"
       verificationProvider="same_as_detection"
       chaptersProvider="same_as_detection"
+      effectiveChaptersProvider="anthropic"
       onDetectionProviderChange={() => {}}
       onVerificationProviderChange={() => {}}
       onChaptersProviderChange={() => {}}
       modelsRefresh={{ refresh: () => {}, isPending: false, error: null }}
       modelPricingOverrides={{}}
+      pricingModelIds={['gpt-5', 'gpt-5-mini']}
       onPricingOverrideUpdate={vi.fn().mockResolvedValue(undefined)}
       {...overrides}
     />
   );
 }
 
+function renderSection(overrides: Partial<Parameters<typeof AIModelsSection>[0]> = {}) {
+  return render(section(overrides));
+}
+
 describe('AIModelsSection: not-configured state', () => {
+  it('warns about an inherited native chapter route independently of the model name', () => {
+    renderSection({ effectiveChaptersProvider: 'systemone-compatible', chaptersModel: 'gpt-5' });
+    expect(screen.getByText(/System One cannot generate chapters/)).toBeTruthy();
+  });
   it('renders a selected "Not configured" placeholder for an empty model value', () => {
     renderSection({ selectedModel: '' });
     const select = screen.getByLabelText('Ad Detection Model') as HTMLSelectElement;
@@ -56,7 +66,9 @@ describe('AIModelsSection: not-configured state', () => {
 
   it('shows the helper line under an unconfigured select', () => {
     renderSection({ selectedModel: '' });
+    const select = screen.getByLabelText('Ad Detection Model');
     expect(screen.getByText('Pick a model before processing episodes.')).toBeDefined();
+    expect(select.getAttribute('aria-invalid')).toBe('true');
   });
 
   it('renders a configured value with no placeholder option and no helper line', () => {
@@ -86,15 +98,17 @@ describe('AIModelsSection: orphaned saved value', () => {
   });
 });
 
-describe('AIModelsSection: empty catalog banner', () => {
-  it('still shows the empty-catalog banner when no models are available', () => {
-    renderSection({
-      detectionCatalog: catalog({ models: [] }),
-      selectedModel: '', verificationModel: '', chaptersModel: '',
-    });
-    expect(
-      screen.getByText('No models available from the LLM provider. Check that your provider is configured correctly and the endpoint is reachable.')
-    ).toBeDefined();
+describe('AIModelsSection: missing selection banner', () => {
+  it.each(['selectedModel', 'verificationModel', 'chaptersModel'] as const)(
+    'shows the banner when %s is blank even with a populated catalog', (field) => {
+      renderSection({ [field]: '' });
+      expect(screen.getByText('No model selected from the provider.')).toBeDefined();
+    },
+  );
+
+  it('does not mistake an empty catalog for a missing model selection', () => {
+    renderSection({ detectionCatalog: catalog({ models: [] }), selectedModel: 'private-model' });
+    expect(screen.queryByText('No model selected from the provider.')).toBeNull();
   });
 });
 
@@ -124,6 +138,18 @@ describe('AIModelsSection: typing a model ID', () => {
     expect(onSelectedModelChange).toHaveBeenCalledWith('x');
   });
 
+  it('marks a blank typed model ID as invalid and links the accessible requirement message', async () => {
+    const user = userEvent.setup();
+    renderSection({ selectedModel: '' });
+
+    await user.click(screen.getAllByRole('button', { name: 'Type a model ID' })[0]);
+
+    const input = screen.getByLabelText('Ad Detection Model');
+    expect(input.getAttribute('aria-invalid')).toBe('true');
+    expect(input.getAttribute('aria-describedby')).toBe('model-required-message');
+    expect(screen.getByText('Pick a model before processing episodes.')).toBeDefined();
+  });
+
   it('switches only the field whose button was clicked', async () => {
     const user = userEvent.setup();
     renderSection();
@@ -150,10 +176,10 @@ describe('AIModelsSection: per-stage provider selects', () => {
     expect(screen.getByLabelText('Chapters Provider')).toBeDefined();
   });
 
-  it('defaults detection to "Default (Primary)" and the others to "Same as detection"', () => {
+  it('defaults detection to "Provider A" and the others to "Same as detection"', () => {
     renderSection();
     expect((screen.getByLabelText('Ad Detection Provider') as HTMLSelectElement).selectedOptions[0].textContent)
-      .toBe('Default (Primary)');
+      .toBe('Provider A');
     expect((screen.getByLabelText('Verification Provider') as HTMLSelectElement).selectedOptions[0].textContent)
       .toBe('Same as detection');
     expect((screen.getByLabelText('Chapters Provider') as HTMLSelectElement).selectedOptions[0].textContent)
@@ -194,32 +220,71 @@ describe('AIModelsSection: per-stage provider selects', () => {
 });
 
 describe('AIModelsSection: secondary provider slot', () => {
-  it('hides the Secondary option on every stage select while the secondary provider is off', () => {
+  it('hides the Provider B option on every stage select while the secondary provider is off', () => {
     renderSection();
     for (const label of ['Ad Detection Provider', 'Verification Provider', 'Chapters Provider']) {
-      expect(within(screen.getByLabelText(label)).queryByRole('option', { name: 'Secondary' })).toBeNull();
+      expect(within(screen.getByLabelText(label)).queryByRole('option', { name: 'Provider B' })).toBeNull();
     }
   });
 
-  it('shows the Secondary option once the secondary provider is enabled', () => {
+  it('shows the Provider B option once the secondary provider is enabled', () => {
     renderSection({ secondaryProviderEnabled: true });
     for (const label of ['Ad Detection Provider', 'Verification Provider', 'Chapters Provider']) {
-      expect(within(screen.getByLabelText(label)).getByRole('option', { name: 'Secondary' })).toBeDefined();
+      expect(within(screen.getByLabelText(label)).getByRole('option', { name: 'Provider B' })).toBeDefined();
     }
   });
 
-  it('stores the slot value when Secondary is picked', async () => {
+  it('stores the slot value when Provider B is picked', async () => {
     const user = userEvent.setup();
     const onDetectionProviderChange = vi.fn();
     renderSection({ secondaryProviderEnabled: true, onDetectionProviderChange });
 
-    await user.selectOptions(screen.getByLabelText('Ad Detection Provider'), 'Secondary');
+    await user.selectOptions(screen.getByLabelText('Ad Detection Provider'), 'Provider B');
 
     expect(onDetectionProviderChange).toHaveBeenCalledWith('secondary');
   });
 });
 
 describe('AIModelsSection: custom pricing', () => {
+  it('restores saved rates when an inactive model is reselected and refreshes changed props', () => {
+    const modelPricingOverrides = { 'retired-model': { inputCostPerMtok: 1, outputCostPerMtok: 2 } };
+    const view = renderSection({ modelPricingOverrides });
+    expect(screen.queryByText('retired-model')).toBeNull();
+    view.rerender(section({ modelPricingOverrides, pricingModelIds: ['retired-model'] }));
+    expect((screen.getByLabelText('Input, USD per 1 million tokens') as HTMLInputElement).value).toBe('1');
+    view.rerender(section({
+      pricingModelIds: ['retired-model'],
+      modelPricingOverrides: { 'retired-model': { inputCostPerMtok: 3, outputCostPerMtok: 4 } },
+    }));
+    expect((screen.getByLabelText('Input, USD per 1 million tokens') as HTMLInputElement).value).toBe('3');
+  });
+
+  it('edits the operative alias key and disables its row during saving', async () => {
+    const user = userEvent.setup();
+    const onPricingOverrideUpdate = vi.fn().mockResolvedValue(undefined);
+    const modelPricingOverrides = { 'openai/gpt-5': { inputCostPerMtok: 1, outputCostPerMtok: 2 } };
+    const props = { pricingModelIds: ['gpt-5'], modelPricingOverrides, onPricingOverrideUpdate };
+    const view = renderSection(props);
+    expect(screen.queryByText('openai/gpt-5')).toBeNull();
+    await user.clear(screen.getByLabelText('Input, USD per 1 million tokens'));
+    await user.clear(screen.getByLabelText('Output, USD per 1 million tokens'));
+    await user.click(screen.getByRole('button', { name: 'Save pricing' }));
+    expect(onPricingOverrideUpdate).toHaveBeenCalledWith('openai/gpt-5', null);
+    view.rerender(section({ ...props, pricingOverrideSavingModel: 'openai/gpt-5' }));
+    expect((screen.getByRole('button', { name: 'Saving...' }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it('retains conflicting exact prices for distinct active model IDs', () => {
+    renderSection({
+      pricingModelIds: ['gpt-5', 'gpt-5:free'],
+      modelPricingOverrides: {
+        'gpt-5': { inputCostPerMtok: 1, outputCostPerMtok: 2 },
+        'gpt-5:free': { inputCostPerMtok: 0, outputCostPerMtok: 0 },
+      },
+    });
+    expect(screen.getAllByLabelText('Input, USD per 1 million tokens').map((input) => (input as HTMLInputElement).value)).toEqual(['1', '0']);
+  });
+
   it('renders explicit zero rates for a free model', () => {
     renderSection({
       modelPricingOverrides: {
@@ -309,8 +374,7 @@ describe('AIModelsSection: custom pricing', () => {
     expect(onPricingOverrideUpdate).toHaveBeenCalledWith('gpt-5', null);
   });
 
-  it('keeps an override available after the model is no longer selected', async () => {
-    const user = userEvent.setup();
+  it('hides inactive overrides without updating their stored rates', () => {
     const onPricingOverrideUpdate = vi.fn().mockResolvedValue(undefined);
     renderSection({
       modelPricingOverrides: {
@@ -319,15 +383,8 @@ describe('AIModelsSection: custom pricing', () => {
       onPricingOverrideUpdate,
     });
 
-    const retiredModel = screen.getByText('retired-model');
-    const fields = retiredModel.closest('fieldset')!;
-    const input = fields.querySelector<HTMLInputElement>('input[id$="-input"]')!;
-    const output = fields.querySelector<HTMLInputElement>('input[id$="-output"]')!;
-    await user.clear(input);
-    await user.clear(output);
-    await user.click(fields.querySelector<HTMLButtonElement>('button')!);
-
-    expect(onPricingOverrideUpdate).toHaveBeenCalledWith('retired-model', null);
+    expect(screen.queryByText('retired-model')).toBeNull();
+    expect(onPricingOverrideUpdate).not.toHaveBeenCalled();
   });
 });
 
@@ -384,23 +441,23 @@ describe('AIModelsSection: per-stage catalog states', () => {
 });
 
 describe('AIModelsSection: stored secondary slot while the secondary provider is off', () => {
-  it('keeps the stored value selected instead of reading as Default (Primary)', () => {
+  it('keeps the stored value selected instead of reading as Provider A', () => {
     renderSection({ detectionProvider: 'secondary' });
     const select = screen.getByLabelText('Ad Detection Provider') as HTMLSelectElement;
     expect(select.value).toBe('secondary');
-    expect(select.selectedOptions[0].textContent).toBe('Secondary (provider off)');
+    expect(select.selectedOptions[0].textContent).toBe('Provider B (off)');
   });
 
   it('explains which provider the stage actually runs on', () => {
     renderSection({ detectionProvider: 'secondary' });
-    expect(screen.getByText('Secondary provider is off, so this stage runs on the primary.')).toBeDefined();
+    expect(screen.getByText('Provider B is off, so this stage runs on Provider A.')).toBeDefined();
   });
 
   it('leaves stages that are not on the secondary slot alone', () => {
     renderSection({ detectionProvider: 'secondary' });
     expect(
-      within(screen.getByLabelText('Verification Provider')).queryByRole('option', { name: 'Secondary (provider off)' })
+      within(screen.getByLabelText('Verification Provider')).queryByRole('option', { name: 'Provider B (off)' })
     ).toBeNull();
-    expect(screen.getAllByText('Secondary provider is off, so this stage runs on the primary.')).toHaveLength(1);
+    expect(screen.getAllByText('Provider B is off, so this stage runs on Provider A.')).toHaveLength(1);
   });
 });

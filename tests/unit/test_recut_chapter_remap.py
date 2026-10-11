@@ -151,6 +151,16 @@ def _stub_assets_io(monkeypatch, counters, embed_ok=True):
     monkeypatch.setattr(
         processing.storage, 'save_chapters_json',
         lambda s, e, chapters: counters.__setitem__('chapters_saved', chapters))
+
+    def _publish(s, e, assets):
+        counters['assets'] = assets
+        if 'chapters' in assets:
+            if 'applied_cuts' in assets:
+                _save_both(s, e, assets['chapters'], assets['applied_cuts'])
+            else:
+                counters['chapters_saved'] = assets['chapters']
+
+    monkeypatch.setattr(processing.db, 'save_processing_assets', _publish)
     # Default: no probe (callers pass audio_duration). Overridden where the
     # duration=None consistency path is exercised.
     monkeypatch.setattr(processing, 'get_audio_duration', lambda p: None)
@@ -268,7 +278,7 @@ def test_generate_assets_recut_no_persisted_cuts_leaves_topic_chapters_untouched
     # entries in play nothing is written at all.
     counters = {}
     _stub_assets_io(monkeypatch, counters)
-    _use_config(monkeypatch, AdChapterConfig.disabled())
+    _use_config(monkeypatch, None)
     stored = {'version': '1.2.0', 'chapters': [{'startTime': 10, 'title': 'Intro'}]}
     monkeypatch.setattr(processing.storage, 'get_chapters_json', lambda s, e: stored)
     new_cuts = [{'start': 100.0, 'end': 200.0}, {'start': 500.0, 'end': 600.0}]
@@ -296,13 +306,14 @@ def test_remap_none_previous_cuts_still_rebuilds_the_ad_entries(monkeypatch):
         {'startTime': 300, 'title': '[mp:sponsor]', 'kind': 'ad', 'category': 'sponsor'},
         {'startTime': 360, 'title': 'Show', 'kind': 'resume'}]}
     monkeypatch.setattr(processing.storage, 'get_chapters_json', lambda s, e: stored)
-    markers = [{'start': 500.0, 'end': 530.0, 'action_applied': 'keep',
+    markers = [{'start': 500.0, 'end': 530.0, 'action_applied': 'mark',
                 'category': 'sponsor', 'confidence': 0.95, 'was_cut': False}]
+    pending = {}
     processing._remap_stored_chapters(
         'slug', 'ep', all_cuts=[], replacement_duration=BEEP,
         previous_cuts=None, original_duration=1000.0, audio_path='/x.mp3',
-        audio_duration=804.0, markers=markers)
-    assert counters['chapters_saved']['chapters'] == [
+        audio_duration=804.0, markers=markers, pending_assets=pending)
+    assert pending['chapters']['chapters'] == [
         {'startTime': 10, 'title': 'Intro'},
         {'startTime': 500, 'title': '[mp:sponsor]', 'kind': 'ad', 'category': 'sponsor'},
         {'startTime': 530, 'title': 'Show', 'kind': 'resume'}]
@@ -310,7 +321,7 @@ def test_remap_none_previous_cuts_still_rebuilds_the_ad_entries(monkeypatch):
         {'startTime': 10, 'title': 'Intro'},
         {'startTime': 500, 'title': '[mp:sponsor]'},
         {'startTime': 530, 'title': 'Show'}]
-    assert 'applied_saved' not in counters, \
+    assert 'applied_cuts' not in pending, \
         "unremapped topic chapters must not claim the recut's cut list"
 
 
@@ -323,12 +334,13 @@ def test_remap_none_previous_cuts_writes_nothing_when_unchanged(monkeypatch):
         {'startTime': 500, 'title': '[mp:sponsor]', 'kind': 'ad', 'category': 'sponsor'},
         {'startTime': 530, 'title': 'Show', 'kind': 'resume'}]}
     monkeypatch.setattr(processing.storage, 'get_chapters_json', lambda s, e: stored)
-    markers = [{'start': 500.0, 'end': 530.0, 'action_applied': 'keep',
+    markers = [{'start': 500.0, 'end': 530.0, 'action_applied': 'mark',
                 'category': 'sponsor', 'confidence': 0.95, 'was_cut': False}]
+    pending = {}
     processing._remap_stored_chapters(
         'slug', 'ep', all_cuts=[], replacement_duration=BEEP,
         previous_cuts=None, original_duration=1000.0, audio_path='/x.mp3',
-        audio_duration=804.0, markers=markers)
+        audio_duration=804.0, markers=markers, pending_assets=pending)
     assert counters == {}
 
 
@@ -389,14 +401,14 @@ def test_generate_assets_recut_duration_none_uses_probed_value(monkeypatch):
 # ---------- ad chapters on the recut path ----------
 
 AD_CFG = AdChapterConfig(
-    enabled=True, categories={'sponsor': True}, include_held=False,
+    actions={'sponsor': 'mark'}, include_held=False,
     title_format='[mp:{category}]', held_title_format='[mp:{category}?]',
     resume_title='Show', min_confidence=0.9)
 
 
 def _use_config(monkeypatch, cfg):
     monkeypatch.setattr(processing, 'resolve_ad_chapter_config',
-                        lambda db, row, slug=None: cfg)
+                        lambda db, row: cfg)
 
 
 def test_remap_strips_stale_ad_chapters_and_rebuilds_from_markers(monkeypatch):
@@ -411,13 +423,14 @@ def test_remap_strips_stale_ad_chapters_and_rebuilds_from_markers(monkeypatch):
     monkeypatch.setattr(processing.storage, 'save_chapters_and_applied_cuts',
                         lambda s, e, cj, cuts: saved.update(cj))
     monkeypatch.setattr(processing, 'embed_chapters', lambda *a, **k: True)
-    markers = [{'start': 2000.0, 'end': 2060.0, 'action_applied': 'keep',
+    markers = [{'start': 2000.0, 'end': 2060.0, 'action_applied': 'mark',
                 'category': 'sponsor', 'confidence': 0.95, 'was_cut': False}]
+    pending = {}
     processing._remap_stored_chapters(
         'example-podcast', 'a1b2c3d4e5f6', all_cuts=[], replacement_duration=BEEP,
         previous_cuts=[], original_duration=3600.0, audio_path=None,
-        audio_duration=3600.0, markers=markers)
-    starts = [(c['startTime'], c.get('kind')) for c in saved['chapters']]
+        audio_duration=3600.0, markers=markers, pending_assets=pending)
+    starts = [(c['startTime'], c.get('kind')) for c in pending['chapters']['chapters']]
     assert (300, 'ad') not in starts and (360, 'resume') not in starts
     assert (2000, 'ad') in starts and (2060, 'resume') in starts
     assert (1, None) in starts and (1200, None) in starts
@@ -432,31 +445,33 @@ def test_remap_with_only_ad_chapters_stored_still_rebuilds(monkeypatch):
     monkeypatch.setattr(processing.storage, 'get_chapters_json', lambda s, e: stored)
     monkeypatch.setattr(processing.storage, 'save_chapters_and_applied_cuts',
                         lambda s, e, cj, cuts: saved.update(cj))
-    markers = [{'start': 500.0, 'end': 530.0, 'action_applied': 'keep',
+    markers = [{'start': 500.0, 'end': 530.0, 'action_applied': 'mark',
                 'category': 'sponsor', 'confidence': 0.95, 'was_cut': False}]
+    pending = {}
     processing._remap_stored_chapters(
         'example-podcast', 'a1b2c3d4e5f6', all_cuts=[], replacement_duration=BEEP,
         previous_cuts=[], original_duration=3600.0, audio_duration=3600.0,
-        markers=markers)
-    assert [c['startTime'] for c in saved['chapters']] == [500, 530]
+        markers=markers, pending_assets=pending)
+    assert [c['startTime'] for c in pending['chapters']['chapters']] == [500, 530]
 
 
 def test_remap_without_ad_chapters_keeps_previous_behavior(monkeypatch):
-    _use_config(monkeypatch, AdChapterConfig.disabled())
+    _use_config(monkeypatch, None)
     calls = []
     stored = {'version': '1.2.0', 'chapters': [{'startTime': 1, 'title': 'Intro'}]}
     monkeypatch.setattr(processing.storage, 'get_chapters_json', lambda s, e: stored)
     monkeypatch.setattr(processing.storage, 'save_chapters_and_applied_cuts',
                         lambda s, e, cj, cuts: calls.append(cj))
+    pending = {}
     processing._remap_stored_chapters(
         'example-podcast', 'a1b2c3d4e5f6', all_cuts=[], replacement_duration=BEEP,
-        previous_cuts=[], original_duration=3600.0, audio_duration=3600.0)
-    assert calls and calls[0]['chapters'] == [{'startTime': 1, 'title': 'Intro'}]
+        previous_cuts=[], original_duration=3600.0, audio_duration=3600.0, pending_assets=pending)
+    assert pending['chapters']['chapters'] == [{'startTime': 1, 'title': 'Intro'}]
 
 
 def test_remap_disabled_ad_config_strips_stale_ad_chapters(monkeypatch):
     """Turning the feature off must clean up entries a previous run wrote."""
-    _use_config(monkeypatch, AdChapterConfig.disabled())
+    _use_config(monkeypatch, None)
     saved = {}
     stored = {'version': '1.2.0', 'chapters': [
         {'startTime': 1, 'title': 'Intro'},
@@ -465,18 +480,19 @@ def test_remap_disabled_ad_config_strips_stale_ad_chapters(monkeypatch):
     monkeypatch.setattr(processing.storage, 'get_chapters_json', lambda s, e: stored)
     monkeypatch.setattr(processing.storage, 'save_chapters_and_applied_cuts',
                         lambda s, e, cj, cuts: saved.update(cj))
-    markers = [{'start': 500.0, 'end': 530.0, 'action_applied': 'keep',
+    markers = [{'start': 500.0, 'end': 530.0, 'action_applied': 'mark',
                 'category': 'sponsor', 'confidence': 0.95, 'was_cut': False}]
+    pending = {}
     processing._remap_stored_chapters(
         'example-podcast', 'a1b2c3d4e5f6', all_cuts=[], replacement_duration=BEEP,
         previous_cuts=[], original_duration=3600.0, audio_duration=3600.0,
-        markers=markers)
-    assert saved['chapters'] == [{'startTime': 1, 'title': 'Intro'}]
+        markers=markers, pending_assets=pending)
+    assert pending['chapters']['chapters'] == [{'startTime': 1, 'title': 'Intro'}]
 
 
 def test_remap_ad_only_stored_list_with_no_replacement_writes_empty_set(monkeypatch):
     """Stale ad entries must leave the JSON and ID3 even with nothing to add."""
-    _use_config(monkeypatch, AdChapterConfig.disabled())
+    _use_config(monkeypatch, None)
     saved = {}
     embedded = {}
     stored = {'version': '1.2.0', 'chapters': [
@@ -488,13 +504,14 @@ def test_remap_ad_only_stored_list_with_no_replacement_writes_empty_set(monkeypa
     monkeypatch.setattr(processing, 'embed_chapters',
                         lambda p, ch, duration=None: embedded.update(
                             {'path': p, 'chapters': ch}) or True)
-    markers = [{'start': 500.0, 'end': 530.0, 'action_applied': 'keep',
+    markers = [{'start': 500.0, 'end': 530.0, 'action_applied': 'mark',
                 'category': 'sponsor', 'confidence': 0.95, 'was_cut': False}]
+    pending = {}
     processing._remap_stored_chapters(
         'example-podcast', 'a1b2c3d4e5f6', all_cuts=[], replacement_duration=BEEP,
         previous_cuts=[], original_duration=3600.0, audio_path='/x.mp3',
-        audio_duration=3600.0, markers=markers)
-    assert saved['chapters'] == []
+        audio_duration=3600.0, markers=markers, pending_assets=pending)
+    assert pending['chapters']['chapters'] == []
     assert embedded == {'path': '/x.mp3', 'chapters': []}
 
 
@@ -514,9 +531,10 @@ def test_remap_ad_only_stored_list_with_no_eligible_marker_writes_empty_set(monk
     # Cut, not kept: nothing is left in the audio to publish as an ad chapter.
     markers = [{'start': 500.0, 'end': 530.0, 'action_applied': 'remove',
                 'category': 'sponsor', 'confidence': 0.95, 'was_cut': True}]
+    pending = {}
     processing._remap_stored_chapters(
         'example-podcast', 'a1b2c3d4e5f6', all_cuts=[], replacement_duration=BEEP,
         previous_cuts=[], original_duration=3600.0, audio_path='/x.mp3',
-        audio_duration=3600.0, markers=markers)
-    assert saved['chapters'] == []
+        audio_duration=3600.0, markers=markers, pending_assets=pending)
+    assert pending['chapters']['chapters'] == []
     assert embedded == {'path': '/x.mp3', 'chapters': []}

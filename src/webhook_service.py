@@ -12,9 +12,9 @@ from dataclasses import dataclass
 from jinja2 import TemplateError
 from jinja2.sandbox import SandboxedEnvironment
 
-from config import HTTP_MAX_REDIRECTS_API, HTTP_TIMEOUT_PROBE
-from database import Database
-from database.settings import registry_current_value, registry_default
+from config import FAILOVER_API_TARGET_NAMES, HTTP_MAX_REDIRECTS_API, HTTP_TIMEOUT_PROBE
+import database
+import database.settings as db_settings
 from utils.http import safe_url_for_log
 from utils.safe_http import URLTrust, safe_post
 from utils.time import format_duration, utc_now_iso, local_now_iso, local_iso
@@ -35,6 +35,8 @@ EVENT_QUEUE_HELD = 'Queue Held'
 EVENT_QUEUE_RESUMED = 'Queue Resumed'
 EVENT_SERVICE_OFFLINE = 'Service Offline'
 EVENT_SERVICE_REACHABLE = 'Service Reachable'
+EVENT_FAILOVER_TRIGGERED = 'Failover Triggered'
+EVENT_FAILOVER_CANCELLED = 'Failover Cancelled'
 VALID_EVENTS = {
     EVENT_EPISODE_PROCESSED,
     EVENT_EPISODE_FAILED,
@@ -48,7 +50,12 @@ VALID_EVENTS = {
     EVENT_QUEUE_RESUMED,
     EVENT_SERVICE_OFFLINE,
     EVENT_SERVICE_REACHABLE,
+    EVENT_FAILOVER_TRIGGERED,
+    EVENT_FAILOVER_CANCELLED,
 }
+
+# Maps the API-facing failover target names to webhook/email payload values,
+# kept local to avoid importing failover (which imports this module).
 
 _sandbox_env = SandboxedEnvironment()
 
@@ -58,11 +65,11 @@ def get_notification_timezone(db=None) -> str:
     or UTC. Never raises: a DB/settings failure must not cost a notification."""
     try:
         if db is None:
-            db = Database()
-        return registry_current_value(db, 'notification_timezone')
+            db = database.Database()
+        return db_settings.registry_current_value(db, 'notification_timezone')
     except Exception:
         logger.debug("Could not read notification_timezone setting", exc_info=True)
-        return registry_default('notification_timezone')
+        return db_settings.registry_default('notification_timezone')
 
 
 def _timestamp_fields() -> dict:
@@ -182,6 +189,16 @@ _ALERT_SAMPLE_CONTEXTS = {
         'service': 'llm',
         'requeued': 3,
     },
+    EVENT_FAILOVER_TRIGGERED: {
+        'target': 'llm-a',
+        'source': 'auto',
+        'reason': 'HTTP 503',
+    },
+    EVENT_FAILOVER_CANCELLED: {
+        'target': 'llm-a',
+        'source': 'manual',
+        'reason': '',
+    },
 }
 
 
@@ -257,36 +274,90 @@ def _render_template(template_str, context):
     return template.render(**context)
 
 
+def _is_text_content_type(content_type):
+    """True for any text/* content type, ignoring parameters such as charset."""
+    return (content_type or '').split(';')[0].strip().lower().startswith('text/')
+
+
+def _plain_text_fallback(context):
+    """Build a readable text fallback from fields present in the event context."""
+    podcast = context.get('podcast')
+    if isinstance(podcast, dict):
+        podcast_name = podcast.get('name')
+    else:
+        podcast_name = context.get('podcast_name') or podcast
+    episode = context.get('episode')
+    episode = episode if isinstance(episode, dict) else {}
+    template = context.get('template')
+    label = context.get('label') or (template.get('label') if isinstance(template, dict) else None)
+
+    route = None
+    if context.get('source') and context.get('target'):
+        route = f"{context['source']} -> {context['target']}"
+    held_until = context.get('hold_until_local')
+    requeued = context.get('requeued')
+    details = [
+        podcast_name,
+        episode.get('title'),
+        label,
+        ' '.join(str(context[key]) for key in ('provider', 'model') if context.get(key)),
+        context.get('service'),
+        context.get('version'),
+        route,
+        context.get('reason'),
+        f"held until {held_until}" if held_until else None,
+        f"requeued {requeued}" if requeued is not None else None,
+        context.get('error_message') or episode.get('error_message'),
+    ]
+    line = f"MinusPod {context.get('event', 'Event')}"
+    detail = ' - '.join(str(d) for d in details if d)
+    if detail:
+        line = f"{line}: {detail}"
+    line = ' '.join(line.split())
+    return f"[test] {line}" if context.get('test') else line
+
+
+def _render_body(webhook_config, context):
+    """Render the body and report whether the default replaced a failed template."""
+    template_str = webhook_config.get('payloadTemplate')
+    if not template_str:
+        return json.dumps(dict(context)), False
+
+    try:
+        return _render_template(template_str, context), False
+    except TemplateError as exc:
+        # Keep alert delivery when an episode-only template fails to render.
+        if _is_text_content_type(webhook_config.get('contentType', 'application/json')):
+            fallback_kind, body_str = 'plain-text line', _plain_text_fallback(context)
+        else:
+            fallback_kind, body_str = 'JSON payload', json.dumps(dict(context))
+        logger.warning(
+            "Jinja2 render error for webhook %s; falling back to the default "
+            "%s so the event is not dropped: %s",
+            safe_url_for_log(webhook_config.get('url')), fallback_kind, exc,
+        )
+        return body_str, True
+
+
 def _prepare_and_dispatch(webhook_config, context, add_test_flag=False,
                           max_attempts=2):
     """Render payload and dispatch to a single webhook. Returns HTTP status or None."""
+    return _dispatch_webhook(webhook_config, context, add_test_flag, max_attempts)[0]
+
+
+def _dispatch_webhook(webhook_config, context, add_test_flag=False,
+                      max_attempts=2):
+    """Send one webhook and return its status and template-fallback flag."""
     url = webhook_config.get('url')
     if not url:
-        return None
+        return None, False
 
     if add_test_flag:
         context = dict(context)
         context['test'] = True
 
     content_type = webhook_config.get('contentType', 'application/json')
-    template_str = webhook_config.get('payloadTemplate')
-
-    if template_str:
-        try:
-            body_str = _render_template(template_str, context)
-        except TemplateError as exc:
-            # Custom templates referencing episode/podcast fields raise on alert
-            # events lacking them; fall back to the default payload so alerts
-            # aren't silently dropped (webhooks-misc-2).
-            logger.warning(
-                "Jinja2 render error for webhook %s; falling back to the default "
-                "JSON payload so the event is not dropped: %s",
-                safe_url_for_log(url), exc,
-            )
-            body_str = json.dumps(dict(context))
-    else:
-        payload = dict(context)
-        body_str = json.dumps(payload)
+    body_str, fell_back = _render_body(webhook_config, context)
 
     body_bytes = body_str.encode('utf-8')
 
@@ -315,12 +386,13 @@ def _prepare_and_dispatch(webhook_config, context, add_test_flag=False,
                 headers=headers,
             )
         except SSRFError as exc:
-            logger.warning("Webhook URL blocked by SSRF check: %s (%s)", safe_url_for_log(url), exc)
-            return None
+            logger.warning("Webhook URL blocked by SSRF check: %s (%s)",
+                            safe_url_for_log(url), type(exc).__name__)
+            return None, fell_back
         except Exception as exc:
             logger.warning(
-                "Webhook attempt %d/%d failed for %s: %s",
-                attempt + 1, max_attempts, url, exc,
+                "Webhook attempt %d/%d failed for %s (%s)",
+                attempt + 1, max_attempts, safe_url_for_log(url), type(exc).__name__,
             )
             continue
 
@@ -330,14 +402,13 @@ def _prepare_and_dispatch(webhook_config, context, add_test_flag=False,
 
     if last_status is not None:
         logger.info("Webhook delivered to %s (status %d)", safe_url_for_log(url), last_status)
-    return last_status
+    return last_status, fell_back
 
 
 def load_webhooks(db=None):
     """Load webhooks list from DB settings."""
     if db is None:
-        from database import Database  # deferred to avoid circular imports
-        db = Database()
+        db = database.Database()
     raw = db.get_setting('webhooks')
     if not raw:
         return []
@@ -362,8 +433,9 @@ def _fire_event_sync(payload: WebhookPayload):
             continue
         try:
             _prepare_and_dispatch(wh, context)
-        except Exception:
-            logger.exception("Unexpected error dispatching webhook to %s", wh.get('url'))
+        except Exception as exc:
+            logger.error("Unexpected error dispatching webhook to %s (%s)",
+                         safe_url_for_log(wh.get('url')), type(exc).__name__)
 
     email_service.send_event_email(payload.event, context)
 
@@ -410,7 +482,7 @@ _ALERT_DEDUP_SECS = 300  # 5 minutes
 _ALERT_BURST_SECS = 60   # Cross-key cap when dedup_key is used
 
 
-def _fire_alert_event(event, context, log_detail, dedup_key=None):
+def _fire_alert_event(event, context, log_detail, dedup_key=None, dedup=True):
     """Dispatch an operator alert to webhooks and email with a 5-minute
     dedup, keyed per event (or per `dedup_key` when alerts for the same
     event must not suppress each other, e.g. per-feed failures). Keyed
@@ -421,14 +493,15 @@ def _fire_alert_event(event, context, log_detail, dedup_key=None):
 
     Returns True when the alert was dispatched, False when suppressed --
     callers that alert on a one-shot state transition use this to retry
-    later instead of losing the alert."""
+    later instead of losing the alert. ``dedup=False`` sends every call, for
+    events that are already one per state transition."""
     key = dedup_key or event
     now = time.time()
     with _alert_lock:
-        if now - _last_alert_time.get(key, 0.0) < _ALERT_DEDUP_SECS:
+        if dedup and now - _last_alert_time.get(key, 0.0) < _ALERT_DEDUP_SECS:
             logger.debug("%s alert suppressed (dedup window)", event)
             return False
-        if dedup_key is not None and \
+        if dedup and dedup_key is not None and \
                 now - _last_alert_time.get(event, 0.0) < _ALERT_BURST_SECS:
             logger.debug("%s alert suppressed (burst cap)", event)
             return False
@@ -448,9 +521,9 @@ def _fire_alert_event(event, context, log_detail, dedup_key=None):
             try:
                 _prepare_and_dispatch(wh, context)
                 logger.info("%s webhook sent (%s)", event, log_detail)
-            except Exception:
-                logger.exception("Failed to send %s webhook to %s",
-                                 event, wh.get('url'))
+            except Exception as exc:
+                logger.error("Failed to send %s webhook to %s (%s)",
+                             event, safe_url_for_log(wh.get('url')), type(exc).__name__)
         email_service.send_event_email(event, context)
 
     thread = threading.Thread(target=_dispatch, daemon=True)
@@ -560,6 +633,17 @@ def fire_service_reachable_event(service, requeued):
         dedup_key=f"{EVENT_SERVICE_REACHABLE}:{service}")
 
 
+def fire_failover_event(action: str, target: str, source: str, reason: str | None) -> bool:
+    """Notify operators that a target switched to or from its failover config."""
+    event = EVENT_FAILOVER_TRIGGERED if action == 'trigger' else EVENT_FAILOVER_CANCELLED
+    api_name = next((k for k, v in FAILOVER_API_TARGET_NAMES.items() if v == target), target)
+    return _fire_alert_event(event, {
+        'target': api_name,
+        'source': source,
+        'reason': reason or '',
+    }, f"target={api_name}, source={source}", dedup_key=f"{event}:{target}", dedup=False)
+
+
 def fire_update_available_event(version, channel, release_date, url):
     """Fire an update-available webhook.
 
@@ -614,8 +698,7 @@ def _episode_test_context(event):
     """
     if event == EVENT_EPISODE_PROCESSED:
         try:
-            from database import Database  # deferred to avoid circular imports
-            db = Database()
+            db = database.Database()
             row = db.get_latest_completed_processing()
             if row:
                 payload = WebhookPayload(
@@ -655,27 +738,21 @@ def _build_test_context(event):
 
 
 def fire_test_event(webhook_config):
-    """Fire one test payload per event the webhook is subscribed to.
-
-    Each payload matches the real shape for its event and is dispatched
-    through the same render/dispatch path as real events (`_build_context`/
-    `_prepare_and_dispatch`), with `test: true` set. Falls back to a single
-    Episode Processed sample when the webhook's event list is empty:
-    webhooks created through the API always save a non-empty list, so this
-    only covers legacy or hand-edited data.
-
-    Returns a list of {'event': ..., 'delivered': bool} dicts, one per
-    event tested, in subscription order (duplicates collapsed).
-    """
+    """Send one test payload per subscribed event and report delivery and fallback status."""
     events = list(dict.fromkeys(webhook_config.get('events') or [])) or [EVENT_EPISODE_PROCESSED]
 
     results = []
     for event in events:
         context = _build_test_context(event)
-        status = _prepare_and_dispatch(webhook_config, context, add_test_flag=True, max_attempts=1)
+        status, fell_back = _dispatch_webhook(
+            webhook_config, context, add_test_flag=True, max_attempts=1)
         delivered = status is not None and 200 <= status < 300
         # Report the event actually sent (context['event']), not the raw
         # stored value: they only diverge for an unrecognized/legacy event
         # name, which falls back to an Episode Processed sample.
-        results.append({'event': context['event'], 'delivered': delivered})
+        results.append({
+            'event': context['event'],
+            'delivered': delivered,
+            'templateFallback': fell_back,
+        })
     return results

@@ -40,6 +40,12 @@ export interface ProcessingStatusResponse {
   queuedEpisodes?: ProcessingStatusQueuedEpisode[];
   feedRefreshes?: unknown[];
   hold?: ProcessingStatusHold;
+  // Provider failover (#806): which targets are on their failover account
+  // right now, keyed by target name ('llm-a', 'llm-b', 'transcriber').
+  failover?: {
+    active: string[];
+    targets: Record<string, { active: boolean; source: string | null; since: string | null }>;
+  };
   lastUpdated?: number;
 }
 

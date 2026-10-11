@@ -2,10 +2,19 @@
 import logging
 import random
 import time
+import uuid
 from typing import Union
 
+import failover
+import llm_route
 import run_context
+from config import (
+    PROVIDER_ANTHROPIC,
+    anthropic_model_requires_adaptive_thinking,
+    resolve_stage_reasoning,
+)
 from llm_capabilities import supports_json_schema
+from llm_capabilities import systemone_supported_phases
 from llm_client import (
     is_review_inconclusive_error,
     is_retryable_error,
@@ -15,18 +24,26 @@ from llm_client import (
     classify_daily_quota_exhaustion,
     is_auth_error,
     is_limit_exceeded_error,
+    is_failover_trigger_error,
+    get_llm_timeout,
+    get_llm_max_retries,
+    llm_retries_disabled,
     extract_retry_after,
     get_effective_provider,
     StructuralRateLimitError,
+    ProviderAccountChangedError,
     ProviderRateLimitedError,
     supports_json_schema_for_calls,
+)
+from llm_route import (
+    Route, apply_failover, account_identity, client_for_route, SLOT_FAILOVER, PHASES,
 )
 from rate_limit_hold import (
     MAX_RESET_SECONDS, MIN_HOLD_RESET_SECONDS, enforce_provider_rate_limit,
     is_rate_limit_hold_enabled, reserve_provider_request,
 )
 from utils.shutdown import shutdown_event
-from utils.time import parse_iso_utc, utc_now
+from utils.time import parse_iso_utc, utc_now, utc_now_iso
 # webhook_service, database and cancel are lazy-imported at the call sites
 # below (database pulls in Flask via AuthLockoutMixin; cancel pulls in
 # database transitively). Keeping them out of this module's import-time
@@ -64,15 +81,7 @@ def schema_format_for(model, name: str, schema: dict,
                       description: str | None = None,
                       allow_provider_schema: bool = False,
                       provider: str | None = None) -> dict:
-    """json_schema response_format when `model` supports it, else json_object.
-
-    ``allow_provider_schema`` additionally accepts a provider with a proven
-    schema path (Anthropic). Only for call sites that send no reasoning
-    budget: see supports_json_schema_for_calls for why the two gates differ.
-
-    ``provider``, when given, is the resolved route's provider for this
-    call; omitted, this falls back to the global effective provider.
-    """
+    """Use a model-probed schema or an explicitly allowed provider schema."""
     if supports_json_schema_for_calls(model) or (
             allow_provider_schema
             and supports_json_schema(provider or get_effective_provider())):
@@ -209,7 +218,8 @@ def _reserved_tokens(llm_kwargs) -> int:
 
 def _ledger_call_once(llm_client, llm_kwargs, model, *, phase_key, invoking_pass,
                       provider_key, credential_slot, slug, episode_id, call_label,
-                      blank_json_is_failure=False):
+                      blank_json_is_failure=False, original_slot=None,
+                      route_phase=None, max_retries=None):
     """One ledger-tracked adapter dispatch.
 
     Reserves the request by creating its attempt row before the network call
@@ -221,6 +231,14 @@ def _ledger_call_once(llm_client, llm_kwargs, model, *, phase_key, invoking_pass
     from cancel import ProcessingCancelled
     from database import Database
     db = Database()
+    if getattr(llm_client, 'uses_per_request_dispatch', False) is True:
+        return _call_with_request_dispatch(
+            llm_client, llm_kwargs, model, phase_key=phase_key,
+            invoking_pass=invoking_pass, provider_key=provider_key,
+            credential_slot=credential_slot, slug=slug,
+            episode_id=episode_id, call_label=call_label,
+            original_slot=original_slot, route_phase=route_phase, db=db,
+            timeout=llm_kwargs.get('timeout'), max_retries=max_retries)
     ctx = run_context.current()
     attempt_id, hold_until = reserve_provider_request(
         db, provider_key, credential_slot,
@@ -233,28 +251,150 @@ def _ledger_call_once(llm_client, llm_kwargs, model, *, phase_key, invoking_pass
             configured_model=model,
             window_label=call_label,
             reserved_tokens=_reserved_tokens(llm_kwargs),
+            **run_context.current_cleanup_review(),
         ),
     )
     if attempt_id is None:
         raise _reservation_refused(provider_key, credential_slot, hold_until,
                                    slug, episode_id, call_label, phase_key)
 
+    if ctx is not None and credential_slot == 'failover':
+        ctx.note_llm_failover(phase_key, invoking_pass, original_slot)
     run_context.begin_dispatch(attempt_id)
+    started = time.monotonic()
     try:
         response = _call_once(llm_client, llm_kwargs, model, blank_json_is_failure)
     except ProcessingCancelled:
-        db.finalize_llm_attempt(attempt_id, state='cancelled')
+        db.finalize_llm_attempt(
+            attempt_id, state='cancelled',
+            dispatch_latency_ms=round((time.monotonic() - started) * 1000),
+            call_latency_ms=round((time.monotonic() - started) * 1000))
         raise
     except Exception as e:
         # Preserve usage on provider errors, including explicit abstentions.
         state = 'inconclusive' if is_review_inconclusive_error(e) else 'failure'
-        _finalize_attempt(db, attempt_id, state, getattr(e, 'response', None), ctx)
+        _finalize_attempt(db, attempt_id, state, getattr(e, 'response', None), ctx,
+                          dispatch_latency_ms=round((time.monotonic() - started) * 1000),
+                          call_latency_ms=round((time.monotonic() - started) * 1000))
         raise
     finally:
         run_context.end_dispatch()
 
-    _finalize_attempt(db, attempt_id, 'success', response, ctx)
+    latency_ms = round((time.monotonic() - started) * 1000)
+    _finalize_attempt(db, attempt_id, 'success', response, ctx,
+                      dispatch_latency_ms=latency_ms, call_latency_ms=latency_ms)
     return response
+
+
+def _call_with_request_dispatch(llm_client, llm_kwargs, model, *, phase_key,
+                                invoking_pass, provider_key, credential_slot,
+                                slug, episode_id, call_label, original_slot,
+                                route_phase, db, timeout, max_retries):
+    """Run a provider adapter whose transport reserves each HTTP request."""
+    ctx = run_context.current()
+    metadata = {
+        'logical_call_id': str(uuid.uuid4()),
+        'logical_call_started_at': utc_now_iso(),
+        'run_id': ctx.run_id if ctx else None,
+        'podcast_id': _resolve_podcast_id(slug), 'episode_id': episode_id,
+        'phase_key': phase_key, 'invoking_pass': invoking_pass,
+        'provider_key': provider_key, 'credential_slot': credential_slot,
+        'configured_model': model, 'slug': slug, 'call_label': call_label,
+        'original_slot': original_slot,
+        'timeout': timeout, 'route_phase': route_phase,
+        'max_retries': max_retries,
+        'database': db,
+        'reserve_request': reserve_provider_request,
+        'reservation_refused': _reservation_refused,
+        'cancel_check': ctx.llm_cancel_check if ctx else lambda: None,
+        'cancel_exceptions': ctx.llm_cancel_exceptions if ctx else (),
+        'retryable': is_retryable_error,
+        'inconclusive': is_review_inconclusive_error,
+        'retry_delay': lambda error, attempt: _fallback_delay(
+            error, calculate_backoff(attempt), attempt == 0,
+            retry_after_cap=run_context.current_llm_dispatch_context().get('retry_after_cap')),
+        'sleep_retry': _sleep_before_retry,
+        'terminal_error': _terminal_error,
+    }
+    metadata['deadline_at'] = None
+    phase = route_phase or (phase_key if phase_key in PHASES else None)
+    metadata['route_phase'] = phase
+    metadata['frozen_route'] = run_context.route_for_phase(phase) if phase else None
+    metadata['account_check'] = _assert_systemone_account if credential_slot != SLOT_FAILOVER else None
+    run_context.begin_llm_dispatch_context(metadata)
+    metadata = run_context.current_llm_dispatch_context()
+    started = time.monotonic()
+    error = None
+    outcome = 'completed'
+    try:
+        return _call_once(llm_client, llm_kwargs, model)
+    except Exception as exc:
+        error = exc
+        outcome = 'inconclusive' if is_review_inconclusive_error(exc) else 'failed'
+        raise
+    finally:
+        latency_ms = round((time.monotonic() - started) * 1000)
+        attempt_id = run_context.first_llm_dispatch_attempt()
+        if attempt_id:
+            db.set_llm_call_latency(attempt_id, latency_ms)
+        cause = getattr(error, '__cause__', None)
+        reason = (getattr(error, 'reason', None) or getattr(error, 'rule', None)
+                  or getattr(cause, 'reason', None) or getattr(cause, 'rule', None))
+        stage = getattr(error, 'stage', None) or getattr(cause, 'stage', None)
+        diagnostics = dict(metadata.get('diagnostics') or {})
+        if error is not None:
+            error_details = {}
+            for name in (
+                    'reason', 'stage', 'score', 'threshold', 'cache_hit',
+                    'range_start', 'range_end', 'candidate_start',
+                    'candidate_end', 'context_start', 'context_end',
+                    'start_supported', 'end_supported', 'proposal', 'fallback'):
+                value = getattr(error, name, None)
+                if value is None:
+                    value = getattr(cause, name, None)
+                if value is not None:
+                    error_details[name] = value
+            rule = getattr(error, 'rule', None) or getattr(cause, 'rule', None)
+            if rule is not None:
+                error_details['validation_rule'] = rule
+            numeric_details = (getattr(error, 'numeric_details', None)
+                               or getattr(cause, 'numeric_details', None))
+            if numeric_details:
+                error_details['numeric_details'] = numeric_details
+            if error_details:
+                diagnostics['error_details'] = error_details
+        try:
+            db.record_systemone_call_diagnostics(
+                logical_call_id=metadata['logical_call_id'],
+                run_id=metadata['run_id'], podcast_id=metadata['podcast_id'],
+                episode_id=episode_id, provider_key=provider_key,
+                credential_slot=credential_slot, configured_model=model,
+                phase_key=phase_key, window_label=call_label,
+                created_at=metadata['logical_call_started_at'],
+                logical_latency_ms=latency_ms, outcome=outcome,
+                reason=reason,
+                stage=stage,
+                diagnostics=diagnostics,
+            )
+        except Exception:
+            logger.exception('Could not persist System One logical-call diagnostics')
+        run_context.end_llm_dispatch_context()
+
+
+def _assert_systemone_account(metadata):
+    """Stop a subrequest if its frozen route now belongs to another account."""
+    route = metadata.get('frozen_route')
+    if not route:
+        return
+    mismatch = llm_route.route_account_mismatch(route)
+    if mismatch is None:
+        return
+    frozen, current = mismatch
+    raise ProviderAccountChangedError(
+        'Provider account changed during the logical call; request was not sent',
+        credential_slot=metadata.get('credential_slot', 'primary'),
+        phase=metadata.get('route_phase'), expected_account_id=frozen,
+        current_account_id=current)
 
 
 def _reservation_refused(provider_key, credential_slot, hold_until, slug,
@@ -272,10 +412,14 @@ def _reservation_refused(provider_key, credential_slot, hold_until, slug,
         credential_slot=credential_slot, manual=True, phase=phase_key)
 
 
-def _finalize_attempt(db, attempt_id, state, response, ctx) -> None:
+def _finalize_attempt(db, attempt_id, state, response, ctx, *,
+                      dispatch_latency_ms=None, call_latency_ms=None) -> None:
     """Finalize one ledger attempt with the response's usage (if any) and
     add the resulting cost to the run accumulator."""
-    cost = db.finalize_llm_attempt_from_response(attempt_id, state, response)
+    cost = db.finalize_llm_attempt_from_response(
+        attempt_id, state, response,
+        dispatch_latency_ms=dispatch_latency_ms,
+        call_latency_ms=call_latency_ms)
     if ctx is None:
         return
     usage = getattr(response, 'usage', None)
@@ -284,10 +428,21 @@ def _finalize_attempt(db, attempt_id, state, response, ctx) -> None:
     ctx.tokens.add(usage.get('input_tokens') or 0, usage.get('output_tokens') or 0, cost)
 
 
-def _apply_reasoning_fallback(llm_kwargs, *, slug, episode_id, call_label) -> None:
-    """Turn reasoning off before the retry an exhausted budget earns. An unset
-    effort flips too: the model reasoned unasked, so 'none' is a different
-    request; an effort already at 'none' retries the same request."""
+def _apply_reasoning_fallback(
+    llm_kwargs, *, slug, episode_id, call_label, model=None, provider=None,
+) -> None:
+    """Reduce reasoning before the retry an exhausted budget earns."""
+    if (provider == 'anthropic'
+            and anthropic_model_requires_adaptive_thinking(model)):
+        current = llm_kwargs.get('reasoning_effort')
+        if current in ('low', 'none'):
+            return
+        llm_kwargs['reasoning_effort'] = 'low'
+        logger.warning(
+            f"[{slug}:{episode_id}] {call_label} reasoning exhausted the output budget; "
+            "retrying with low adaptive effort"
+        )
+        return
     if llm_kwargs.get('reasoning_effort') in ('', 'none'):
         return
     llm_kwargs['reasoning_effort'] = 'none'
@@ -377,19 +532,31 @@ def _shutdown_requested() -> bool:
     return shutdown_event.is_set()
 
 
-def _sleep_before_retry(delay: float) -> bool:
-    """Wait `delay` in slices, ending early on shutdown; False when interrupted."""
+def _sleep_before_retry(delay: float, *, before_wait=None,
+                        deadline_at: float | None = None) -> bool:
+    """Wait in slices, ending on cancellation, deadline, or shutdown."""
     remaining = delay
     while remaining > 0:
+        if before_wait:
+            before_wait()
         if _shutdown_requested():
             return False
-        slice_seconds = min(RETRY_SLEEP_SLICE_SECONDS, remaining)
+        if deadline_at is not None:
+            remaining_deadline = deadline_at - time.monotonic()
+            if remaining_deadline <= 0:
+                return False
+        else:
+            remaining_deadline = remaining
+        slice_seconds = min(RETRY_SLEEP_SLICE_SECONDS, remaining, remaining_deadline)
         time.sleep(slice_seconds)
         remaining -= slice_seconds
-    return not _shutdown_requested()
+    if before_wait:
+        before_wait()
+    return not _shutdown_requested() and (
+        deadline_at is None or time.monotonic() < deadline_at)
 
 
-def _fallback_delay(error, base_delay: float, honor_retry_after: bool) -> float:
+def _fallback_delay(error, base_delay: float, honor_retry_after: bool, *, retry_after_cap=None) -> float:
     """Per-window retry wait: a rate limit's own reset beats the fixed backoff.
 
     Only the first retry honors the reset, capped, so a long hint cannot park
@@ -397,9 +564,11 @@ def _fallback_delay(error, base_delay: float, honor_retry_after: bool) -> float:
     """
     if honor_retry_after and is_rate_limit_error(error):
         retry_after = extract_retry_after(
-            error, max_seconds=FALLBACK_RETRY_AFTER_CAP_SECONDS)
+            error, max_seconds=(FALLBACK_RETRY_AFTER_CAP_SECONDS
+                                if retry_after_cap is None else retry_after_cap))
         if retry_after is not None:
-            return retry_after + random.uniform(0.0, 2.0)
+            delay = retry_after + random.uniform(0.0, 2.0)
+            return delay if retry_after_cap is None else min(delay, retry_after_cap)
     return base_delay
 
 
@@ -556,6 +725,79 @@ def _manual_rate_limit_error(provider_key, credential_slot, slug, episode_id,
         credential_slot=credential_slot, manual=True, phase=phase)
 
 
+def _failover_route(phase: str, provider_key: str, credential_slot: str, model: str,
+                    base_url=None):
+    """Failover Route for the phase whose slot just failed, or None."""
+    original = Route(phase=phase, provider_key=provider_key, model_id=model, base_url=base_url,
+                     slot=credential_slot, credential_slot=credential_slot,
+                     account_id=account_identity(provider_key, base_url))
+    route = apply_failover(original)
+    return route if route.credential_slot == SLOT_FAILOVER else None
+
+
+def _failover_result_error(fo_error, original_error):
+    """Keep the original error unless the standby rejected the request shape (400/422)
+    or returned a run-control outcome (hold, cancel, account change)."""
+    from cancel import ProcessingCancelled
+    if fo_error is None or fo_error is original_error:
+        return original_error
+    if isinstance(fo_error, (ProviderRateLimitedError, ProviderAccountChangedError,
+                             ProcessingCancelled)):
+        wins = True
+    else:
+        wins = (getattr(fo_error, 'status_code', None) in (400, 422)
+                and not is_limit_exceeded_error(fo_error))
+    if wins:
+        fo_error.__context__ = original_error
+        return fo_error
+    return original_error
+
+
+def _dispatch_on_failover(run_ladder, llm_kwargs, last_error, *, target, phase, provider_key,
+                         credential_slot, model, slug, episode_id, call_label,
+                         stage_tunable_prefix=None, reasoning_retried=False):
+    """Retry on standby and return its effective response or error."""
+    try:
+        failover.trigger(target, f"{call_label}: {type(last_error).__name__}: {str(last_error)[:200]}",
+                         raise_on_error=True)
+    except Exception as error:
+        logger.warning(f"[{slug}:{episode_id}] {call_label} standby skipped: state not saved: {error}")
+        return None, last_error
+    route = _failover_route(phase, provider_key, credential_slot, model)
+    if route is None:
+        return None, last_error
+    fo_kwargs = {**llm_kwargs, 'model': route.model_id,
+                 'timeout': get_llm_timeout(route.provider_key, SLOT_FAILOVER)}
+    if stage_tunable_prefix:
+        stage_reasoning = resolve_stage_reasoning(
+            stage_tunable_prefix, provider=route.provider_key, model=route.model_id)
+        if reasoning_retried:
+            reasoning = llm_kwargs.get('reasoning_effort')
+            if (route.provider_key == PROVIDER_ANTHROPIC
+                    and not anthropic_model_requires_adaptive_thinking(route.model_id)
+                    and reasoning not in (None, 'none')):
+                reasoning = 'none'
+        else:
+            reasoning = stage_reasoning
+        fo_kwargs['reasoning_effort'] = reasoning
+    rf = llm_kwargs.get('response_format') or {}
+    if (rf.get('type') == 'json_schema'
+            and not supports_json_schema(route.provider_key)
+            and not supports_json_schema_for_calls(route.model_id)):
+        fo_kwargs['response_format'] = {'type': 'json_object'}
+    logger.warning(f"[{slug}:{episode_id}] {call_label} switching to failover provider "
+                   f"{route.provider_key} model {route.model_id}")
+    response, fo_error = run_ladder(
+        client_for_route(route), route.model_id, fo_kwargs,
+        get_llm_max_retries(route.provider_key, SLOT_FAILOVER),
+        SLOT_FAILOVER, route.provider_key)
+    if response is None:
+        logger.warning(f"[{slug}:{episode_id}] {call_label} failover attempt on "
+                       f"{route.provider_key} {route.model_id} also failed: {fo_error}")
+        return None, _failover_result_error(fo_error, last_error)
+    return response, None
+
+
 def call_llm(
     *,
     llm_client,
@@ -577,36 +819,19 @@ def call_llm(
     credential_slot: str = 'primary',
     blank_json_is_failure: bool = False,
     is_window: bool = False,
+    route_phase: str | None = None,
+    stage_tunable_prefix: str | None = None,
 ) -> tuple[object | None, Exception | None]:
-    """Call LLM with an in-loop retry then a per-window fallback retry.
-
-    Both retry loops stay on the same route/slot; this is not a cross-provider
-    failover chain (see ``provider``/``credential_slot`` below).
-
-    Generic seam shared by ad detection/review (via ``call_llm_for_window``)
-    and chapters generation. Never raises: all failures come back as the
-    second tuple element so callers can degrade gracefully.
-
-    ``provider``, when given, is the resolved route's provider for this
-    call; error/webhook context uses it instead of the global effective
-    provider. ``credential_slot`` is that route's account ('primary' or
-    'secondary'), carried onto a held 429 so the queue pauses only that
-    account, not every account on the same provider type.
-
-    ``phase_key`` labels this call in the llm_call_usage ledger ('detection',
-    'verification', 'review', 'chapters'); every real dispatch (including
-    each retry below) is recorded as its own billable ledger row.
-
-    ``blank_json_is_failure`` treats a budget-truncated blank JSON object as a
-    failed call; only window calls, where it means an unexamined span, opt in.
-
-    ``is_window`` marks a detection/review window, the only calls whose loss
-    is a coverage gap worth its own log line.
-
-    Returns:
-        Tuple of (response, last_error). response is None if all retries failed.
-    """
+    """Return (response, last_error) after account-scoped retries and eligible standby dispatch.
+    route_phase selects standby model; phase_key labels usage; is_window logs coverage loss.
+    blank_json_is_failure rejects truncated empty JSON; provider/credential_slot scope the account."""
     provider_key = provider or get_effective_provider()
+    effective_phase = route_phase or (phase_key if phase_key in PHASES else None)
+    supported_phases = systemone_supported_phases(provider_key, model)
+    if supported_phases is not None and effective_phase is not None \
+            and effective_phase not in supported_phases:
+        raise ValueError(
+            f"System One model '{model}' does not support the {effective_phase} phase")
 
     invoking_pass = _invoking_pass_from_name(pass_name)
     llm_kwargs = dict(
@@ -621,151 +846,191 @@ def call_llm(
         episode_id=episode_id,
         pass_name=pass_name,
     )
-    response = None
-    last_error = None
+    # Shared across both ladder runs on purpose: ReasoningExhaustedError is
+    # never a failover trigger, so only one provider ever spends this retry.
     reasoning_retried = False
 
-    def dispatch():
-        """One dispatch, plus the single retry an exhausted reasoning budget
-        earns wherever in the ladder it lands. A ReasoningExhaustedError out of
-        here has already spent that retry and is terminal for the window."""
+    original_slot = credential_slot
+
+    def _run_ladder(client, model, llm_kwargs, max_retries, credential_slot, provider_key):
+        """In-loop retry then two fixed per-window rungs, all on one route/slot."""
         nonlocal reasoning_retried
-        call = dict(
-            phase_key=phase_key, invoking_pass=invoking_pass,
-            provider_key=provider_key, credential_slot=credential_slot,
-            slug=slug, episode_id=episode_id, call_label=call_label,
-            blank_json_is_failure=blank_json_is_failure)
-        try:
-            return _ledger_call_once(llm_client, llm_kwargs, model, **call)
-        except ReasoningExhaustedError:
-            if reasoning_retried:
-                logger.warning(
-                    f"[{slug}:{episode_id}] {call_label} exhausted its output "
-                    f"budget again; giving up"
-                )
-                raise
-            reasoning_retried = True
-            _apply_reasoning_fallback(llm_kwargs, slug=slug, episode_id=episode_id,
-                                      call_label=call_label)
-        held = _manual_rate_limit_error(provider_key, credential_slot, slug,
-                                        episode_id, phase=phase_key)
-        if held is not None:
-            raise held
-        return _ledger_call_once(llm_client, llm_kwargs, model, **call)
+        per_request_dispatch = bool(
+            getattr(client, 'uses_per_request_dispatch', False) is True)
+        response = None
+        last_error = None
 
-    for attempt in range(max_retries + 1):
-        # Manual rate-limit backstop (#747): re-checked before every dispatch,
-        # not once up front, so a cap crossed mid-retry defers instead of
-        # burning more requests. Admission is still the primary gate.
-        held = _manual_rate_limit_error(provider_key, credential_slot, slug,
-                                        episode_id, phase=phase_key)
-        if held is not None:
-            return None, _lost_window(held, is_window, slug, episode_id, call_label)
-        try:
-            response = dispatch()
-            return response, None
-        except Exception as e:
-            last_error = e
-            if is_review_inconclusive_error(e):
-                break
-            if isinstance(e, ReasoningExhaustedError):
-                break
-            # A cap that refused the reservation already recorded its hold;
-            # re-classifying it would only retry into the same refusal.
-            if _is_manual_cap_error(e):
-                return None, _lost_window(e, is_window, slug, episode_id, call_label)
-            terminal = _terminal_error(
-                e, model=model, slug=slug, episode_id=episode_id,
-                call_label=call_label, provider=provider,
-                credential_slot=credential_slot, phase=phase_key)
-            if terminal is not None:
-                last_error = terminal
-                break
-            if _is_retryable(e) and attempt < max_retries:
-                if is_rate_limit_error(e):
-                    retry_after = extract_retry_after(e)
-                    if retry_after is not None:
-                        delay = retry_after + random.uniform(0.0, 2.0)
-                        source = f"retry-after={retry_after:.1f}s"
-                    else:
-                        delay = calculate_backoff(attempt, base_delay=30.0, max_delay=120.0)
-                        source = "backoff"
+        def dispatch():
+            """One dispatch, plus the single retry an exhausted reasoning budget
+            earns wherever in the ladder it lands. A ReasoningExhaustedError out of
+            here has already spent that retry and is terminal for the window."""
+            nonlocal reasoning_retried
+            call = dict(
+                phase_key=phase_key, invoking_pass=invoking_pass,
+                provider_key=provider_key, credential_slot=credential_slot,
+                slug=slug, episode_id=episode_id, call_label=call_label,
+                blank_json_is_failure=blank_json_is_failure, original_slot=original_slot,
+                route_phase=route_phase, max_retries=max_retries)
+            try:
+                return _ledger_call_once(client, llm_kwargs, model, **call)
+            except ReasoningExhaustedError:
+                if per_request_dispatch:
+                    raise
+                if reasoning_retried:
                     logger.warning(
-                        f"[{slug}:{episode_id}] {call_label} rate limit ({source}), "
-                        f"waiting {delay:.1f}s"
+                        f"[{slug}:{episode_id}] {call_label} exhausted its output "
+                        f"budget again; giving up"
                     )
-                else:
-                    delay = calculate_backoff(attempt)
-                    delay = _breaker_retry_delay(llm_client, e, delay)
-                    logger.warning(
-                        f"[{slug}:{episode_id}] {call_label} API error: {e}. "
-                        f"Retrying in {delay:.1f}s"
-                    )
-                if not _sleep_before_retry(delay):
-                    break
-                continue
-            logger.warning(f"[{slug}:{episode_id}] {call_label} failed: {e}")
-            break
-
-    if (response is None and last_error is not None and _is_retryable(last_error)
-            and not isinstance(last_error, ReasoningExhaustedError)):
-        # A CircuitBreakerOpen on the last fixed rung earns one more rung once
-        # its cooldown clears, appended here rather than pre-planned: no other
-        # error qualifies for it.
-        rungs = [2, 5]
-        retry_num = 0
-        while retry_num < len(rungs):
-            retry_num += 1
+                    raise
+                reasoning_retried = True
+                _apply_reasoning_fallback(
+                    llm_kwargs, slug=slug, episode_id=episode_id,
+                    call_label=call_label, model=model, provider=provider_key)
             held = _manual_rate_limit_error(provider_key, credential_slot, slug,
                                             episode_id, phase=phase_key)
             if held is not None:
-                return None, _lost_window(held, is_window, slug, episode_id, call_label)
-            rung = rungs[retry_num - 1]
-            if rung == 'breaker':
-                if not _wait_past_breaker_cooldown(last_error.seconds_until_retry):
-                    break
-                wait = last_error.seconds_until_retry + BREAKER_RETRY_MARGIN_SECONDS
-                logger.warning(
-                    f"[{slug}:{episode_id}] {call_label} per-window retry "
-                    f"{retry_num}/{len(rungs)} after breaker cooldown ({wait:.1f}s)"
-                )
-            else:
-                delay = _fallback_delay(last_error, rung, retry_num == 1)
-                delay = _breaker_retry_delay(llm_client, last_error, delay)
-                logger.warning(
-                    f"[{slug}:{episode_id}] {call_label} per-window retry "
-                    f"{retry_num}/{len(rungs)} after {delay:.1f}s backoff"
-                )
-                if not _sleep_before_retry(delay):
-                    break
+                raise held
+            return _ledger_call_once(client, llm_kwargs, model, **call)
+
+        for attempt in range(1 if per_request_dispatch else max_retries + 1):
+            # Manual rate-limit backstop (#747): re-checked before every dispatch,
+            # not once up front, so a cap crossed mid-retry defers instead of
+            # burning more requests. Admission is still the primary gate.
+            held = _manual_rate_limit_error(provider_key, credential_slot, slug,
+                                            episode_id, phase=phase_key)
+            if held is not None:
+                return None, held
             try:
                 response = dispatch()
-                logger.info(
-                    f"[{slug}:{episode_id}] {call_label} succeeded on retry {retry_num}"
-                )
                 return response, None
             except Exception as e:
                 last_error = e
+                if is_review_inconclusive_error(e):
+                    break
                 if isinstance(e, ReasoningExhaustedError):
                     break
+                # A cap that refused the reservation already recorded its hold;
+                # re-classifying it would only retry into the same refusal.
                 if _is_manual_cap_error(e):
-                    return None, _lost_window(e, is_window, slug, episode_id,
-                                              call_label)
+                    return None, e
                 terminal = _terminal_error(
                     e, model=model, slug=slug, episode_id=episode_id,
-                    call_label=call_label, provider=provider,
+                    call_label=call_label, provider=provider_key,
                     credential_slot=credential_slot, phase=phase_key)
                 if terminal is not None:
                     last_error = terminal
                     break
-                if not _is_retryable(e):
-                    break
-                logger.warning(
-                    f"[{slug}:{episode_id}] {call_label} retry {retry_num} failed: {e}"
-                )
-                if (retry_num == len(rungs) and rungs[-1] != 'breaker'
-                        and isinstance(last_error, CircuitBreakerOpen)):
-                    rungs = rungs + ['breaker']
+                if _is_retryable(e) and attempt < max_retries:
+                    if is_rate_limit_error(e):
+                        retry_after = extract_retry_after(e)
+                        if retry_after is not None:
+                            delay = retry_after + random.uniform(0.0, 2.0)
+                            source = f"retry-after={retry_after:.1f}s"
+                        else:
+                            delay = calculate_backoff(attempt, base_delay=30.0, max_delay=120.0)
+                            source = "backoff"
+                        logger.warning(
+                            f"[{slug}:{episode_id}] {call_label} rate limit ({source}), "
+                            f"waiting {delay:.1f}s"
+                        )
+                    else:
+                        delay = calculate_backoff(attempt)
+                        delay = _breaker_retry_delay(client, e, delay)
+                        logger.warning(
+                            f"[{slug}:{episode_id}] {call_label} API error: {e}. "
+                            f"Retrying in {delay:.1f}s"
+                        )
+                    if not _sleep_before_retry(delay):
+                        break
+                    continue
+                logger.warning(f"[{slug}:{episode_id}] {call_label} failed: {e}")
+                break
+
+        if (not per_request_dispatch and response is None and last_error is not None
+                and _is_retryable(last_error)
+                and not isinstance(last_error, ReasoningExhaustedError)
+                and not (max_retries == 0 and llm_retries_disabled(credential_slot))):
+            # A CircuitBreakerOpen on the last fixed rung earns one more rung once
+            # its cooldown clears, appended here rather than pre-planned: no other
+            # error qualifies for it.
+            rungs = [2, 5]
+            retry_num = 0
+            while retry_num < len(rungs):
+                retry_num += 1
+                held = _manual_rate_limit_error(provider_key, credential_slot, slug,
+                                                episode_id, phase=phase_key)
+                if held is not None:
+                    return None, held
+                rung = rungs[retry_num - 1]
+                if rung == 'breaker':
+                    if not _wait_past_breaker_cooldown(last_error.seconds_until_retry):
+                        break
+                    wait = last_error.seconds_until_retry + BREAKER_RETRY_MARGIN_SECONDS
+                    logger.warning(
+                        f"[{slug}:{episode_id}] {call_label} per-window retry "
+                        f"{retry_num}/{len(rungs)} after breaker cooldown ({wait:.1f}s)"
+                    )
+                else:
+                    delay = _fallback_delay(last_error, rung, retry_num == 1)
+                    delay = _breaker_retry_delay(client, last_error, delay)
+                    logger.warning(
+                        f"[{slug}:{episode_id}] {call_label} per-window retry "
+                        f"{retry_num}/{len(rungs)} after {delay:.1f}s backoff"
+                    )
+                    if not _sleep_before_retry(delay):
+                        break
+                try:
+                    response = dispatch()
+                    logger.info(
+                        f"[{slug}:{episode_id}] {call_label} succeeded on retry {retry_num}"
+                    )
+                    return response, None
+                except Exception as e:
+                    last_error = e
+                    if isinstance(e, ReasoningExhaustedError):
+                        break
+                    if _is_manual_cap_error(e):
+                        return None, e
+                    terminal = _terminal_error(
+                        e, model=model, slug=slug, episode_id=episode_id,
+                        call_label=call_label, provider=provider_key,
+                        credential_slot=credential_slot, phase=phase_key)
+                    if terminal is not None:
+                        last_error = terminal
+                        break
+                    if not _is_retryable(e):
+                        break
+                    logger.warning(
+                        f"[{slug}:{episode_id}] {call_label} retry {retry_num} failed: {e}"
+                    )
+                    if (retry_num == len(rungs) and rungs[-1] != 'breaker'
+                            and isinstance(last_error, CircuitBreakerOpen)):
+                        rungs = rungs + ['breaker']
+
+        return response, last_error
+
+    response, last_error = _run_ladder(
+        llm_client, model, llm_kwargs, max_retries, credential_slot, provider_key)
+    if response is not None:
+        return response, None
+
+    phase = route_phase or (phase_key if phase_key in PHASES else None)
+    target = failover.llm_target_for_slot(credential_slot)
+    if (last_error is not None and phase and target
+            and is_failover_trigger_error(last_error) and failover.is_configured(target)):
+        try:
+            response, last_error = _dispatch_on_failover(
+                _run_ladder, llm_kwargs, last_error, target=target, phase=phase,
+                provider_key=provider_key, credential_slot=credential_slot, model=model,
+                slug=slug, episode_id=episode_id, call_label=call_label,
+                stage_tunable_prefix=stage_tunable_prefix,
+                reasoning_retried=reasoning_retried)
+        except Exception as e:
+            logger.warning(f"[{slug}:{episode_id}] {call_label} failover dispatch errored: {e}")
+            last_error = _failover_result_error(e, last_error)
+            response = None
+        if response is not None:
+            return response, None
 
     return None, _lost_window(last_error, is_window, slug, episode_id, call_label)
 

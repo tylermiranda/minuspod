@@ -36,7 +36,7 @@ def test_render_with_no_data(tmp_path, minimal_cfg, make_episode, pricing_snapsh
     out = tmp_path / "report.md"
     report.render(
         cfg=minimal_cfg, episodes=[make_episode()],
-        calls_path=calls, episode_results_path=tmp_path / "ep.jsonl",
+        calls_path=calls,
         pricing_snapshot=pricing_snapshot,
         output_path=out, assets_dir=tmp_path / "assets",
     )
@@ -50,7 +50,7 @@ def test_render_with_one_call(tmp_path, minimal_cfg, make_episode, pricing_snaps
     out = tmp_path / "report.md"
     report.render(
         cfg=minimal_cfg, episodes=[ep],
-        calls_path=calls, episode_results_path=tmp_path / "ep.jsonl",
+        calls_path=calls,
         pricing_snapshot=pricing_snapshot,
         output_path=out, assets_dir=tmp_path / "assets",
     )
@@ -84,7 +84,7 @@ def test_per_model_detail_reports_verbosity_and_truncation(tmp_path, minimal_cfg
     out = tmp_path / "report.md"
     report.render(
         cfg=minimal_cfg, episodes=[ep],
-        calls_path=calls, episode_results_path=tmp_path / "ep.jsonl",
+        calls_path=calls,
         pricing_snapshot=pricing_snapshot,
         output_path=out, assets_dir=tmp_path / "assets",
     )
@@ -130,7 +130,7 @@ def test_tldr_table_columns_and_json_mode_telemetry(tmp_path, minimal_cfg, make_
     out = tmp_path / "report.md"
     report.render(
         cfg=minimal_cfg, episodes=[ep],
-        calls_path=calls, episode_results_path=tmp_path / "ep.jsonl",
+        calls_path=calls,
         pricing_snapshot=pricing_snapshot,
         output_path=out, assets_dir=tmp_path / "assets",
     )
@@ -165,7 +165,7 @@ def test_render_handles_no_ad_episode(tmp_path, minimal_cfg, make_episode, prici
     out = tmp_path / "report.md"
     report.render(
         cfg=minimal_cfg, episodes=[ep],
-        calls_path=calls, episode_results_path=tmp_path / "ep.jsonl",
+        calls_path=calls,
         pricing_snapshot=pricing_snapshot,
         output_path=out, assets_dir=tmp_path / "assets",
     )
@@ -277,3 +277,24 @@ def test_fp_windows_table_lists_only_truthless_windows(make_episode):
 
     solo_vote = {("ep-a", 1): {"m1": 1, "m2": 0, "m3": 0}}
     assert _render_fp_windows(solo_vote, 3, [ep]) == []
+
+
+def test_native_failed_call_keeps_known_spend_and_unknown_cost_out_of_free_rankings(
+        tmp_path, minimal_cfg, make_episode, pricing_snapshot):
+    ep = make_episode(n_windows=1)
+    calls = tmp_path / 'calls.jsonl'
+    accounting = {'known_cost_usd': '0.000042', 'request_count': 2,
+                  'unknown_cost_request_count': 1, 'unknown_usage_request_count': 1,
+                  'input_tokens': 1000, 'output_tokens': 5, 'cost_source': 'estimated'}
+    append_jsonl(calls, {**CALL_RECORD_TEMPLATE, 'call_id': 'c1',
+                        'error': {'type': 'NativeCallError', 'message': 'failed upstream request'},
+                        'native_accounting': accounting, 'parsed_ads': []})
+    output = tmp_path / 'report.md'
+    report.render(cfg=minimal_cfg, episodes=[ep], calls_path=calls,
+                  pricing_snapshot=pricing_snapshot, output_path=output,
+                  assets_dir=tmp_path / 'assets')
+    text = output.read_text()
+    assert 'Known native request cost: USD 0.000042; 1 requests with unknown cost' in text
+    assert 'Native usage: 2 requests; 1 requests with unknown tokens' in text
+    assert 'unknown cost' in text
+    assert '($0.0000' not in text

@@ -9,7 +9,7 @@
  *   - DAI-likely badge + hint render only when feed.daiLikely is true.
  */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { render, screen, within, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, within, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import FeedSettingsPanel from './FeedSettingsPanel';
@@ -104,10 +104,43 @@ function renderPanel(feed: Feed) {
       <FeedSettingsPanel feed={next} slug={next.slug} />
     </QueryClientProvider>,
   );
-  return { ...result, rerenderWithFeed };
+  return { ...result, client, rerenderWithFeed };
 }
 
 const SELECT_NAME = 'Fetch each episode twice to find inserted ads';
+
+describe('Feed audio output inheritance', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockGetSettings.mockResolvedValue({
+      audioReplacementSoundEnabled: { value: false, isDefault: false },
+      audioMp3StreamCopyEnabled: { value: true, isDefault: false },
+    });
+    mockUpdateFeed.mockResolvedValue(makeFeed());
+  });
+
+  it('shows inherited global choices and preserves explicit false', async () => {
+    const user = userEvent.setup();
+    renderPanel(makeFeed({ audioReplacementSoundOverride: null, audioMp3StreamCopyOverride: null }));
+    const sound = await screen.findByLabelText('Replacement sound');
+    const copy = screen.getByLabelText('MP3 stream copy');
+    await waitFor(() => expect(within(sound).getByRole('option', { name: 'Use global (off)' })).toBeDefined());
+    expect(within(copy).getByRole('option', { name: 'Use global (on)' })).toBeDefined();
+    await user.selectOptions(copy, 'off');
+    await waitFor(() => expect(mockUpdateFeed).toHaveBeenCalledWith('test-feed', { audioMp3StreamCopyOverride: false }));
+    await user.selectOptions(sound, 'on');
+    await waitFor(() => expect(mockUpdateFeed).toHaveBeenCalledWith('test-feed', { audioReplacementSoundOverride: true }));
+  });
+
+  it('restores inheritance with null for each override', async () => {
+    const user = userEvent.setup();
+    renderPanel(makeFeed({ audioReplacementSoundOverride: false, audioMp3StreamCopyOverride: true }));
+    await user.selectOptions(screen.getByLabelText('Replacement sound'), '');
+    await waitFor(() => expect(mockUpdateFeed).toHaveBeenCalledWith('test-feed', { audioReplacementSoundOverride: null }));
+    await user.selectOptions(screen.getByLabelText('MP3 stream copy'), '');
+    await waitFor(() => expect(mockUpdateFeed).toHaveBeenCalledWith('test-feed', { audioMp3StreamCopyOverride: null }));
+  });
+});
 
 describe('FeedSettingsPanel processing mode preset', () => {
   beforeEach(() => {
@@ -200,6 +233,24 @@ describe('FeedSettingsPanel chapters mode control', () => {
     renderPanel(makeFeed());
     const select = screen.getByRole('combobox', { name: CHAPTERS_SELECT_NAME }) as HTMLSelectElement;
     expect(select.value).toBe('');
+  });
+
+  it.each([
+    { enabled: true, mode: 'off', autoBlocked: true },
+    { enabled: false, mode: 'auto', autoBlocked: false },
+  ])('allows disabled inherited native configuration (%j)', async ({ enabled, mode, autoBlocked }) => {
+    mockGetSettings.mockResolvedValue({
+      llmProvider: { value: 'typesafe' }, claudeModel: { value: 'jev-latest' },
+      chaptersEnabled: { value: enabled }, chaptersMode: { value: mode },
+    });
+    renderPanel(makeFeed({ chaptersMode: 'off' }));
+    await screen.findByText('System One cannot generate chapters. Select a chat provider and model.');
+    const select = screen.getByRole('combobox', { name: CHAPTERS_SELECT_NAME });
+    expect((within(select).getByRole('option', { name: /Inherit global/ }) as HTMLOptionElement).disabled).toBe(false);
+    expect((within(select).getByRole('option', { name: 'Auto' }) as HTMLOptionElement).disabled).toBe(autoBlocked);
+    await userEvent.selectOptions(select, '');
+    expect(mockUpdateFeed).toHaveBeenCalledWith('test-feed', { chaptersMode: null });
+    mockGetSettings.mockResolvedValue({});
   });
 
   it('renders the current value when chaptersMode is set', () => {
@@ -318,6 +369,99 @@ describe('FeedSettingsPanel title blacklist controls', () => {
   });
 });
 
+describe('FeedSettingsPanel description blacklist controls (#835)', () => {
+  const ADD_BUTTON_NAME = 'Add description pattern';
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockGetSettings.mockResolvedValue({});
+    mockUpdateFeed.mockResolvedValue(makeFeed());
+  });
+
+  it('renders existing patterns as chips', () => {
+    renderPanel(makeFeed({ descriptionSkipPatterns: ['*This is a preview*', '*Patreon*'] }));
+    expect(screen.getByText('*This is a preview*')).toBeDefined();
+    expect(screen.getByText('*Patreon*')).toBeDefined();
+  });
+
+  it('adding a pattern fires updateFeed with the appended list', async () => {
+    renderPanel(makeFeed({ descriptionSkipPatterns: ['*This is a preview*'] }));
+    await userEvent.click(screen.getByRole('button', { name: ADD_BUTTON_NAME }));
+    await userEvent.type(screen.getByLabelText('New description pattern'), '*Patreon*');
+    await userEvent.click(screen.getByRole('button', { name: 'Add' }));
+    expect(mockUpdateFeed).toHaveBeenCalledWith('test-feed', {
+      descriptionSkipPatterns: ['*This is a preview*', '*Patreon*'],
+    });
+  });
+
+  it('a failed add keeps the editor open with its value and shows the error', async () => {
+    mockUpdateFeed.mockRejectedValueOnce(new Error('descriptionSkipPatterns entries must be strings of 1-200 characters'));
+    renderPanel(makeFeed());
+    await userEvent.click(screen.getByRole('button', { name: ADD_BUTTON_NAME }));
+    const input = screen.getByLabelText('New description pattern');
+    await userEvent.type(input, '*Patreon*');
+    await userEvent.click(screen.getByRole('button', { name: 'Add' }));
+    expect(await screen.findByText('descriptionSkipPatterns entries must be strings of 1-200 characters')).toBeDefined();
+    expect((screen.getByLabelText('New description pattern') as HTMLInputElement).value).toBe('*Patreon*');
+  });
+
+  it('removing a pattern fires updateFeed without it', async () => {
+    renderPanel(makeFeed({ descriptionSkipPatterns: ['*This is a preview*', '*Patreon*'] }));
+    await userEvent.click(screen.getByRole('button', { name: 'Remove *This is a preview*' }));
+    expect(mockUpdateFeed).toHaveBeenCalledWith('test-feed', {
+      descriptionSkipPatterns: ['*Patreon*'],
+    });
+  });
+
+  it('keeps a pending pattern save from being submitted or edited again', async () => {
+    let finishSave!: (feed: Feed) => void;
+    mockUpdateFeed.mockReturnValueOnce(new Promise<Feed>((resolve) => { finishSave = resolve; }));
+    renderPanel(makeFeed());
+    await userEvent.click(screen.getByRole('button', { name: ADD_BUTTON_NAME }));
+    const input = screen.getByLabelText('New description pattern');
+    await userEvent.type(input, '*Preview*');
+    await userEvent.click(screen.getByRole('button', { name: 'Add' }));
+    expect(input).toHaveProperty('disabled', true);
+    expect(screen.getByRole('button', { name: 'Cancel' })).toHaveProperty('disabled', true);
+    fireEvent.keyDown(input, { key: 'Enter' });
+    expect(mockUpdateFeed).toHaveBeenCalledTimes(1);
+    await act(async () => { finishSave(makeFeed({ descriptionSkipPatterns: ['*Preview*'] })); });
+    await waitFor(() => expect(screen.queryByLabelText('New description pattern')).toBeNull());
+  });
+
+  it('announces a failed save and clears the error when the pattern changes', async () => {
+    mockUpdateFeed.mockRejectedValueOnce(new Error('Failed to save pattern'));
+    renderPanel(makeFeed());
+    await userEvent.click(screen.getByRole('button', { name: ADD_BUTTON_NAME }));
+    const input = screen.getByLabelText('New description pattern');
+    await userEvent.type(input, '*Preview*');
+    await userEvent.click(screen.getByRole('button', { name: 'Add' }));
+    expect((await screen.findByRole('alert')).textContent).toBe('Failed to save pattern');
+    await userEvent.type(input, '*');
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
+
+  it('waits for refreshed patterns before enabling the next change', async () => {
+    const { client, rerenderWithFeed } = renderPanel(makeFeed());
+    let finishRefresh!: () => void;
+    const refresh = new Promise<void>((resolve) => { finishRefresh = resolve; });
+    const invalidate = vi.spyOn(client, 'invalidateQueries').mockReturnValue(refresh);
+    await userEvent.click(screen.getByRole('button', { name: ADD_BUTTON_NAME }));
+    await userEvent.type(screen.getByLabelText('New description pattern'), '*Preview*');
+    await userEvent.click(screen.getByRole('button', { name: 'Add' }));
+    await waitFor(() => expect(invalidate).toHaveBeenCalledWith({ queryKey: ['feed', 'test-feed'] }));
+    expect(screen.getByLabelText('New description pattern')).toHaveProperty('disabled', true);
+    rerenderWithFeed(makeFeed({ descriptionSkipPatterns: ['*Preview*'] }));
+    await act(async () => { finishRefresh(); });
+    await userEvent.click(await screen.findByRole('button', { name: ADD_BUTTON_NAME }));
+    await userEvent.type(screen.getByLabelText('New description pattern'), '*Bonus*');
+    await userEvent.click(screen.getByRole('button', { name: 'Add' }));
+    expect(mockUpdateFeed).toHaveBeenLastCalledWith('test-feed', {
+      descriptionSkipPatterns: ['*Preview*', '*Bonus*'],
+    });
+  });
+});
+
 describe('FeedSettingsPanel source URL row (#484)', () => {
   beforeEach(() => {
     vi.clearAllMocks();
@@ -381,6 +525,14 @@ describe('FeedSettingsPanel segment action overrides (#565)', () => {
     mockUpdateFeed.mockResolvedValue(makeFeed());
   });
 
+  it('describes what Mark does alongside Remove, Beep, and Keep', async () => {
+    renderPanel(makeFeed());
+    expect(await screen.findByText(
+      'Mark leaves it in and adds a chapter a player can skip.',
+      { exact: false },
+    )).toBeDefined();
+  });
+
   it('shows Inherit and the resolved global value for an unoverridden category', async () => {
     renderPanel(makeFeed());
     await waitFor(() => {
@@ -396,6 +548,15 @@ describe('FeedSettingsPanel segment action overrides (#565)', () => {
     await userEvent.click(within(group).getByRole('radio', { name: 'Keep' }));
     expect(mockUpdateFeed).toHaveBeenCalledWith('test-feed', {
       segmentCategoryActions: { sponsor: 'keep', cross_promo: 'keep' },
+    });
+  });
+
+  it('picking Mark saves it as the segment action override', async () => {
+    renderPanel(makeFeed());
+    const group = await screen.findByRole('radiogroup', { name: 'Sponsor action' });
+    await userEvent.click(within(group).getByRole('radio', { name: 'Mark' }));
+    expect(mockUpdateFeed).toHaveBeenCalledWith('test-feed', {
+      segmentCategoryActions: { sponsor: 'mark' },
     });
   });
 
@@ -664,6 +825,48 @@ describe('FeedSettingsPanel skip verification toggle (#599)', () => {
     // Disabled: a click must not fire a PATCH.
     await userEvent.click(toggle);
     expect(mockUpdateFeed).not.toHaveBeenCalled();
+  });
+});
+
+describe('FeedSettingsPanel upstream transcript select', () => {
+  const NAME = 'Compare with the publisher transcript';
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockGetSettings.mockResolvedValue({ transcriptDifferentialEnabled: { value: false, isDefault: false } });
+    mockUpdateFeed.mockResolvedValue(makeFeed());
+  });
+
+  it('renders Inherit with the global value when unset', async () => {
+    renderPanel(makeFeed());
+    const select = screen.getByRole('combobox', { name: NAME }) as HTMLSelectElement;
+    expect(select.value).toBe('inherit');
+    expect(await screen.findByRole('option', { name: 'Inherit global (Off)' })).toBeDefined();
+  });
+
+  it('renders on and off from the feed value', () => {
+    renderPanel(makeFeed({ transcriptDifferential: false }));
+    expect((screen.getByRole('combobox', { name: NAME }) as HTMLSelectElement).value).toBe('off');
+  });
+
+  it.each([
+    ['on', true],
+    ['off', false],
+  ] as const)('choosing %s sends transcriptDifferential %s', async (option, value) => {
+    renderPanel(makeFeed());
+    await userEvent.selectOptions(screen.getByRole('combobox', { name: NAME }), option);
+    expect(mockUpdateFeed).toHaveBeenCalledWith('test-feed', { transcriptDifferential: value });
+  });
+
+  it('choosing inherit sends null', async () => {
+    renderPanel(makeFeed({ transcriptDifferential: true }));
+    await userEvent.selectOptions(screen.getByRole('combobox', { name: NAME }), 'inherit');
+    expect(mockUpdateFeed).toHaveBeenCalledWith('test-feed', { transcriptDifferential: null });
+  });
+
+  it('is absent on a local feed', () => {
+    renderPanel(makeFeed({ feedType: 'local' }));
+    expect(screen.queryByRole('combobox', { name: NAME })).toBeNull();
   });
 });
 
@@ -1294,6 +1497,13 @@ describe('FeedSettingsPanel chapters in description control', () => {
     expect((screen.getByRole('combobox', { name: NAME }) as HTMLSelectElement).value).toBe('');
   });
 
+  it('has no per-feed ad chapters enable or category controls', () => {
+    renderPanel(makeFeed());
+    expect(screen.queryByRole('combobox', { name: 'Ad chapters' })).toBeNull();
+    expect(screen.queryByRole('checkbox', { name: 'Use global categories' })).toBeNull();
+    expect(screen.queryByRole('checkbox', { name: 'Sponsor' })).toBeNull();
+  });
+
   it('selecting On fires updateFeed with chaptersInNotes on', async () => {
     renderPanel(makeFeed());
     await userEvent.selectOptions(screen.getByRole('combobox', { name: NAME }), 'on');
@@ -1307,54 +1517,105 @@ describe('FeedSettingsPanel chapters in description control', () => {
   });
 });
 
-describe('FeedSettingsPanel ad chapters overrides', () => {
-  const NAME = 'Ad chapters';
-  const GLOBAL_CATEGORIES = {
-    sponsor: true,
-    cross_promo: true,
-    self_promo: false,
-    interaction: false,
-    intro: false,
-    outro: false,
-    recap: false,
-  };
-
+describe('Feed duration filters', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    mockGetSettings.mockResolvedValue({});
     mockUpdateFeed.mockResolvedValue(makeFeed());
-    mockGetSettings.mockResolvedValue({
-      adChaptersEnabled: { value: true },
-      adChapterCategories: { value: GLOBAL_CATEGORIES },
-    });
   });
 
-  it('sends the ad chapters override', async () => {
-    renderPanel(makeFeed({ adChaptersEnabled: null }));
-    const select = await screen.findByRole('combobox', { name: NAME }) as HTMLSelectElement;
-    expect(select.value).toBe('');
-    await userEvent.selectOptions(select, 'off');
-    expect(mockUpdateFeed).toHaveBeenCalledWith('test-feed', { adChaptersEnabled: 'off' });
+  it('displays minutes and saves both nullable limits in seconds', async () => {
+    const user = userEvent.setup();
+    renderPanel(makeFeed({ minDurationSeconds: 60, maxDurationSeconds: 180 }));
+    const minimum = screen.getByRole('spinbutton', { name: 'Minimum (minutes)' });
+    const maximum = screen.getByRole('spinbutton', { name: 'Maximum (minutes)' });
+    expect(minimum).toHaveProperty('value', '1');
+    expect(maximum).toHaveProperty('value', '3');
+    await user.clear(minimum);
+    await user.type(minimum, '2.5');
+    await user.clear(maximum);
+    await user.click(screen.getByRole('button', { name: 'Save duration limits' }));
+    await waitFor(() => expect(mockUpdateFeed).toHaveBeenCalledWith('test-feed', {
+      minDurationSeconds: 150, maxDurationSeconds: null,
+    }));
   });
 
-  it('shows the global label in the inherit option', async () => {
+  it('rejects a reversed range before sending an update', async () => {
+    const user = userEvent.setup();
+    renderPanel(makeFeed({ maxDurationSeconds: 60 }));
+    await user.type(screen.getByRole('spinbutton', { name: 'Minimum (minutes)' }), '2');
+    await user.click(screen.getByRole('button', { name: 'Save duration limits' }));
+    expect(screen.getByRole('alert').textContent).toBe('Minimum duration must not exceed maximum duration.');
+    expect(mockUpdateFeed).not.toHaveBeenCalled();
+  });
+
+  it('omits upstream filters on a local feed', () => {
+    renderPanel(makeFeed({ feedType: 'local' }));
+    expect(screen.queryByRole('spinbutton', { name: 'Minimum (minutes)' })).toBeNull();
+  });
+});
+
+
+describe('Feed download User-Agent', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockGetSettings.mockResolvedValue({ downloadUserAgent: { value: 'Global/1.0', isDefault: false } });
+    mockUpdateFeed.mockResolvedValue(makeFeed());
+  });
+
+  it('keeps edits local until Save and trims the override', async () => {
+    const user = userEvent.setup();
     renderPanel(makeFeed());
-    expect(await screen.findByRole('option', { name: 'Use global (on)' })).toBeDefined();
+    const input = screen.getByLabelText('Download User-Agent');
+    await waitFor(() => expect(input.getAttribute('placeholder')).toBe('Global/1.0'));
+    await user.type(input, '  Feed/2.0  ');
+    expect(mockUpdateFeed).not.toHaveBeenCalled();
+    await user.click(screen.getByRole('button', { name: 'Save download User-Agent' }));
+    await waitFor(() => expect(mockUpdateFeed).toHaveBeenCalledWith('test-feed', { downloadUserAgentOverride: 'Feed/2.0' }));
   });
 
-  it('lets a feed override the chaptered categories', async () => {
-    const { rerenderWithFeed } = renderPanel(makeFeed({ adChapterCategories: null }));
-    const useGlobal = await screen.findByRole('checkbox', { name: 'Use global categories' }) as HTMLInputElement;
-    expect(useGlobal.checked).toBe(true);
-    expect(screen.queryByRole('checkbox', { name: 'Sponsor' })).toBeNull();
+  it('clears the override with null to inherit global', async () => {
+    const user = userEvent.setup();
+    renderPanel(makeFeed({ downloadUserAgentOverride: 'Feed/2.0' }));
+    await user.click(screen.getByRole('button', { name: 'Use global download User-Agent' }));
+    await waitFor(() => expect(mockUpdateFeed).toHaveBeenCalledWith('test-feed', { downloadUserAgentOverride: null }));
+  });
 
-    await userEvent.click(useGlobal);
-    expect(mockUpdateFeed).toHaveBeenCalledWith('test-feed', { adChapterCategories: GLOBAL_CATEGORIES });
+  it('keeps an unsaved draft after the server rejects it', async () => {
+    const user = userEvent.setup();
+    mockUpdateFeed.mockRejectedValueOnce(new Error('downloadUserAgentOverride must be printable ASCII'));
+    renderPanel(makeFeed());
+    const input = screen.getByLabelText('Download User-Agent') as HTMLInputElement;
+    await user.type(input, 'Client/2.0');
+    await user.click(screen.getByRole('button', { name: 'Save download User-Agent' }));
+    expect(await screen.findByRole('alert')).toHaveProperty('textContent', 'downloadUserAgentOverride must be printable ASCII');
+    expect(input.value).toBe('Client/2.0');
+    expect((screen.getByRole('button', { name: 'Save download User-Agent' }) as HTMLButtonElement).disabled).toBe(false);
+  });
+});
 
-    rerenderWithFeed(makeFeed({ adChapterCategories: { sponsor: false } }));
-    const sponsor = await screen.findByRole('checkbox', { name: 'Sponsor' }) as HTMLInputElement;
-    expect(sponsor.checked).toBe(false);
+describe('Feed RSS User-Agent', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockGetSettings.mockResolvedValue({ feedUserAgent: { value: 'Global/1.0', isDefault: false } });
+    mockUpdateFeed.mockResolvedValue(makeFeed());
+  });
 
-    await userEvent.click(sponsor);
-    expect(mockUpdateFeed).toHaveBeenLastCalledWith('test-feed', { adChapterCategories: { sponsor: true } });
+  it('keeps edits local until Save and trims the override', async () => {
+    const user = userEvent.setup();
+    renderPanel(makeFeed());
+    const input = screen.getByLabelText('RSS User-Agent');
+    await waitFor(() => expect(input.getAttribute('placeholder')).toBe('Global/1.0'));
+    await user.type(input, '  Feed/2.0  ');
+    expect(mockUpdateFeed).not.toHaveBeenCalled();
+    await user.click(screen.getByRole('button', { name: 'Save RSS User-Agent' }));
+    await waitFor(() => expect(mockUpdateFeed).toHaveBeenCalledWith('test-feed', { feedUserAgentOverride: 'Feed/2.0' }));
+  });
+
+  it('clears the override with null to inherit global', async () => {
+    const user = userEvent.setup();
+    renderPanel(makeFeed({ feedUserAgentOverride: 'Feed/2.0' }));
+    await user.click(screen.getByRole('button', { name: 'Use global RSS User-Agent' }));
+    await waitFor(() => expect(mockUpdateFeed).toHaveBeenCalledWith('test-feed', { feedUserAgentOverride: null }));
   });
 });

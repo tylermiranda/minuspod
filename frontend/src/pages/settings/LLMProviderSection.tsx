@@ -1,30 +1,29 @@
 import { useEffect, useRef, useState } from 'react';
 import type { AffectedRunsAction, LlmProvider, StageTunables, UpdateSettingsPayload } from '../../api/types';
-import {
-  LLM_PROVIDER_LABELS, LLM_PROVIDER_OPTIONS, LLM_PROVIDERS, SLOT_PRIMARY, SLOT_SECONDARY,
-} from '../../api/types';
+import { LLM_PROVIDERS, SLOT_LABELS, SLOT_PRIMARY, SLOT_SECONDARY } from '../../api/types';
 import AccountSwitchPreflight from './AccountSwitchPreflight';
 import CollapsibleSection from '../../components/CollapsibleSection';
-import ConnectionTestButton from './ConnectionTestButton';
-import ProviderKeyField from './ProviderKeyField';
+import { KEY_META, ProviderFields, keyMetaForType, keyProviderFor } from './ProviderFields';
 import type { ConnectionTestResult, ProviderName, ProviderStatus, ProviderTestResult, ProvidersResponse } from '../../api/providers';
 import DraftNumberInput, { parseOptionalNumber } from '../../components/DraftNumberInput';
 import NumberInput from '../../components/NumberInput';
 import ToggleSwitch from '../../components/ToggleSwitch';
-import { inputBase, selectBase } from '../../components/fieldStyles';
+import { selectBase } from '../../components/fieldStyles';
 
 interface LLMProviderSectionProps {
   llmProvider: LlmProvider;
   openaiBaseUrl: string;
+  systemoneBaseUrl: string;
   pricingSourceMode: string;
   onProviderChange: (provider: LlmProvider) => void;
   onBaseUrlChange: (url: string) => void;
+  onSystemOneBaseUrlChange: (url: string) => void;
   onPricingSourceModeChange: (mode: string) => void;
   providersState: ProvidersResponse | null;
   onProviderKeySave: (provider: ProviderName, apiKey: string) => Promise<void>;
   onProviderKeyClear: (provider: ProviderName) => Promise<void>;
   onProviderKeyTest: (provider: ProviderName) => Promise<ProviderTestResult>;
-  onConnectionTest: (provider: 'openai' | 'ollama' | 'anthropic' | 'openrouter', baseUrl?: string) => Promise<ConnectionTestResult>;
+  onConnectionTest: (provider: 'openai' | 'ollama' | 'anthropic' | 'openrouter' | 'typesafe' | 'systemone-compatible', baseUrl?: string) => Promise<ConnectionTestResult>;
   ollamaNumCtx?: StageTunables['ollamaNumCtx'];
   onOllamaNumCtxUpdate?: (payload: UpdateSettingsPayload) => void;
   llmJsonSchemaEnabled: boolean;
@@ -60,6 +59,16 @@ interface LLMProviderSectionProps {
   onProviderTokensPerMinChange: (value: number) => void;
   secondaryProviderTokensPerMin: number;
   onSecondaryProviderTokensPerMinChange: (value: number) => void;
+  // Per-provider request timeout and retry overrides (#806); null inherits
+  // the provider type's default (see providerDefaults() in ProviderFields).
+  providerATimeoutSeconds: number | null;
+  onProviderATimeoutSecondsChange: (value: number | null) => void;
+  providerAMaxRetries: number | null;
+  onProviderAMaxRetriesChange: (value: number | null) => void;
+  providerBTimeoutSeconds: number | null;
+  onProviderBTimeoutSecondsChange: (value: number | null) => void;
+  providerBMaxRetries: number | null;
+  onProviderBMaxRetriesChange: (value: number | null) => void;
   // Set when the form's endpoint or provider type for that slot differs from
   // what is saved, which is what moves in-flight work to another account.
   primaryAccountChanged: boolean;
@@ -152,134 +161,14 @@ function RateLimitFields({
 
 const NONE_STATUS: ProviderStatus = { configured: false, source: 'none' };
 
-function keyProviderFor(p: LlmProvider | ''): Exclude<ProviderName, 'secondary'> | null {
-  if (p === LLM_PROVIDERS.ANTHROPIC) return 'anthropic';
-  if (p === LLM_PROVIDERS.OPENROUTER) return 'openrouter';
-  if (p === LLM_PROVIDERS.OPENAI_COMPATIBLE) return 'openai';
-  if (p === LLM_PROVIDERS.OLLAMA) return 'ollama';
-  return null;
-}
-
-const KEY_META: Record<ProviderName, { placeholder: string; label: string; helper?: string }> = {
-  anthropic:  { placeholder: 'sk-ant-...', label: 'Anthropic API key' },
-  openrouter: { placeholder: 'sk-or-v1-...', label: 'OpenRouter API key', helper: 'Get your API key from openrouter.ai/keys' },
-  openai:     { placeholder: 'sk-...', label: 'API key' },
-  whisper:    { placeholder: 'sk-...', label: 'API key' },
-  ollama:     { placeholder: 'Leave blank for local Ollama; paste an ollama.com key for Cloud', label: 'Ollama API key', helper: 'Local Ollama does not require a key. Ollama Cloud keys come from ollama.com/settings/keys.' },
-  // Never read directly: the secondary block looks up its label/placeholder
-  // by the chosen provider TYPE (keyProviderFor(secondaryProvider)) since
-  // one secondary secret covers whichever type is selected. Present only
-  // so KEY_META stays a total Record over ProviderName.
-  secondary:  { placeholder: '', label: 'API key' },
-};
-
-// The provider type select, base URL (where the type needs one), key field,
-// and connection test: identical controls for the primary and secondary
-// provider config, differing only in which state/handlers they're bound to.
-interface ProviderFieldsProps {
-  providerSelectId: string;
-  providerLabel: string;
-  provider: LlmProvider | '';
-  onProviderChange: (provider: LlmProvider) => void;
-  baseUrlInputId: string;
-  baseUrlLabel: string;
-  baseUrl: string;
-  onBaseUrlChange: (url: string) => void;
-  keyProvider: ProviderName;
-  keyStatus: ProviderStatus;
-  cryptoReady: boolean;
-  keyLabel: string;
-  keyPlaceholder: string;
-  keyHelper?: string;
-  onProviderKeySave: (provider: ProviderName, apiKey: string) => Promise<void>;
-  onProviderKeyClear: (provider: ProviderName) => Promise<void>;
-  onProviderKeyTest: (provider: ProviderName) => Promise<ProviderTestResult>;
-  onConnectionTest: (baseUrl?: string) => Promise<ConnectionTestResult>;
-}
-
-function ProviderFields({
-  providerSelectId, providerLabel, provider, onProviderChange,
-  baseUrlInputId, baseUrlLabel, baseUrl, onBaseUrlChange,
-  keyProvider, keyStatus, cryptoReady, keyLabel, keyPlaceholder, keyHelper,
-  onProviderKeySave, onProviderKeyClear, onProviderKeyTest, onConnectionTest,
-}: ProviderFieldsProps) {
-  const hasBaseUrl = provider === LLM_PROVIDERS.OPENAI_COMPATIBLE || provider === LLM_PROVIDERS.OLLAMA;
-  const hasFixedEndpoint = provider === LLM_PROVIDERS.ANTHROPIC || provider === LLM_PROVIDERS.OPENROUTER;
-
-  return (
-    <>
-      <div>
-        <label htmlFor={providerSelectId} className="block text-sm font-medium text-foreground mb-2">
-          {providerLabel}
-        </label>
-        <select
-          id={providerSelectId}
-          value={provider}
-          onChange={(e) => onProviderChange(e.target.value as LlmProvider)}
-          className={`w-full ${selectBase}`}
-        >
-          {/* No type saved yet: without an option of its own the select would
-              render blank, reading as the first provider in the list. */}
-          {!provider && <option value="">Choose a provider</option>}
-          {LLM_PROVIDER_OPTIONS.map((p) => (
-            <option key={p} value={p}>{LLM_PROVIDER_LABELS[p]}</option>
-          ))}
-        </select>
-      </div>
-
-      {hasBaseUrl && (
-        <div>
-          <label htmlFor={baseUrlInputId} className="block text-sm font-medium text-foreground mb-2">
-            {baseUrlLabel}
-          </label>
-          <input
-            type="text"
-            id={baseUrlInputId}
-            value={baseUrl}
-            onChange={(e) => onBaseUrlChange(e.target.value)}
-            placeholder="http://localhost:11434/v1"
-            className={`w-full ${inputBase} placeholder:text-muted-foreground font-mono`}
-          />
-          <p className="mt-1 text-sm text-muted-foreground">
-            {provider === LLM_PROVIDERS.OLLAMA
-              ? 'Ollama server URL (e.g. http://localhost:11434)'
-              : 'OpenAI-compatible API endpoint (must end with /v1)'}
-          </p>
-          <ConnectionTestButton
-            key={`${provider}|${baseUrl}|${keyStatus.configured}`}
-            onTest={() => onConnectionTest(baseUrl)}
-          />
-        </div>
-      )}
-
-      <ProviderKeyField
-        provider={keyProvider}
-        status={keyStatus}
-        cryptoReady={cryptoReady}
-        placeholder={keyPlaceholder}
-        label={keyLabel}
-        helper={keyHelper}
-        onSave={onProviderKeySave}
-        onClear={onProviderKeyClear}
-        onTest={onProviderKeyTest}
-      />
-
-      {hasFixedEndpoint && (
-        <ConnectionTestButton
-          key={`${provider}|${keyStatus.configured}`}
-          onTest={() => onConnectionTest()}
-        />
-      )}
-    </>
-  );
-}
-
 function LLMProviderSection({
   llmProvider,
   openaiBaseUrl,
+  systemoneBaseUrl,
   pricingSourceMode,
   onProviderChange,
   onBaseUrlChange,
+  onSystemOneBaseUrlChange,
   onPricingSourceModeChange,
   providersState,
   onProviderKeySave,
@@ -312,6 +201,14 @@ function LLMProviderSection({
   onProviderTokensPerMinChange,
   secondaryProviderTokensPerMin,
   onSecondaryProviderTokensPerMinChange,
+  providerATimeoutSeconds,
+  onProviderATimeoutSecondsChange,
+  providerAMaxRetries,
+  onProviderAMaxRetriesChange,
+  providerBTimeoutSeconds,
+  onProviderBTimeoutSecondsChange,
+  providerBMaxRetries,
+  onProviderBMaxRetriesChange,
   primaryAccountChanged,
   secondaryAccountChanged,
   affectedRunsAction,
@@ -325,20 +222,28 @@ function LLMProviderSection({
     configured: secondaryProviderApiKeyConfigured,
     source: secondaryProviderApiKeyConfigured ? 'db' : 'none',
   };
-  const secondaryKeyMeta = KEY_META[keyProviderFor(secondaryProvider) ?? 'anthropic'];
+  const secondaryKeyMeta = keyMetaForType(secondaryProvider);
 
   return (
     <CollapsibleSection title="LLM Provider" defaultOpen>
-      <div className="space-y-4">
+      <div className="space-y-4 max-sm:[&_input]:min-h-11 max-sm:[&_select]:min-h-11 max-sm:[&_button]:min-h-11">
+        <div>
+          <span className="text-sm font-medium text-foreground">{SLOT_LABELS.primary}</span>
+        </div>
         <ProviderFields
           providerSelectId="llmProvider"
           providerLabel="Provider"
           provider={llmProvider}
           onProviderChange={onProviderChange}
-          baseUrlInputId="openaiBaseUrl"
-          baseUrlLabel="Base URL"
-          baseUrl={openaiBaseUrl}
-          onBaseUrlChange={onBaseUrlChange}
+          baseUrlInputId={llmProvider === LLM_PROVIDERS.SYSTEMONE_COMPATIBLE ? 'systemoneBaseUrl' : 'openaiBaseUrl'}
+          baseUrlLabel={llmProvider === LLM_PROVIDERS.SYSTEMONE_COMPATIBLE ? 'System One base URL' : 'Base URL'}
+          baseUrl={llmProvider === LLM_PROVIDERS.SYSTEMONE_COMPATIBLE ? systemoneBaseUrl : openaiBaseUrl}
+          onBaseUrlChange={llmProvider === LLM_PROVIDERS.SYSTEMONE_COMPATIBLE ? onSystemOneBaseUrlChange : onBaseUrlChange}
+          slotLabel={SLOT_LABELS.primary}
+          timeoutSeconds={providerATimeoutSeconds}
+          onTimeoutChange={onProviderATimeoutSecondsChange}
+          maxRetries={providerAMaxRetries}
+          onMaxRetriesChange={onProviderAMaxRetriesChange}
           keyProvider={keyProvider ?? 'anthropic'}
           keyStatus={status}
           cryptoReady={cryptoReady}
@@ -353,6 +258,10 @@ function LLMProviderSection({
               ? 'ollama'
               : llmProvider === LLM_PROVIDERS.OPENAI_COMPATIBLE
                 ? 'openai'
+                : llmProvider === LLM_PROVIDERS.TYPESAFE
+                  ? 'typesafe'
+                  : llmProvider === LLM_PROVIDERS.SYSTEMONE_COMPATIBLE
+                    ? 'systemone-compatible'
                 : llmProvider === LLM_PROVIDERS.ANTHROPIC
                   ? 'anthropic'
                   : 'openrouter',
@@ -387,18 +296,14 @@ function LLMProviderSection({
               </span>
             </label>
             <p className="mt-2 text-sm text-muted-foreground">
-              Asks the endpoint to enforce a JSON schema on detection and
-              review responses. Servers that implement it return cleaner
-              JSON. Not every OpenAI-compatible server does: the app probes
-              once and falls back to plain JSON mode, but verify that yours
-              supports response_format with type json_schema.
+              Use JSON schema for detection and review. Unsupported endpoints fall back to plain JSON.
             </p>
           </div>
         )}
 
         <RateLimitFields
           idPrefix="provider"
-          legend="Primary provider rate limits"
+          legend={`${SLOT_LABELS.primary} rate limits`}
           rpm={providerRequestsPerMin}
           onRpmChange={onProviderRequestsPerMinChange}
           rpd={providerRequestsPerDay}
@@ -413,27 +318,32 @@ function LLMProviderSection({
               <ToggleSwitch
                 checked={secondaryProviderEnabled}
                 onChange={onSecondaryProviderEnabledChange}
-                ariaLabel="Enable secondary provider"
+                ariaLabel="Enable Provider B"
               />
               <span className="text-sm font-medium text-foreground">
-                Secondary provider
+                {SLOT_LABELS.secondary}
               </span>
             </label>
             <p className="mt-2 text-sm text-muted-foreground ml-14">
-              A second full provider that ad detection, verification, chapters, and the reviewer can each route to instead of the primary provider above. Off by default: every stage stays on the primary provider until you point it here.
+              A second provider that detection, verification, chapters and the reviewer can each route to instead of {SLOT_LABELS.primary}. Both are peers; use the Failover card below for automatic switching when one is down.
             </p>
           </div>
 
           {secondaryProviderEnabled && (
             <ProviderFields
               providerSelectId="secondaryProviderType"
-              providerLabel="Secondary provider type"
+              providerLabel="Provider B type"
               provider={secondaryProvider}
               onProviderChange={onSecondaryProviderChange}
               baseUrlInputId="secondaryProviderBaseUrl"
-              baseUrlLabel="Secondary base URL"
+              baseUrlLabel="Provider B base URL"
               baseUrl={secondaryProviderBaseUrl}
               onBaseUrlChange={onSecondaryProviderBaseUrlChange}
+              slotLabel={SLOT_LABELS.secondary}
+              timeoutSeconds={providerBTimeoutSeconds}
+              onTimeoutChange={onProviderBTimeoutSecondsChange}
+              maxRetries={providerBMaxRetries}
+              onMaxRetriesChange={onProviderBMaxRetriesChange}
               keyProvider="secondary"
               keyStatus={secondaryKeyStatus}
               cryptoReady={cryptoReady}
@@ -444,7 +354,11 @@ function LLMProviderSection({
               onProviderKeyClear={() => onSecondaryProviderKeyClear()}
               onProviderKeyTest={async () => {
                 const result = await onSecondaryConnectionTest(secondaryProvider);
-                return { ok: result.ok, error: result.ok ? undefined : result.detail };
+                return {
+                  ok: result.ok, detail: result.detail,
+                  error: result.ok ? undefined : result.detail,
+                  validation: result.validation, inferenceChecked: result.inferenceChecked,
+                };
               }}
               onConnectionTest={(baseUrl) => onSecondaryConnectionTest(secondaryProvider, baseUrl)}
             />
@@ -462,7 +376,7 @@ function LLMProviderSection({
           {secondaryProviderEnabled && (
             <RateLimitFields
               idPrefix="secondaryProvider"
-              legend="Secondary provider rate limits"
+              legend={`${SLOT_LABELS.secondary} rate limits`}
               rpm={secondaryProviderRequestsPerMin}
               onRpmChange={onSecondaryProviderRequestsPerMinChange}
               rpd={secondaryProviderRequestsPerDay}

@@ -10,12 +10,13 @@
  *   - Description and chapter notes render as separate blocks.
  */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { render, screen, waitFor } from '@testing-library/react';
+import { render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import EpisodeDetail, { KeyedEpisodeDetail } from './EpisodeDetail';
 import EpisodeList from '../components/EpisodeList';
-import type { Episode, EpisodeDetail as EpisodeDetailType } from '../api/types';
+import type { Episode, EpisodeDetail as EpisodeDetailType, Settings } from '../api/types';
 import { formatTimestamp } from '../utils/format';
+import { getSettings } from '../api/settings';
 
 // react-router stubs. Mutable so a test can move the view to another episode.
 const routeParams = vi.hoisted(() => ({ slug: 'test-feed', episodeId: 'ep-1' }));
@@ -28,7 +29,13 @@ vi.mock('react-router', () => ({
 
 // Stub heavy child components that are not under test.
 vi.mock('../components/AdEditor', () => ({
-  default: () => <div data-testid="ad-editor" />,
+  default: ({ detectedAds }: { detectedAds: Array<{ category?: string | null; action_applied?: string | null }> }) => (
+    <div
+      data-testid="ad-editor"
+      data-category={detectedAds[0]?.category ?? ''}
+      data-action-applied={detectedAds[0]?.action_applied ?? ''}
+    />
+  ),
 }));
 vi.mock('../components/PatternLink', () => ({
   default: ({ reason }: { reason: string }) => <span>{reason}</span>,
@@ -137,6 +144,13 @@ function makeEpisode(overrides: Partial<EpisodeDetailType> = {}): EpisodeDetailT
 
 // Wrap getEpisode to return a resolved episode; getFeed returns minimal data.
 import { getEpisode, getFeed } from '../api/feeds';
+
+vi.mock('../api/settings', () => ({ getSettings: vi.fn() }));
+beforeEach(() => {
+  vi.mocked(getSettings).mockResolvedValue({
+    llmProvider: { value: 'anthropic' }, claudeModel: { value: 'claude-sonnet' },
+  } as Settings);
+});
 
 function setupEpisodeMock(ep: EpisodeDetailType) {
   (getEpisode as ReturnType<typeof vi.fn>).mockResolvedValue(ep);
@@ -479,6 +493,24 @@ describe('Held for Review: re-detect offer once every held marker is rejected', 
     expect(screen.queryByTestId('held-review-cleared')).toBeNull();
   });
 
+  it('keeps the post-review chapter action disabled for an inherited native route', async () => {
+    mockRegenerateChapters.mockReset();
+    vi.mocked(getSettings).mockResolvedValue({
+      llmProvider: { value: 'anthropic' }, secondaryProvider: { value: 'systemone-compatible' },
+      secondaryProviderEnabled: { value: true }, detectionProvider: { value: 'secondary' },
+      chaptersProvider: { value: 'same_as_detection' }, chaptersModel: { value: 'custom-native-model' },
+    } as Settings);
+    const user = userEvent.setup();
+    renderDetail(makeEpisode({ transcriptAvailable: true, transcriptVttAvailable: true }));
+    await screen.findByTestId('dismiss-0');
+    setupEpisodeMock(makeEpisode({ transcriptAvailable: true, transcriptVttAvailable: true, pendingReviewMarkers: [] }));
+    await user.click(screen.getByTestId('dismiss-0'));
+    const button = await screen.findByTestId('regenerate-chapters-after-review');
+    expect((button as HTMLButtonElement).disabled).toBe(true);
+    await user.click(button);
+    expect(mockRegenerateChapters).not.toHaveBeenCalled();
+  });
+
   it('omits Regenerate Chapters without a VTT transcript', async () => {
     const user = userEvent.setup();
     renderDetail(makeEpisode({ transcriptAvailable: true, transcriptVttAvailable: false }));
@@ -791,6 +823,56 @@ describe('Differential status and corroboration badges', () => {
       daiDifferential: { status: 'error', regions: [], error: 'refetch timed out' },
     }));
     await waitFor(() => expect(screen.getByText('Cross-fetch: failed')).toBeDefined());
+  });
+
+  it('labels a held transcript gap with its stage and hold reason', async () => {
+    renderDetail(makeEpisode({
+      pendingReviewMarkers: [{
+        ...heldMarker,
+        detection_stage: 'transcript_differential',
+        hold_reason: 'transcript_differential_unreviewed',
+      }],
+    }));
+    await waitFor(() => expect(screen.getByTestId('held-for-review-section')).toBeDefined());
+    const section = within(screen.getByTestId('held-for-review-section'));
+    expect(section.getByText('Transcript diff')).toBeDefined();
+    const chip = section.getByTitle(
+      'This span is missing from the upstream transcript, and no other detector confirmed it is an ad.');
+    expect(chip.textContent).toBe('Upstream transcript omits this span');
+  });
+
+  it('renders the transcript corroboration badge', async () => {
+    renderDetail(makeEpisode({
+      pendingReviewMarkers: [],
+      adMarkers: [{ start: 10, end: 70, confidence: 0.9, detection_stage: 'claude',
+        corroborated_by: 'transcript_differential' }],
+    }));
+    await waitFor(() => expect(screen.getByText('Corroborated: transcript')).toBeDefined());
+  });
+
+  it.each([
+    [{ status: 'ok', coverage: 0.93, sourceType: 'text/vtt', spans: [
+      { start: 10, end: 70, offsetConfirmed: true }, { start: 900, end: 915, offsetConfirmed: false }] },
+    'Transcript diff: 2 gaps'],
+    [{ status: 'ok', coverage: 0.97, sourceType: 'text/vtt', spans: [] }, 'Transcript diff: no gaps'],
+    [{ status: 'unreliable', coverage: 0.3, sourceType: 'text/vtt', spans: [] }, 'Transcript diff: unreliable'],
+    [{ status: 'empty', coverage: null, sourceType: 'text/vtt', spans: [] }, 'Transcript diff: empty'],
+    [{ status: 'error', coverage: null, sourceType: null, spans: [] }, 'Transcript diff: failed'],
+  ] as const)('shows the transcript diff header badge for %o', async (upstreamTranscript, label) => {
+    renderDetail(makeEpisode({
+      pendingReviewMarkers: [],
+      upstreamTranscript: { ...upstreamTranscript, spans: [...upstreamTranscript.spans] },
+    }));
+    await waitFor(() => expect(screen.getByText(label)).toBeDefined());
+  });
+
+  it('omits the transcript diff badge when the stage did not run', async () => {
+    renderDetail(makeEpisode({
+      pendingReviewMarkers: [],
+      upstreamTranscript: { status: 'none', coverage: null, sourceType: null, spans: [] },
+    }));
+    await waitFor(() => expect(screen.getByText('Test Episode')).toBeDefined());
+    expect(screen.queryByText(/^Transcript diff:/)).toBeNull();
   });
 
   it('omits the header badge when daiDifferential is absent', async () => {
@@ -1283,6 +1365,26 @@ describe('Detected ads: inline audition', () => {
   });
 });
 
+describe('AdEditor detected marker metadata', () => {
+  it('passes category and resolved action into the edit flow', async () => {
+    const user = userEvent.setup();
+    renderDetail(makeEpisode({
+      pendingReviewMarkers: [],
+      transcript: 'available',
+      adMarkers: [{
+        start: 10, end: 40, confidence: 0.9, category: 'cross_promo',
+        actionApplied: 'beep',
+      }],
+    }));
+
+    await user.click(await screen.findByRole('button', { name: 'Edit ads' }));
+
+    const editor = screen.getByTestId('ad-editor');
+    expect(editor.getAttribute('data-category')).toBe('cross_promo');
+    expect(editor.getAttribute('data-action-applied')).toBe('beep');
+  });
+});
+
 describe('Segment category chips (#565)', () => {
   it('shows the category label on a detected ad marker', async () => {
     renderDetail(makeEpisode({
@@ -1308,6 +1410,16 @@ describe('Segment category chips (#565)', () => {
       adMarkers: [{ start: 10, end: 40, confidence: 0.9, detection_stage: 'claude', category: 'sponsor', actionApplied: 'remove' }],
     }));
     expect(await screen.findByText('Detected Ads (1)')).not.toBeNull();
+    expect(screen.queryByText('Kept')).toBeNull();
+  });
+
+  it('shows a Marked badge, not Kept, when actionApplied is mark', async () => {
+    renderDetail(makeEpisode({
+      pendingReviewMarkers: [],
+      adMarkers: [{ start: 10, end: 40, confidence: 0.9, detection_stage: 'claude', category: 'sponsor', actionApplied: 'mark' }],
+    }));
+    expect(await screen.findByText('Detected Ads (1)')).not.toBeNull();
+    expect(screen.getByText('Marked')).not.toBeNull();
     expect(screen.queryByText('Kept')).toBeNull();
   });
 
@@ -1365,6 +1477,38 @@ describe('Kept segments section (2.78.3)', () => {
     expect(screen.getByText('Kept segments (1)')).not.toBeNull();
     expect(screen.getByText('Intro')).not.toBeNull();
     expect(screen.getByText('Kept')).not.toBeNull();
+  });
+
+  it('renders a Marked badge for a kept marker whose actionApplied is mark', async () => {
+    renderDetail(makeEpisode({
+      pendingReviewMarkers: [],
+      keptMarkers: [{ start: 127.8, end: 140.2, confidence: 0.9, category: 'sponsor', actionApplied: 'mark' }],
+    }));
+    expect(await screen.findByTestId('kept-segments-section')).not.toBeNull();
+    expect(screen.getByText('Marked')).not.toBeNull();
+    expect(screen.queryByText('Kept')).toBeNull();
+  });
+
+  it('titles the section "Marked segments (N)" when every marker is mark', async () => {
+    renderDetail(makeEpisode({
+      pendingReviewMarkers: [],
+      keptMarkers: [
+        { start: 127.8, end: 140.2, confidence: 0.9, category: 'sponsor', actionApplied: 'mark' },
+        { start: 300.0, end: 330.0, confidence: 0.8, category: 'self_promo', actionApplied: 'mark' },
+      ],
+    }));
+    expect(await screen.findByText('Marked segments (2)')).not.toBeNull();
+  });
+
+  it('titles the section "Kept and marked segments (N)" for a mix of both', async () => {
+    renderDetail(makeEpisode({
+      pendingReviewMarkers: [],
+      keptMarkers: [
+        { start: 127.8, end: 140.2, confidence: 0.9, category: 'intro', actionApplied: 'keep' },
+        { start: 300.0, end: 330.0, confidence: 0.8, category: 'sponsor', actionApplied: 'mark' },
+      ],
+    }));
+    expect(await screen.findByText('Kept and marked segments (2)')).not.toBeNull();
   });
 
   it('offers a play button per row when the original audio is retained', async () => {
@@ -1647,6 +1791,56 @@ describe('Thinking setting fallback', () => {
     await screen.findByText('Test Episode');
     expect(screen.queryByRole('status')).toBeNull();
   });
+
+  it('keeps audio verification and thinking notices when a chapter run is newer', async () => {
+    renderDetail(makeEpisode({
+      pendingReviewMarkers: [],
+      processingRuns: [
+        {
+          runNumber: 1,
+          processedAt: '2026-01-01T00:00:00Z',
+          status: 'completed',
+          adsDetected: 1,
+          processingDurationSeconds: 30,
+          errorMessage: null,
+          inputTokens: 100,
+          outputTokens: 20,
+          llmCost: 0,
+          stats: {
+            mode: 'auto',
+            verificationAdsCut: 2,
+            thinkingNotices: [{
+              pass: 'ad_detection_pass_1',
+              provider: 'unknown',
+              model: 'redacted',
+              requested: 'high',
+              compatibility: 'unsupported',
+              fallback: { maxTokens: 4096, temperature: 0, reasoningEffort: null },
+            }],
+          },
+        },
+        {
+          runNumber: 2,
+          processedAt: '2026-01-02T00:00:00Z',
+          status: 'completed',
+          adsDetected: 0,
+          processingDurationSeconds: 5,
+          errorMessage: null,
+          inputTokens: 0,
+          outputTokens: 0,
+          llmCost: 0,
+          stats: { mode: 'chapters' },
+        },
+      ],
+    }));
+
+    expect(await screen.findByText(
+      'Verified: a second scan of the output audio found 2 more ads and cut them.',
+    )).toBeTruthy();
+    expect((await screen.findByRole('status')).textContent).toContain(
+      'The requested thinking setting was not accepted for ad detection. This run used provider defaults.',
+    );
+  });
 });
 
 describe('Regenerate Chapters: progress and result feedback', () => {
@@ -1659,6 +1853,50 @@ describe('Regenerate Chapters: progress and result feedback', () => {
     await user.click(screen.getByRole('button', { name: 'Reprocess' }));
     await user.click(screen.getByText('Regenerate Chapters'));
   }
+
+  it('disables native chapter regeneration and offers the settings route', async () => {
+    vi.mocked(getSettings).mockResolvedValue({
+      llmProvider: { value: 'typesafe' }, claudeModel: { value: 'jev-latest' },
+    } as Settings);
+    const user = userEvent.setup();
+    renderDetail(makeEpisode({ transcriptAvailable: true, transcriptVttAvailable: true }));
+    await screen.findByText('System One cannot generate chapters. Select a chat provider and model.');
+    expect(screen.getByRole('link', { name: 'Open settings' }).getAttribute('href')).toBe('/settings');
+    await user.click(screen.getByRole('button', { name: 'Reprocess' }));
+    expect((screen.getByText('Regenerate Chapters').closest('button') as HTMLButtonElement).disabled).toBe(true);
+    await user.click(screen.getByText('Regenerate Chapters'));
+    expect(mockRegenerateChapters).not.toHaveBeenCalled();
+  });
+
+  it('keeps manual regeneration disabled while chapter settings load', async () => {
+    let resolveSettings!: (value: Settings) => void;
+    vi.mocked(getSettings).mockReturnValue(new Promise((resolve) => { resolveSettings = resolve; }));
+    const user = userEvent.setup();
+    renderDetail(makeEpisode({ transcriptVttAvailable: true }));
+    await screen.findByText('Test Episode');
+    await user.click(screen.getByRole('button', { name: 'Reprocess' }));
+    const item = screen.getByText('Regenerate Chapters').closest('button') as HTMLButtonElement;
+    expect(item.disabled).toBe(true);
+    expect(item.title).toBe('Loading chapter settings...');
+    resolveSettings({ llmProvider: { value: 'anthropic' }, claudeModel: { value: 'claude-sonnet' } } as Settings);
+    await waitFor(() => expect(item.disabled).toBe(false));
+  });
+
+  it('explains failed chapter settings and recovers through Retry', async () => {
+    vi.mocked(getSettings).mockRejectedValue(new Error('Chapter settings unavailable'));
+    const user = userEvent.setup();
+    renderDetail(makeEpisode({ transcriptVttAvailable: true }));
+    await screen.findByRole('alert');
+    await user.click(screen.getByRole('button', { name: 'Reprocess' }));
+    const item = screen.getByText('Regenerate Chapters').closest('button') as HTMLButtonElement;
+    expect(item.disabled).toBe(true);
+    expect(item.title).toBe('Load chapter settings before regenerating chapters.');
+    vi.mocked(getSettings).mockResolvedValue({ llmProvider: { value: 'anthropic' }, claudeModel: { value: 'claude-sonnet' } } as Settings);
+    await user.click(screen.getByRole('button', { name: 'Retry chapter settings' }));
+    await waitFor(() => expect(screen.queryByRole('alert')).toBeNull());
+    await user.click(screen.getByRole('button', { name: 'Reprocess' }));
+    expect((screen.getByText('Regenerate Chapters').closest('button') as HTMLButtonElement).disabled).toBe(false);
+  });
 
   it('shows the progress text once the menu closes while the call is pending', async () => {
     const user = userEvent.setup();
