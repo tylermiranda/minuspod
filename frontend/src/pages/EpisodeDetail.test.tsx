@@ -1377,7 +1377,7 @@ describe('AdEditor detected marker metadata', () => {
       }],
     }));
 
-    await user.click(await screen.findByRole('button', { name: 'Edit ads' }));
+    await user.click(await screen.findByRole('button', { name: 'Fine-tune in waveform' }));
 
     const editor = screen.getByTestId('ad-editor');
     expect(editor.getAttribute('data-category')).toBe('cross_promo');
