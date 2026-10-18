@@ -1,4 +1,7 @@
-import { useState, useEffect, useMemo, useRef } from 'react';
+import { pageHeader, pageTitle } from '../components/pageStyles';
+import { useState, useEffect, useMemo } from 'react';
+import { useSyncFromQuery } from '../hooks/useSyncFromQuery';
+import PageTabs from '../components/PageTabs';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useSearchParams } from 'react-router';
 import {
@@ -48,13 +51,16 @@ const OTHER_TABS: readonly string[] = ['ad-review', 'detected-ads', 'cleanup'];
 const headerBtn = 'px-3 py-1.5 text-sm rounded whitespace-nowrap';
 
 function PatternsPage() {
+  const [searchParams, setSearchParams] = useSearchParams();
   const [scopeFilter, setScopeFilter] = useState<ScopeFilter>('all');
   const [originFilter, setOriginFilter] = useState<OriginFilter>('all');
   const [sourceFilter, setSourceFilter] = useState<SourceFilter>('all');
   const [categoryFilter, setCategoryFilter] = useState('');
-  const [searchQuery, setSearchQuery] = useState('');
+  const [searchQuery, setSearchQuery] = useState(searchParams.get('q') || '');
   const [showInactive, setShowInactive] = useState(false);
   const [selectedPattern, setSelectedPattern] = useState<AdPattern | null>(null);
+  // A search-result link can land here while the page is already mounted.
+  useSyncFromQuery(searchParams.get('q') ?? undefined, setSearchQuery);
   const [page, setPage] = useState(1);
   // Reset to first page on sort change.
   const { sortField, sortDirection, handleSort } =
@@ -62,27 +68,11 @@ function PatternsPage() {
   const [importOpen, setImportOpen] = useState(false);
   const [exportOpen, setExportOpen] = useState(false);
   const limit = 20;
-  const [searchParams, setSearchParams] = useSearchParams();
+
 
   const tabParam = searchParams.get('tab');
   const activeTab: PatternsTab =
     tabParam && OTHER_TABS.includes(tabParam) ? (tabParam as PatternsTab) : 'patterns';
-  const tablistRef = useRef<HTMLDivElement>(null);
-  const activeTabRef = useRef<HTMLButtonElement>(null);
-
-  useEffect(() => {
-    const tablist = tablistRef.current;
-    const activeButton = activeTabRef.current;
-    if (!tablist || !activeButton) return;
-    const tablistRect = tablist.getBoundingClientRect();
-    const buttonRect = activeButton.getBoundingClientRect();
-    if (buttonRect.left < tablistRect.left) {
-      tablist.scrollLeft -= tablistRect.left - buttonRect.left;
-    } else if (buttonRect.right > tablistRect.right) {
-      tablist.scrollLeft += buttonRect.right - tablistRect.right;
-    }
-  }, [activeTab]);
-
   const switchTab = (tab: PatternsTab) => {
     setSearchParams(tab === 'patterns' ? {} : { tab });
   };
@@ -219,8 +209,8 @@ function PatternsPage() {
 
   return (
     <div>
-      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 mb-6">
-        <h1 className="text-2xl font-bold text-foreground">Ad Patterns</h1>
+      <div className={pageHeader}>
+        <h1 className={pageTitle}>Ad Patterns</h1>
         {activeTab === 'patterns' && (
           <div className="flex flex-wrap items-center gap-2 sm:gap-3 text-sm">
             <span className="text-muted-foreground">
@@ -269,38 +259,14 @@ function PatternsPage() {
         onClose={() => setExportOpen(false)}
       />
 
-      {/* Scrolls instead of pushing the page wider on phones under 380px. */}
-      <div ref={tablistRef} role="tablist" className="flex gap-1 border-b border-border mb-6 overflow-x-auto overflow-y-hidden">
-        {([
-          ['patterns', 'Patterns'],
-          ['detected-ads', 'Detected Ads'],
-          ['ad-review', 'Ad Review'],
-          ['cleanup', 'Cleanup'],
-        ] as const).map(
-          ([key, label]) => (
-            <button
-              key={key}
-              ref={activeTab === key ? activeTabRef : undefined}
-              role="tab"
-              aria-selected={activeTab === key}
-              aria-label={key === 'cleanup' && cleanupPending > 0
-                ? `Cleanup, ${cleanupPending} pending` : undefined}
-              onClick={() => switchTab(key)}
-              className={`px-2 sm:px-4 py-2 text-sm font-medium whitespace-nowrap border-b-2 -mb-px transition-colors ${
-                activeTab === key
-                  ? 'border-primary text-foreground'
-                  : 'border-transparent text-muted-foreground hover:text-foreground'
-              } ${focusRing}`}
-            >
-              {label}
-              {key === 'cleanup' && cleanupPending > 0 && (
-                <span className={`ml-2 ${badgeBase} ${tint.warning} tabular-nums`}>{cleanupPending}</span>
-              )}
-            </button>
-          ),
-        )}
-      </div>
-
+      <PageTabs id="patterns" label="Pattern sections" active={activeTab} onChange={switchTab} tabs={[
+        { value: 'patterns', label: 'Patterns' },
+        { value: 'detected-ads', label: 'Detected Ads' },
+        { value: 'ad-review', label: 'Ad Review' },
+        { value: 'cleanup', label: 'Cleanup', accessibleLabel: cleanupPending > 0 ? `Cleanup, ${cleanupPending} pending` : undefined,
+          badge: cleanupPending > 0 ? <span className={`ml-2 ${badgeBase} ${tint.warning}`}>{cleanupPending}</span> : undefined },
+      ]} />
+      <div role="tabpanel" id={`patterns-panel-${activeTab}`} aria-labelledby={`patterns-tab-${activeTab}`} tabIndex={0}>
       {activeTab === 'detected-ads' && <DetectedAdsTab />}
       {activeTab === 'ad-review' && <AdReviewTab />}
       {activeTab === 'cleanup' && <CleanupTab />}
@@ -312,10 +278,10 @@ function PatternsPage() {
       {isLoading && <SkeletonRows count={6} />}
       {error && (
         <div className="text-center py-12">
-          <p className="text-destructive">Failed to load patterns</p>
+          <p className="text-destructive">{patterns ? 'Patterns could not be refreshed. Showing the last loaded list.' : 'Failed to load patterns'}</p>
         </div>
       )}
-      {!isLoading && !error && (<>
+      {!isLoading && patterns && (<>
 
       {/* Stats Summary */}
       {stats && (
@@ -698,6 +664,7 @@ function PatternsPage() {
 
       </>)}
       </>)}
+      </div>
     </div>
   );
 }

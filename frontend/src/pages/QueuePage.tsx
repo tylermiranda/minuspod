@@ -1,3 +1,4 @@
+import { pageHeader, pageTitle, pageDescription } from '../components/pageStyles';
 import { useState } from 'react';
 import { Link } from 'react-router';
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
@@ -21,6 +22,7 @@ import { touchTarget } from '../components/buttonStyles';
 import { tint } from '../components/badgeStyles';
 import LoadingSpinner from '../components/LoadingSpinner';
 import ProcessingJobProgress from '../components/ProcessingJobProgress';
+import QueryError from '../components/QueryError';
 
 function ActiveQueue({
   status,
@@ -29,6 +31,8 @@ function ActiveQueue({
   cancelIsPending,
   cancelingKey,
   loading,
+  failed,
+  onRetry,
 }: {
   status: ProcessingStatus | undefined;
   activeEpisodes: ProcessingEpisode[];
@@ -36,6 +40,8 @@ function ActiveQueue({
   cancelIsPending: boolean;
   cancelingKey: string | null;
   loading: boolean;
+  failed: boolean;
+  onRetry: () => void;
 }) {
   const jobs = status?.jobs ?? (status?.currentJob ? [status.currentJob] : []);
   const hold = status?.hold;
@@ -52,7 +58,7 @@ function ActiveQueue({
           </span>
         )}
       </div>
-      {loading ? <LoadingSpinner size="sm" /> : jobs.length > 0 ? (
+      {failed ? <QueryError title="Active processing is unavailable." onRetry={onRetry} /> : loading ? <LoadingSpinner size="sm" /> : jobs.length > 0 ? (
         <div className="space-y-3">
           {jobs.map((job) => (
             <ProcessingJobProgress
@@ -156,9 +162,11 @@ function QueuePage() {
 
   return (
     <div className="max-w-7xl mx-auto space-y-4 pb-20">
-      <div>
-        <h1 className="text-2xl font-bold text-foreground mb-2">Queue</h1>
-        <p className="text-muted-foreground">Monitor active processing and manage queued episodes.</p>
+      <div className={pageHeader}>
+        <div>
+        <h1 className={pageTitle}>Queue</h1>
+        <p className={pageDescription}>Monitor active processing and manage queued episodes.</p>
+        </div>
       </div>
 
       <ActiveQueue
@@ -168,6 +176,8 @@ function QueuePage() {
         cancelIsPending={cancel.isPending}
         cancelingKey={cancel.variables ? `${cancel.variables.slug}:${cancel.variables.episodeId}` : null}
         loading={status.isPending && episodes.isPending}
+        failed={episodes.isError && !episodes.data && !status.data}
+        onRetry={() => { void episodes.refetch(); void status.refetch(); }}
       />
       {cancel.isError && <p className="text-sm text-destructive">Could not cancel the selected episode. Refresh and try again.</p>}
       {priority.isError && <p className="text-sm text-destructive">Could not update queue priority. Refresh and try again.</p>}

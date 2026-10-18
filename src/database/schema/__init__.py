@@ -35,7 +35,9 @@ _AUTO_FILED_REASON_RE = re.compile(r'\s*corroborated (\S+) hold')
 
 
 # SQL DDL constants live in tables.py - re-exported for backward compat
-from database.schema.tables import PATTERN_CLEANUP_INDEXES, SCHEMA_SQL, TABLE_DDL
+from database.schema.tables import (
+    DOWNLOAD_INDEX_SQL, PATTERN_CLEANUP_INDEXES, SCHEMA_SQL, TABLE_DDL,
+)
 from database.search import (
     SEARCH_CHANGE_JOURNAL_DDL,
     SEARCH_CHANGE_TRIGGERS_SQL,
@@ -183,6 +185,8 @@ class SchemaMixin:
         'processing_runs',
         'upload_reservations',
         'feed_subscriber_keys',
+        'episode_downloads',
+        'ip_geo_cache',
         'provider_spend_reservations',
         'failover_events',
         'pattern_cleanup_runs',
@@ -247,7 +251,7 @@ class SchemaMixin:
             "CREATE INDEX IF NOT EXISTS idx_failover_events_created "
             "ON failover_events(created_at DESC)"
         )
-        for statement in PATTERN_CLEANUP_INDEXES:
+        for statement in PATTERN_CLEANUP_INDEXES + DOWNLOAD_INDEX_SQL:
             conn.execute(statement)
         conn.execute("DROP INDEX IF EXISTS idx_upload_reservations_active_target")
         conn.execute(
@@ -484,6 +488,9 @@ class SchemaMixin:
         """)
         conn.commit()
 
+        dl_cols = self._get_table_columns(conn, 'episode_downloads')
+        self._add_column_if_missing(conn, 'episode_downloads', 'last_request_line', 'TEXT', dl_cols)
+        self._add_column_if_missing(conn, 'episode_downloads', 'last_request_headers', 'TEXT', dl_cols)
         ledger_cols = self._get_table_columns(conn, 'llm_call_usage')
         self._add_column_if_missing(
             conn, 'llm_call_usage', 'logical_call_id', 'TEXT', ledger_cols)
@@ -635,6 +642,8 @@ class SchemaMixin:
             # Episode description blacklist (#835): same glob semantics as
             # title_skip_patterns, matched against the plain-text description.
             ('description_skip_patterns', 'TEXT'),
+            ('description_trim_pattern', 'TEXT'),
+            ('description_trim_mode', "TEXT DEFAULT 'to_end'"),
             ('title_skip_action', 'TEXT'),
             ('min_duration_seconds', 'REAL'),
             ('max_duration_seconds', 'REAL'),
@@ -662,6 +671,7 @@ class SchemaMixin:
             ('categories', 'TEXT'),
             # Operator hints appended to the LLM prompt for this feed (#709).
             ('detection_notes', 'TEXT'),
+            ('chapter_notes', 'TEXT'),
             # Durable, status-aware artwork negative cache: JSON map of
             # attempted candidate URL -> {status, at}, so a broken preferred
             # cover is not retried until its backoff window elapses even
@@ -700,6 +710,7 @@ class SchemaMixin:
             ('origin', "TEXT NOT NULL DEFAULT 'user'"),
             # 2.97.34: the hold an auto-filed confirm released; older rows group by bounds.
             ('hold_id', 'TEXT'),
+            ('addressing_mode', 'TEXT'),
         ]
         for col, definition in pcorr_migrations:
             self._add_column_if_missing(conn, 'pattern_corrections', col, definition, pcorr_cols)
@@ -841,6 +852,11 @@ class SchemaMixin:
                         'ads_dropped_out_of_window', 'ads_dropped_too_long'):
                 self._add_column_if_missing(
                     conn, 'addressing_log', col, 'INTEGER', addr_cols)
+
+        # NULL on old rows keeps them out of the per-mode splits.
+        rl_cols = self._get_table_columns(conn, 'ad_reviewer_log')
+        self._add_column_if_missing(
+            conn, 'ad_reviewer_log', 'addressing_mode', 'TEXT', rl_cols)
 
         # -- Ad patterns table columns --
         ap_cols = self._get_table_columns(conn, 'ad_patterns')
@@ -1869,6 +1885,25 @@ class SchemaMixin:
             conn.rollback()
             logger.error(f"search index reindex failed: {e}")
 
+        # One-shot reindex so descriptions are stored as plain text, not RSS HTML (2.100.12).
+        plain_text_rebuilt = search_index_freshly_populated
+        try:
+            plain_text_rebuilt |= self._run_reindex_search_plain_text(
+                conn, already_rebuilt=search_index_freshly_populated)
+        except Exception as e:
+            conn.rollback()
+            logger.error(f"search index plain-text reindex failed: {e}")
+
+        # Re-strip rows indexed before tags collapsed to a space ("legacy.All") (2.100.13).
+        # Skipped when the step above rebuilt in this boot: one rebuild covers both.
+        try:
+            self._run_reindex_search_plain_text(
+                conn, already_rebuilt=plain_text_rebuilt,
+                name='search_index_plain_text_2_100_13')
+        except Exception as e:
+            conn.rollback()
+            logger.error(f"search index plain-text re-strip failed: {e}")
+
         # Per-boot, not schema_migrations-gated: seeds an absent model row
         # from OPENAI_MODEL, run after the clear above so a stale default is
         # removed and reseeded in the same boot.
@@ -2770,6 +2805,18 @@ class SchemaMixin:
             logger.info("search-index-reindex: skipped, auto-populate already rebuilt it this boot")
         else:
             logger.info(f"search-index-reindex: complete, {count} row(s) indexed")
+
+    def _run_reindex_search_plain_text(self, conn, already_rebuilt: bool = False,
+                                       name: str = 'search_index_plain_text_2_100_12') -> bool:
+        """One-shot rebuild so existing rows hold plain-text descriptions; skipped
+        if this boot already rebuilt. Returns True when it rebuilt."""
+        if conn.execute("SELECT 1 FROM schema_migrations WHERE name = ?", (name,)).fetchone():
+            return False
+        count = 0 if already_rebuilt else self.rebuild_search_index()
+        conn.execute("INSERT OR IGNORE INTO schema_migrations (name) VALUES (?)", (name,))
+        conn.commit()
+        logger.info(f"search-index-plain-text: complete, {count} row(s) indexed")
+        return not already_rebuilt
 
     def _seed_model_settings_from_env(self, conn):
         """Seed an absent model row from OPENAI_MODEL (2.86.4).
@@ -4396,7 +4443,8 @@ class SchemaMixin:
                     source_hold_reason TEXT,
                     fp_suppressed INTEGER DEFAULT 0,
                     origin TEXT NOT NULL DEFAULT 'user',
-                    hold_id TEXT
+                    hold_id TEXT,
+                    addressing_mode TEXT
                 )
             """)
             new_pc_cols = [

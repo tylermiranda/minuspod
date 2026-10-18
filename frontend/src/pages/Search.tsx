@@ -1,3 +1,4 @@
+import { pageHeader, pageTitle, pageDescription } from '../components/pageStyles';
 import { useState, useEffect, useMemo } from 'react';
 import { useSearchParams, Link } from 'react-router';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
@@ -6,6 +7,10 @@ import { SkeletonRows } from '../components/Skeleton';
 import { btnSecondary } from '../components/buttonStyles';
 import { focusRing } from '../components/fieldStyles';
 import { renderSnippet } from '../utils/searchSnippet';
+import { formatDate } from '../utils/format';
+import { displayStatusColor, displayStatusLabel } from '../utils/episodeStatus';
+import { badgeBase } from '../components/badgeStyles';
+import QueryError from '../components/QueryError';
 
 type FilterType = 'all' | 'episode' | 'podcast' | 'transcript' | 'pattern' | 'sponsor';
 type ResultType = Exclude<FilterType, 'all'>;
@@ -23,6 +28,9 @@ interface NormalizedResult {
   subtitle?: string;
   snippet: string | null;
   link: string;
+  titleSnippet?: string | null;
+  status?: string;
+  date?: string;
 }
 
 const typeIcons: Record<ResultType, React.ReactNode> = {
@@ -78,7 +86,7 @@ function Search() {
     return () => clearTimeout(timer);
   }, [query, filterType, setSearchParams]);
 
-  const { data: results, isLoading, error } = useQuery({
+  const { data: results, isLoading, error, refetch, isFetching } = useQuery({
     queryKey: ['search', debouncedQuery],
     queryFn: () => search(debouncedQuery),
     enabled: debouncedQuery.length >= 2,
@@ -102,21 +110,24 @@ function Search() {
     if (!results) return { podcast: [], episode: [], transcript: [], pattern: [], sponsor: [] };
     return {
       podcast: results.shows.map((r) => ({
-        type: 'podcast', id: r.slug, title: r.title, snippet: r.snippet, link: `/feeds/${r.slug}`,
+        type: 'podcast', id: r.slug, title: r.title, titleSnippet: r.titleSnippet, snippet: r.snippet,
+        link: `/feeds/${r.slug}`,
       })),
       episode: results.episodes.map((r) => ({
-        type: 'episode', id: `${r.feedSlug}-${r.episodeId}`, title: r.title, subtitle: r.feedTitle,
-        snippet: r.snippet, link: `/feeds/${r.feedSlug}/episodes/${r.episodeId}`,
+        type: 'episode', id: `${r.feedSlug}-${r.episodeId}`, title: r.title,
+        subtitle: r.feedTitle, date: r.publishDate ? formatDate(r.publishDate) : undefined,
+        status: r.status, titleSnippet: r.titleSnippet, snippet: r.snippet,
+        link: `/feeds/${r.feedSlug}/episodes/${r.episodeId}`,
       })),
       transcript: results.transcripts.map((r) => ({
         type: 'transcript', id: `${r.feedSlug}-${r.episodeId}`, title: r.title,
         snippet: r.snippet, link: `/feeds/${r.feedSlug}/episodes/${r.episodeId}`,
       })),
       pattern: results.patterns.map((r) => ({
-        type: 'pattern', id: r.id, title: r.sponsor, subtitle: r.scope, snippet: r.snippet, link: '/patterns',
+        type: 'pattern', id: r.id, title: r.sponsor, subtitle: r.scope, snippet: r.snippet, link: `/patterns?q=${encodeURIComponent(r.sponsor)}`,
       })),
       sponsor: results.sponsors.map((r) => ({
-        type: 'sponsor', id: r.id, title: r.name, snippet: r.snippet, link: '/patterns',
+        type: 'sponsor', id: r.id, title: r.name, snippet: r.snippet, link: `/sponsors?q=${encodeURIComponent(r.name)}`,
       })),
     };
   }, [results]);
@@ -136,23 +147,17 @@ function Search() {
 
   return (
     <div className="max-w-4xl mx-auto">
-      <div className="flex justify-between items-start mb-6">
+      <div className={pageHeader}>
         <div>
-          <h1 className="text-2xl font-bold text-foreground">Search</h1>
-          <p className="text-muted-foreground mt-1">
+          <h1 className={pageTitle}>Search</h1>
+          <p className={pageDescription}>
             Search across shows, episodes, transcripts, patterns, and sponsors
           </p>
         </div>
-        <button
-          onClick={() => rebuildMutation.mutate()}
-          disabled={rebuildMutation.isPending}
-          className={`px-3 py-1.5 text-sm rounded ${btnSecondary} disabled:opacity-50 transition-colors ${focusRing}`}
-        >
-          {rebuildMutation.isPending ? 'Rebuilding...' : 'Rebuild Index'}
-        </button>
       </div>
 
       {/* Search Input */}
+      <label htmlFor="library-search" className="block text-sm font-medium mb-2">Search your library</label>
       <div className="relative mb-6">
         <svg
           className="absolute left-4 top-1/2 -translate-y-1/2 w-5 h-5 text-muted-foreground"
@@ -168,6 +173,7 @@ function Search() {
           />
         </svg>
         <input
+          id="library-search"
           type="text"
           value={query}
           onChange={(e) => setQuery(e.target.value)}
@@ -178,12 +184,13 @@ function Search() {
       </div>
 
       {/* Filter Tabs */}
-      <div className="flex gap-2 mb-6 overflow-x-auto pb-2">
+      <div role="group" aria-label="Result type" className="grid grid-cols-2 sm:flex sm:flex-wrap gap-2 mb-6">
         {FILTER_TYPES.map((type) => (
           <button
             key={type}
+            aria-pressed={filterType === type}
             onClick={() => setFilterType(type)}
-            className={`px-4 py-2 rounded text-sm font-medium transition-colors whitespace-nowrap ${
+            className={`min-w-0 min-h-11 whitespace-normal px-2 sm:px-4 py-2 rounded text-sm font-medium transition-colors ${
               filterType === type
                 ? 'bg-primary text-primary-foreground'
                 : btnSecondary
@@ -191,7 +198,7 @@ function Search() {
           >
             {type === 'all' ? 'All' : typeLabels[type]}
             {stats?.stats && type !== 'all' && type !== 'transcript' && stats.stats[type] !== undefined && (
-              <span className="ml-1 opacity-70">({stats.stats[type]})</span>
+              <span className="ml-1 inline-block">({stats.stats[type]})</span>
             )}
           </button>
         ))}
@@ -201,12 +208,10 @@ function Search() {
       {isLoading && debouncedQuery.length >= 2 && <SkeletonRows count={5} />}
 
       {error && (
-        <div className="p-4 rounded-lg bg-destructive/10 text-destructive">
-          {(error as Error).message}
-        </div>
+        <QueryError title="Search is unavailable." onRetry={() => void refetch()} retrying={isFetching} />
       )}
 
-      {!isLoading && debouncedQuery.length >= 2 && results && (
+      {!isLoading && !error && debouncedQuery.length >= 2 && results && (
         <>
           <p className="text-sm text-muted-foreground mb-4">
             {total} result{total !== 1 ? 's' : ''} for "{results.query}"
@@ -272,6 +277,15 @@ function Search() {
           <p>Enter at least 2 characters to search</p>
         </div>
       )}
+      <details className="mt-8 border-t border-border pt-4 text-sm">
+        <summary className="cursor-pointer text-muted-foreground py-3">Search maintenance</summary>
+        <button type="button" onClick={() => rebuildMutation.mutate()} disabled={rebuildMutation.isPending}
+          className={`px-3 py-2 rounded ${btnSecondary} ${focusRing} disabled:opacity-50`}>
+          {rebuildMutation.isPending ? 'Rebuilding...' : 'Rebuild Index'}
+        </button>
+        {rebuildMutation.isSuccess && <p role="status" className="mt-2">Search index rebuilt.</p>}
+        {rebuildMutation.isError && <p role="alert" className="mt-2 text-destructive">Could not rebuild the index. Try again.</p>}
+      </details>
     </div>
   );
 }
@@ -285,9 +299,21 @@ function SearchResultCard({ result }: { result: NormalizedResult }) {
       <div className="flex items-start gap-3">
         <div className="shrink-0 mt-1 text-muted-foreground">{typeIcons[result.type]}</div>
         <div className="flex-1 min-w-0">
-          <h3 className="font-medium text-foreground truncate">{result.title}</h3>
-          {result.subtitle && (
-            <p className="text-xs text-muted-foreground truncate">{result.subtitle}</p>
+          <div className="flex items-center gap-2">
+            <h3 className="font-medium text-foreground truncate">
+              {result.titleSnippet ? renderSnippet(result.titleSnippet) : result.title}
+            </h3>
+            {result.status && (
+              <span className={`${badgeBase} shrink-0 whitespace-nowrap font-normal ${displayStatusColor(result.status)}`}>
+                {displayStatusLabel(result.status)}
+              </span>
+            )}
+          </div>
+          {(result.subtitle || result.date) && (
+            <p className="flex justify-between gap-3 text-xs text-muted-foreground">
+              <span className="truncate">{result.subtitle}</span>
+              {result.date && <span className="shrink-0 tabular-nums">{result.date}</span>}
+            </p>
           )}
           {result.snippet && (
             <p className="text-sm text-muted-foreground mt-1 line-clamp-2">

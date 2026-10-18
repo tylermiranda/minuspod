@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 from config import (
+    DESCRIPTION_CHAPTER_STAGE,
     MIN_AD_DURATION, SHORT_AD_WARN, LONG_AD_WARN, MAX_AD_DURATION,
     MAX_AD_DURATION_CONFIRMED, LOW_CONFIDENCE,
     REJECT_CONFIDENCE, HIGH_CONFIDENCE_OVERRIDE, PRE_ROLL, MID_ROLL_1,
@@ -251,6 +252,21 @@ def _covered_seconds(spans, lo: float, hi: float) -> float:
     """Seconds of [lo, hi] the union of (start, end) spans covers."""
     return sum(b - a for a, b in merge_runs(
         (max(a, lo), min(b, hi)) for a, b in spans if min(b, hi) > max(a, lo)))
+
+
+def _clip_reviewer_proposal(piece: dict) -> None:
+    """Drop an inherited reviewer trim that misses the piece, else clamp it into the piece."""
+    p_start = piece.get('reviewer_proposed_start')
+    p_end = piece.get('reviewer_proposed_end')
+    if p_start is None and p_end is None:
+        return
+    if (p_start is None or p_end is None
+            or p_end <= piece['start'] or p_start >= piece['end']):
+        piece.pop('reviewer_proposed_start', None)
+        piece.pop('reviewer_proposed_end', None)
+        return
+    piece['reviewer_proposed_start'] = max(p_start, piece['start'])
+    piece['reviewer_proposed_end'] = min(p_end, piece['end'])
 
 
 class AdValidator:
@@ -638,6 +654,9 @@ class AdValidator:
             return ValidationResult(ads=[])
 
         result = ValidationResult(ads=[])
+        chapter_ads = [self._force_accepted_chapter(ad) for ad in ads
+                       if ad.get('detection_stage') == DESCRIPTION_CHAPTER_STAGE]
+        ads = [ad for ad in ads if ad.get('detection_stage') != DESCRIPTION_CHAPTER_STAGE]
 
         # Make SHALLOW copies to avoid modifying originals. Callers rely on
         # this staying shallow: _validate_verification_ads attaches an
@@ -865,6 +884,9 @@ class AdValidator:
         # Step 5: Check overall density
         self._check_ad_density(result)
 
+        result.ads = sorted(result.ads + chapter_ads, key=lambda a: a['start'])
+        result.accepted += len(chapter_ads)
+
         # Log summary
         logger.info(
             f"Validation complete: {result.accepted} accepted, "
@@ -877,6 +899,22 @@ class AdValidator:
                 logger.warning(f"Validation warning: {warning}")
 
         return result
+
+    def _force_accepted_chapter(self, ad: dict) -> dict:
+        """Accept a description-chapter marker as a user-authored cut, bypassing every gate."""
+        marker = ad.copy()
+        start = max(0.0, marker['start'])
+        end = marker['end']
+        if self.episode_duration > 0:
+            end = min(end, self.episode_duration)
+        marker.update(start=start, end=end, was_cut=True, _skip_pattern_learning=True)
+        marker['validation'] = {
+            'decision': Decision.ACCEPT.value, 'adjusted_confidence': 1.0,
+            'original_confidence': marker.get('confidence', 1.0),
+            'user_confirmed': True, 'confirmed_span': {'start': start, 'end': end},
+            'flags': ['INFO: Description chapter trim'],
+        }
+        return marker
 
     @staticmethod
     def _preserve_reviewer_reject(ad: dict) -> None:
@@ -1696,6 +1734,7 @@ class AdValidator:
             piece['hold_reason'] = reason
             piece['pass2_hold_remainder'] = True
             piece['_skip_pattern_learning'] = True
+            _clip_reviewer_proposal(piece)
             pieces.append(piece)
         return pieces
 
@@ -1723,6 +1762,12 @@ class AdValidator:
             if lo is None:
                 out.append(ad)
                 continue
+            # A template cue snap on an edge is a measurement of that edge.
+            snaps = ad.get('cue_snap') or {}
+            if is_template_cue(snaps.get('start')):
+                lo = ad['start']
+            if is_template_cue(snaps.get('end')):
+                hi = ad['end']
             if (lo, hi) == (ad['start'], ad['end']):
                 cut = ad
             else:

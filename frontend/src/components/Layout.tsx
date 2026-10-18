@@ -34,6 +34,7 @@ function NavLink({ to, label, active, onClick, count }: NavLinkProps) {
     <Link
       to={to}
       onClick={onClick}
+      aria-current={active ? 'page' : undefined}
       className={`flex min-h-11 items-center px-3 py-2 text-sm font-medium transition-colors xl:min-h-0 rounded-md ${focusRing} ${
         active
           ? 'bg-primary text-primary-foreground'
@@ -97,14 +98,7 @@ function Layout() {
       >
         Skip to content
       </a>
-      {/* GlobalStatusBar is fixed at top-0 (z-50) and only rendered while
-          processing is active. This opaque spacer reserves its 2.5rem strip and,
-          being sticky, also covers that strip so page content never shows through
-          above the pinned header while scrolling. */}
-      <div className="sticky top-0 z-30 h-10 bg-background" aria-hidden="true" />
-      {/* sticky top-10 pins the banner just below that strip on scroll;
-          z-30 sits above page content (z-10/20) and below modals + status bar (z-50) */}
-      <header className="sticky top-10 z-30 border-b border-border bg-card">
+      <header className="sticky z-30 border-b border-border bg-card" style={{ top: 'var(--status-bar-height, 0px)' }}>
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
           <div className="flex justify-between items-center h-16">
             <div className="flex items-center gap-8">
@@ -200,7 +194,7 @@ function Layout() {
           </div>
         </div>
         {mobileMenuOpen && (
-          <div className="xl:hidden max-h-[calc(100dvh-6.5rem)] overflow-y-auto overscroll-contain border-t border-border bg-card">
+          <div className="xl:hidden max-h-[calc(100dvh-var(--status-bar-height,0px)-4rem)] overflow-y-auto overscroll-contain border-t border-border bg-card">
             <nav className="flex flex-col px-4 py-2 gap-1">
               {NAV_ITEMS.map((item) => (
                 <NavLink

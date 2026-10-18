@@ -1,6 +1,8 @@
-import { Fragment, useState, useMemo, useRef, useEffect, type ReactNode } from 'react';
+import { pageHeader, pageTitle, summaryValue, summaryLabel } from '../components/pageStyles';
+import { Fragment, useState, useMemo, type ReactNode } from 'react';
 import { keepPreviousData, useQuery } from '@tanstack/react-query';
-import { Link, useSearchParams } from 'react-router';
+import { Link } from 'react-router';
+import { useUrlParams } from '../hooks/useUrlParams';
 import {
   BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip,
   ResponsiveContainer, Cell,
@@ -8,7 +10,7 @@ import {
 import {
   getDashboardStats, getStatsByDay, getStatsByPodcast, getReviewerStats, getAddressingStats, getCleanupStats,
   getModelUsageStats, getEpisodeCostStats, getEpisodeCostRuns, getLedgerFilterOptions,
-  getSpendAttempts, getSystemOneStats, ModelUsageQueryParams, EpisodeCostQueryParams,
+  getSpendAttempts, getSystemOneStats, getLlmStats, ModelUsageQueryParams, EpisodeCostQueryParams,
 } from '../api/stats';
 import ProcessingRunsTable from '../components/ProcessingRunsTable';
 import { getCueAggregateStats } from '../api/cueDetections';
@@ -22,7 +24,8 @@ import { Pagination } from '../components/Pagination';
 import { SortHeader, useSortState } from '../components/SortHeader';
 import DisclosureButton from '../components/DisclosureButton';
 import CostAmount from '../components/CostAmount';
-import { selectBase, inputBase, focusRing, filterGrid, filterLabel, filterControl } from '../components/fieldStyles';
+import DateField from '../components/DateField';
+import { selectBase, focusRing, filterGrid, filterLabel, filterControl } from '../components/fieldStyles';
 import { SLOT_LABELS } from '../api/types';
 import { btnSecondary } from '../components/buttonStyles';
 import { badgeBase, tint } from '../components/badgeStyles';
@@ -34,56 +37,13 @@ const CLEANUP_ACTION_LABELS: Record<string, string> = {
   retire: 'Retirements', flag: 'Flags', category: 'Category changes',
 };
 
-interface SpendDateFieldProps {
-  id: string;
-  label: string;
-  value: string;
-  onChange: (value: string) => void;
-  min?: string;
-  max?: string;
-}
-
-function SpendDateField({
-  id, label, value, onChange, min, max,
-}: SpendDateFieldProps): ReactNode {
-  const inputRef = useRef<HTMLInputElement>(null);
-  const [editing, setEditing] = useState(false);
-  useEffect(() => {
-    if (!editing && inputRef.current && inputRef.current.value !== value) {
-      inputRef.current.value = value;
-    }
-  }, [editing, value]);
-  return (
-    <div className="min-w-0">
-      <label htmlFor={id} className={filterLabel}>{label}</label>
-      <div className="flex items-center gap-1">
-        <input
-          ref={inputRef}
-          type="date"
-          id={id}
-          min={min}
-          max={max}
-          defaultValue={value}
-          onFocus={() => setEditing(true)}
-          onChange={(event) => onChange(event.target.value)}
-          onBlur={() => {
-            setEditing(false);
-            onChange(inputRef.current?.value ?? '');
-          }}
-          className={`${filterControl} ${inputBase} max-sm:px-0 max-sm:text-base [&::-webkit-date-and-time-value]:text-left [&::-webkit-datetime-edit]:min-w-0 [&::-webkit-datetime-edit]:p-0`}
-        />
-      </div>
-    </div>
-  );
-}
-
 type PodcastSortField = 'podcastTitle' | 'episodeCount' | 'runCount' | 'totalAds' | 'avgAds' | 'avgTimeSavedSeconds' | 'avgEpisodeLengthSeconds' | 'totalCost' | 'avgTokensPerEpisode';
 
 function ReviewerStatCard({ label, value }: { label: string; value: number | string }) {
   return (
     <div className="bg-secondary/50 rounded-md p-3">
       <p className="text-xs text-muted-foreground">{label}</p>
-      <p className="text-lg font-semibold tabular-nums text-foreground">{value}</p>
+      <p className={`${summaryValue} text-foreground`}>{value}</p>
     </div>
   );
 }
@@ -95,7 +55,7 @@ function Metric({ label, value }: { label: string; value: number | string }) {
   return (
     <div className="flex min-w-0 flex-col">
       <p className="flex-1 text-xs text-muted-foreground">{label}</p>
-      <p className="text-lg font-semibold tabular-nums text-foreground">{value}</p>
+      <p className={`${summaryValue} text-foreground`}>{value}</p>
     </div>
   );
 }
@@ -123,25 +83,6 @@ const STATS_PARAM_DEFAULTS = {
   ecSort: 'lastActivityAt', ecDir: 'desc', ecPage: '1',
 } as const;
 
-type StatsParam = keyof typeof STATS_PARAM_DEFAULTS;
-
-function useStatsParams() {
-  const [params, setParams] = useSearchParams();
-  const read = (key: StatsParam) => params.get(key) ?? STATS_PARAM_DEFAULTS[key];
-  // One patch per interaction: two separate setters in the same handler would
-  // each build from the pre-update query and the second would drop the first.
-  const write = (changes: Partial<Record<StatsParam, string>>) => {
-    const next = new URLSearchParams(params);
-    for (const [key, value] of Object.entries(changes)) {
-      if (value && value !== STATS_PARAM_DEFAULTS[key as StatsParam]) next.set(key, value);
-      else next.delete(key);
-    }
-    setParams(next, { replace: true });
-  };
-  const readPage = (key: StatsParam) => Math.max(1, Number(read(key)) || 1);
-  return { read, readPage, write };
-}
-
 // Option list that always contains the current selection, so a filter whose
 // value has no data in the selected scope is still shown as selected.
 function withSelection(options: string[], selected: string): { value: string; inScope: boolean }[] {
@@ -154,6 +95,14 @@ function withSelection(options: string[], selected: string): { value: string; in
 
 function modelUsageKey(stat: ModelUsageStat): string {
   return `${stat.provider}::${stat.model}`;
+}
+
+function requestCount(n: number): string {
+  return `${n} ${n === 1 ? 'request' : 'requests'}`;
+}
+
+function formatMs(value: number | null): string {
+  return value === null ? 'Unknown' : `${value.toLocaleString()} ms`;
 }
 
 // Counts the calls that were billable but came back without a price, so an
@@ -211,7 +160,7 @@ function ModelUsageTable({
   return (
     <>
       <div className="hidden sm:block bg-card border border-border rounded-lg overflow-hidden">
-        <div className="overflow-x-auto">
+        <div role="region" aria-label="Statistics table; scroll for more columns" tabIndex={0} className="overflow-x-auto">
           <table aria-label="Provider and model usage" className="w-full">
             <thead className="bg-muted/50">
               <tr>
@@ -464,8 +413,8 @@ function EpisodeCostTable({
   const [attemptRows, toggleAttemptRows] = useExpandedKeys();
   return (
     <>
-      <div className="hidden sm:block bg-card border border-border rounded-lg overflow-hidden">
-        <div className="overflow-x-auto">
+      <div className="hidden xl:block bg-card border border-border rounded-lg overflow-hidden">
+        <div role="region" aria-label="Statistics table; scroll for more columns" tabIndex={0} className="overflow-x-auto">
           <table aria-label="Episode costs" className="w-full">
             <thead className="bg-muted/50">
               <tr>
@@ -550,7 +499,7 @@ function EpisodeCostTable({
         </div>
       </div>
 
-      <div className="sm:hidden space-y-3">
+      <div className="xl:hidden space-y-3">
         <div className="flex items-center gap-2">
           <select
             aria-label="Sort episode costs by"
@@ -743,7 +692,7 @@ export default function StatsPage() {
   // Shared ledger filters (date interval, podcast, provider, model) drive both
   // the model-usage and episode-cost lists below, and all of it round-trips
   // through the URL.
-  const { read, readPage, write } = useStatsParams();
+  const { read, readPage, write } = useUrlParams(STATS_PARAM_DEFAULTS);
   const ledgerFrom = read('from');
   const ledgerTo = read('to');
   const ledgerPodcast = read('podcast');
@@ -810,6 +759,21 @@ export default function StatsPage() {
     queryKey: ['stats-systemone', systemOneParams],
     queryFn: () => getSystemOneStats(systemOneParams),
   });
+  const {
+    data: llmStats, isLoading: llmLoading,
+    error: llmError, refetch: refetchLlm,
+  } = useQuery({
+    queryKey: ['stats-llm', systemOneParams],
+    queryFn: () => getLlmStats(systemOneParams),
+  });
+  const llmTokenDetails = !llmStats ? undefined : !llmStats.requests
+    ? 'No recorded requests'
+    : [
+      llmStats.tokens.cacheRead > 0 ? `${formatTokenCount(llmStats.tokens.cacheRead)} cache read` : null,
+      llmStats.tokens.cacheWrite > 0 ? `${formatTokenCount(llmStats.tokens.cacheWrite)} cache write` : null,
+      llmStats.tokens.reasoning > 0 ? `${formatTokenCount(llmStats.tokens.reasoning)} reasoning` : null,
+      llmStats.tokens.unknownRequestCount ? `Usage unavailable for ${requestCount(llmStats.tokens.unknownRequestCount)}` : null,
+    ].filter(Boolean).join(', ') || undefined;
   const cleanupStatsParams = {
     ...ledgerScope,
     provider: ledgerProvider || undefined,
@@ -881,6 +845,7 @@ export default function StatsPage() {
     { id: 'stats-cues', label: 'Audio cues',
       show: !!cueStats && (cueStats.total > 0 || cueStats.nearMissTotal > 0) },
     { id: 'stats-spend', label: 'Spend', show: true },
+    { id: 'stats-llm', label: 'LLM', show: true },
     { id: 'stats-systemone', label: 'System One', show: true },
     { id: 'stats-cleanup', label: 'Cleanup', show: true },
     { id: 'stats-podcasts', label: 'Podcasts', show: sortedPodcasts.length > 0 },
@@ -888,14 +853,14 @@ export default function StatsPage() {
 
   return (
     <div>
-      <div className="flex flex-col sm:flex-row sm:justify-between sm:items-center gap-4 mb-6">
-        <h1 className="text-2xl font-bold text-foreground">Stats</h1>
+      <div className={pageHeader}>
+        <h1 className={pageTitle}>Stats</h1>
         <div className="w-full sm:w-64 min-w-0">
         <label htmlFor="stats-summary-podcast" className={filterLabel}>Podcast</label>
         <select
           id="stats-summary-podcast"
           aria-label="Filter summary cards, charts, reviewer and addressing sections by podcast"
-          title="Applies to the summary cards, charts, reviewer and addressing sections. The LLM spend section has its own podcast filter."
+          title="Applies to the summary cards, charts, reviewer and addressing sections. The Spend section has its own podcast filter."
           value={podcastFilter}
           onChange={(e) => setPodcastFilter(e.target.value)}
           className={`${filterControl} ${selectBase}`}
@@ -973,38 +938,17 @@ export default function StatsPage() {
       )}
       {dashboard && (
         <div className="grid grid-cols-1 sm:grid-cols-3 lg:grid-cols-3 xl:grid-cols-6 gap-4 mb-8">
-          <div className="bg-card rounded-lg border border-border p-4">
-            <p className="text-sm text-muted-foreground">Total Episodes</p>
-            <p className="text-xl font-bold tabular-nums text-foreground">{dashboard.totalEpisodesProcessed}</p>
-            {dashboard.totalRuns !== dashboard.totalEpisodesProcessed && (
-              <p className="text-xs text-muted-foreground mt-1">{dashboard.totalRuns} processing runs</p>
-            )}
-          </div>
-          <div className="bg-card rounded-lg border border-border p-4">
-            <p className="text-sm text-muted-foreground">Total Ads Removed</p>
-            <p className="text-xl font-bold tabular-nums text-foreground">{dashboard.totalAdsRemoved}</p>
-          </div>
-          <div className="bg-card rounded-lg border border-border p-4">
-            <p className="text-sm text-muted-foreground">Total Audio Cues</p>
-            <p className="text-xl font-bold tabular-nums text-foreground">{dashboard.totalAudioCuesDetected}</p>
-          </div>
-          <div className="bg-card rounded-lg border border-border p-4">
-            <p className="text-sm text-muted-foreground">Total Time Saved</p>
-            <p className="text-xl font-bold tabular-nums text-foreground">{formatDuration(dashboard.totalTimeSavedSeconds)}</p>
-            {dashboard.episodesWithTimeSaved > 0 &&
-              dashboard.episodesWithTimeSaved !== dashboard.totalEpisodesProcessed && (
-                <p className="text-xs text-muted-foreground mt-1">from {dashboard.episodesWithTimeSaved} episodes</p>
-              )}
-          </div>
-          <div className="bg-card rounded-lg border border-border p-4">
-            <p className="text-sm text-muted-foreground">Total LLM Cost</p>
-            <p className="text-xl font-bold tabular-nums text-foreground">{formatCost(dashboard.totalLlmCost)}</p>
-          </div>
-          <div className="bg-card rounded-lg border border-border p-4">
-            <p className="text-sm text-muted-foreground">Total Tokens</p>
-            <p className="text-xl font-bold tabular-nums text-foreground">{formatTokenCount(dashboard.totalInputTokens + dashboard.totalOutputTokens)}</p>
-            <p className="text-xs text-muted-foreground mt-1">In: {formatTokenCount(dashboard.totalInputTokens)} / Out: {formatTokenCount(dashboard.totalOutputTokens)}</p>
-          </div>
+          <StatCard label="Total Episodes" value={String(dashboard.totalEpisodesProcessed)}
+            details={dashboard.totalRuns !== dashboard.totalEpisodesProcessed
+              ? `${dashboard.totalRuns} processing runs` : undefined} />
+          <StatCard label="Total Ads Removed" value={String(dashboard.totalAdsRemoved)} />
+          <StatCard label="Total Audio Cues" value={String(dashboard.totalAudioCuesDetected)} />
+          <StatCard label="Total Time Saved" value={formatDuration(dashboard.totalTimeSavedSeconds)}
+            details={dashboard.episodesWithTimeSaved > 0 && dashboard.episodesWithTimeSaved !== dashboard.totalEpisodesProcessed
+              ? `from ${dashboard.episodesWithTimeSaved} episodes` : undefined} />
+          <StatCard label="Total Cost" value={formatCost(dashboard.totalLlmCost)} />
+          <StatCard label="Total Tokens" value={formatTokenCount(dashboard.totalInputTokens + dashboard.totalOutputTokens)}
+            details={`In: ${formatTokenCount(dashboard.totalInputTokens)} / Out: ${formatTokenCount(dashboard.totalOutputTokens)}`} />
         </div>
       )}
 
@@ -1181,22 +1125,22 @@ export default function StatsPage() {
           paginated and sorted server-side over the llm_call_usage ledger.
           Includes failed and cancelled runs that incurred cost. */}
       <div id="stats-spend" className="scroll-mt-28 bg-card rounded-lg border border-border p-4 sm:p-6 mb-6">
-        <h2 className="text-lg font-semibold text-foreground mb-1">LLM spend</h2>
+        <h2 className="text-lg font-semibold text-foreground mb-1">Spend</h2>
         <p className="text-sm text-muted-foreground mb-4">
-          Spend by provider, model, and episode, including failed or cancelled runs that incurred cost.
-          The filters below apply to LLM spend, System One calls, and pattern cleanup activity. Dates select whole UTC days.
+          Spend by provider, model, and episode across LLM and System One calls, including failed or cancelled runs that incurred cost.
+          The filters below apply to spend, LLM calls, System One calls, and pattern cleanup activity. Dates select whole UTC days.
         </p>
 
         <div className={`${filterGrid} lg:grid-cols-5 mb-3`}>
           <div className="grid grid-cols-2 gap-2 sm:gap-4 min-w-0 min-[375px]:col-span-2">
-          <SpendDateField
+          <DateField
             id="spendFrom"
             label="From"
             value={ledgerFrom}
             max={ledgerTo || undefined}
             onChange={(value) => write({ from: value, muPage: '1', ecPage: '1' })}
           />
-          <SpendDateField
+          <DateField
             id="spendTo"
             label="To"
             value={ledgerTo}
@@ -1321,10 +1265,52 @@ export default function StatsPage() {
         )}
       </div>
 
+      <div id="stats-llm" className="scroll-mt-28 bg-card rounded-lg border border-border p-4 sm:p-6 mb-6">
+        <h2 className="text-lg font-semibold text-foreground mb-1">LLM calls</h2>
+        <p className="text-sm text-muted-foreground mb-3">
+          Uses the Spend filters above. One call may send several requests.
+        </p>
+        {llmLoading && <SkeletonRows count={2} />}
+        {llmError && (
+          <QueryErrorPanel
+            message={`Could not load LLM call stats: ${getErrorMessage(llmError)}.`}
+            onRetry={() => { void refetchLlm(); }}
+            retryLabel="Retry LLM stats"
+          />
+        )}
+        {llmStats && (
+          llmStats.calls === 0 ? (
+            <p className="rounded-lg border border-border p-3 text-sm text-muted-foreground">No LLM calls recorded for this filter.</p>
+          ) : (
+            <div>
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                <StatCard label="Calls" value={String(llmStats.calls)} />
+                <StatCard label="HTTP requests" value={String(llmStats.requests)} />
+                <StatCard label="Success / failed / inconclusive" value={`${llmStats.outcomes.success} / ${llmStats.outcomes.failure} / ${llmStats.outcomes.inconclusive}`} details={llmStats.outcomes.inFlight > 0 ? `${llmStats.outcomes.inFlight} in flight` : undefined} />
+                <StatCard label="Average call time" value={formatMs(llmStats.callLatencyMsAverage)} />
+                <StatCard label="Average request time" value={formatMs(llmStats.dispatchLatencyMsAverage)} details="Per HTTP request" />
+                <StatCard label="Token usage" value={`${formatTokenCount(llmStats.tokens.input)} in / ${formatTokenCount(llmStats.tokens.output)} out`} details={llmTokenDetails} />
+                <StatCard label="Known cost" value={formatKnownCallCost(llmStats.costUsd)} details={!llmStats.requests ? 'No recorded requests' : llmStats.unknownCostRequestCount ? `${requestCount(llmStats.unknownCostRequestCount)} unpriced` : undefined} />
+              </div>
+              {Object.keys(llmStats.byPhase).length > 0 && (
+                <div className="mt-4 border-t border-border pt-3">
+                  <h4 className="text-sm font-medium text-foreground mb-2">Calls by phase</h4>
+                  <ul className="flex flex-wrap gap-x-4 gap-y-2 text-sm text-muted-foreground">
+                    {Object.entries(llmStats.byPhase).map(([phase, entry]) => (
+                      <li key={phase}>{phase}: <span className="tabular-nums text-foreground">{entry.calls}, {formatKnownCallCost(entry.costUsd)}</span></li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+            </div>
+          )
+        )}
+      </div>
+
       <div id="stats-systemone" className="scroll-mt-28 bg-card rounded-lg border border-border p-4 sm:p-6 mb-6">
         <h2 className="text-lg font-semibold text-foreground mb-1">System One calls</h2>
         <p className="text-sm text-muted-foreground mb-3">
-          Uses the LLM spend filters above. One call may send several requests.
+          Uses the Spend filters above. One call may send several requests.
         </p>
         {systemOneLoading && <SkeletonRows count={2} />}
         {systemOneError && (
@@ -1343,10 +1329,10 @@ export default function StatsPage() {
                 <StatCard label="Calls" value={String(systemOneStats.calls)} />
                 <StatCard label="HTTP requests" value={String(systemOneStats.requests)} />
                 <StatCard label="Completed / failed / inconclusive" value={`${systemOneStats.outcomes.completed} / ${systemOneStats.outcomes.failed} / ${systemOneStats.outcomes.inconclusive}`} />
-                <StatCard label="Average call time" value={systemOneStats.logicalLatencyMsAverage === null ? 'Unknown' : `${systemOneStats.logicalLatencyMsAverage.toLocaleString()} ms`} />
-                <StatCard label="Token usage" value={`${formatTokenCount(systemOneStats.tokens.input)} in / ${formatTokenCount(systemOneStats.tokens.output)} out`} details={!systemOneStats.requests ? 'No recorded requests' : systemOneStats.tokens.unknownRequestCount ? `Usage unavailable for ${systemOneStats.tokens.unknownRequestCount} requests` : undefined} />
-                <StatCard label="Known cost" value={formatKnownCallCost(systemOneStats.costUsd)} details={!systemOneStats.requests ? 'No recorded requests' : systemOneStats.unknownCostRequestCount ? `${systemOneStats.unknownCostRequestCount} requests unpriced` : undefined} />
-                <StatCard label="HTTP dispatch time" value={formatDuration(systemOneStats.dispatchLatencyMsTotal / 1000)} details="Sum across requests" />
+                <StatCard label="Average call time" value={formatMs(systemOneStats.logicalLatencyMsAverage)} />
+                <StatCard label="Token usage" value={`${formatTokenCount(systemOneStats.tokens.input)} in / ${formatTokenCount(systemOneStats.tokens.output)} out`} details={!systemOneStats.requests ? 'No recorded requests' : systemOneStats.tokens.unknownRequestCount ? `Usage unavailable for ${requestCount(systemOneStats.tokens.unknownRequestCount)}` : undefined} />
+                <StatCard label="Known cost" value={formatKnownCallCost(systemOneStats.costUsd)} details={!systemOneStats.requests ? 'No recorded requests' : systemOneStats.unknownCostRequestCount ? `${requestCount(systemOneStats.unknownCostRequestCount)} unpriced` : undefined} />
+                <StatCard label="Average request time" value={formatMs(systemOneStats.dispatchLatencyMsAverage)} details="Per HTTP request" />
                 <StatCard label="Review refinements" value={`${systemOneStats.refinements.completed} / ${systemOneStats.refinements.attempted}`} details={`${systemOneStats.refinements.skipped} skipped, ${systemOneStats.refinements.inconclusive} inconclusive, ${systemOneStats.refinements.upstream_error} upstream errors`} />
               </div>
               {Object.keys(systemOneStats.reviewReasons).length > 0 && (
@@ -1377,7 +1363,7 @@ export default function StatsPage() {
       <div id="stats-cleanup" className="scroll-mt-28 bg-card rounded-lg border border-border p-4 sm:p-6 mb-6">
         <h2 className="text-lg font-semibold text-foreground mb-1">Pattern cleanup activity</h2>
         <p className="text-sm text-muted-foreground mb-3">
-          Uses the LLM spend filters above.
+          Uses the Spend filters above.
         </p>
         {cleanupStatsLoading && <SkeletonRows count={2} />}
         {cleanupStatsError && (
@@ -1492,7 +1478,7 @@ export default function StatsPage() {
       {sortedPodcasts.length > 0 && (
         <div className="hidden sm:block bg-card rounded-lg border border-border overflow-hidden">
           <h2 className="text-lg font-semibold text-foreground p-4 pb-2">All Podcasts</h2>
-          <div className="overflow-x-auto">
+          <div role="region" aria-label="Statistics table; scroll for more columns" tabIndex={0} className="overflow-x-auto">
             <table aria-label="Podcast totals" className="w-full">
               <thead className="bg-muted/50">
                 <tr>
@@ -1549,9 +1535,9 @@ function CleanupUsageCards({ title, usage }: { title: string; usage: CleanupStat
 
 function StatCard({ label, value, details }: { label: string; value: string; details?: ReactNode }) {
   return (
-    <div className="row-span-3 grid grid-rows-subgrid gap-y-0 bg-card rounded-lg border border-border p-3 sm:p-4">
-      <p className="text-sm text-muted-foreground">{label}</p>
-      <p className="text-xl font-bold tabular-nums text-foreground">{value}</p>
+    <div className="row-span-3 grid grid-rows-subgrid gap-y-0 bg-card rounded-lg border border-border p-4">
+      <p className={summaryLabel}>{label}</p>
+      <p className={`${summaryValue} text-foreground`}>{value}</p>
       {details && <p className="flex flex-wrap content-start gap-x-2 text-xs text-muted-foreground mt-1 [&>span]:whitespace-nowrap">{details}</p>}
     </div>
   );

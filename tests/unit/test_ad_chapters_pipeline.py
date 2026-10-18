@@ -26,6 +26,8 @@ from ad_chapters import AdChapterConfig, ID3_CHAPTER_SOURCE_KEY, public_chapters
 from id3_chapters import chapter_frames, read_tag
 from llm_client import ProviderRateLimitedError, clear_settings_cache
 from main_app import processing
+from main_app.pipeline import publish
+from main_app.pipeline import review, cuts, verify, failure
 from rate_limit_hold import hold_message
 from utils.time import utc_now_iso
 
@@ -83,18 +85,21 @@ def _run(monkeypatch, db, publisher_chapters, generator_chapters=None,
 
     monkeypatch.setattr(processing, 'db', db)
     monkeypatch.setattr(processing, 'storage', storage_mock)
-    monkeypatch.setattr(processing, 'probe_chapters',
+    monkeypatch.setattr(publish, 'probe_chapters',
                         MagicMock(return_value=publisher_chapters))
-    monkeypatch.setattr(processing, 'embed_chapters', embed_mock)
-    monkeypatch.setattr(processing, 'fetch_upstream_chapters',
+    monkeypatch.setattr(publish, 'embed_chapters', embed_mock)
+    monkeypatch.setattr(publish, 'fetch_upstream_chapters',
                         MagicMock(return_value=fetch_return))
-    monkeypatch.setattr(processing, 'get_replacement_duration', lambda: 2.0)
-    monkeypatch.setattr(processing, 'resolve_ad_chapter_config',
+    monkeypatch.setattr(review, 'get_replacement_duration', lambda: 2.0)
+    monkeypatch.setattr(cuts, 'get_replacement_duration', lambda: 2.0)
+    monkeypatch.setattr(verify, 'get_replacement_duration', lambda: 2.0)
+    monkeypatch.setattr(publish, 'get_replacement_duration', lambda: 2.0)
+    monkeypatch.setattr(publish, 'resolve_ad_chapter_config',
                         lambda db, row: ad_config)
     monkeypatch.setattr('transcript_generator.TranscriptGenerator', transcript_gen_class)
     monkeypatch.setattr(chapters_generator, 'ChaptersGenerator', generator_class)
 
-    processing._generate_assets(
+    publish._generate_assets(
         'example-podcast', 'a1b2c3d4e5f6', segments=[], all_cuts=[],
         episode_description='desc', podcast_name='Pod', episode_title='Title',
         regenerate_chapters=True, audio_path='/tmp/fake-processed.mp3',
@@ -266,12 +271,12 @@ _UNSET = object()
 def _post_regenerate(app_client, generated, ad_config=_UNSET):
     resolved = AD_CFG if ad_config is _UNSET else ad_config
     headers = _authed(app_client)
-    with patch('api.episodes.threading', SimpleNamespace(Thread=SyncThread)), \
-         patch('api.episodes.ChaptersGenerator') as generator, \
-         patch('api.episodes.embed_chapters', return_value=False), \
-         patch('api.episodes.resolve_ad_chapter_config',
+    with patch('api.episodes.chapters.threading', SimpleNamespace(Thread=SyncThread)), \
+         patch('api.episodes.chapters.ChaptersGenerator') as generator, \
+         patch('api.episodes.chapters.embed_chapters', return_value=False), \
+         patch('api.episodes.chapters.resolve_ad_chapter_config',
                lambda db, row: resolved), \
-         patch('main_app.processing._refresh_rss_for_slug'):
+         patch('main_app.pipeline.common._refresh_rss_for_slug'):
         generator.return_value.chapters_degraded = False
         if callable(generated):
             generator.return_value.generate_chapters.side_effect = generated
@@ -317,15 +322,15 @@ def test_manual_regeneration_clears_publisher_choice_and_recut_keeps_generated_t
     assert storage.get_chapters_json(SLUG, EPISODE_ID) == chosen
     monkeypatch.setattr(processing, 'db', seeded)
     monkeypatch.setattr(processing, 'storage', storage)
-    monkeypatch.setattr(processing, 'resolve_ad_chapter_config', lambda *args: None)
+    monkeypatch.setattr(publish, 'resolve_ad_chapter_config', lambda *args: None)
     source, _ = _long_fixture(tmp_path, 4)
     assert set(chapter_frames(read_tag(source))[0]) == {b'first', b'ad', b'last'}
     probe = MagicMock()
-    embed = MagicMock(wraps=processing.embed_chapters)
-    monkeypatch.setattr(processing, 'probe_chapters', probe)
-    monkeypatch.setattr(processing, 'embed_chapters', embed)
+    embed = MagicMock(wraps=publish.embed_chapters)
+    monkeypatch.setattr(publish, 'probe_chapters', probe)
+    monkeypatch.setattr(publish, 'embed_chapters', embed)
     pending = {}
-    processing._remap_stored_chapters(SLUG, EPISODE_ID, [], 1, [], 60,
+    publish._remap_stored_chapters(SLUG, EPISODE_ID, [], 1, [], 60,
                                      audio_path=source, audio_duration=60,
                                      pending_assets=pending)
     probe.assert_not_called()
@@ -340,10 +345,10 @@ def test_degraded_manual_regeneration_keeps_existing_chapters_and_recovers(app_c
     storage.save_chapters_json(SLUG, EPISODE_ID, existing)
     headers = _authed(app_client)
 
-    with patch('api.episodes.threading', SimpleNamespace(Thread=SyncThread)), \
-         patch('api.episodes.ChaptersGenerator') as generator, \
-         patch('api.episodes.embed_chapters') as embed, \
-         patch('main_app.processing._refresh_rss_for_slug') as refresh:
+    with patch('api.episodes.chapters.threading', SimpleNamespace(Thread=SyncThread)), \
+         patch('api.episodes.chapters.ChaptersGenerator') as generator, \
+         patch('api.episodes.chapters.embed_chapters') as embed, \
+         patch('main_app.pipeline.common._refresh_rss_for_slug') as refresh:
         generator.return_value.chapters_degraded = True
         generator.return_value.generate_chapters.return_value = {
             'version': '1.2.0', 'chapters': [{'startTime': 1, 'title': 'Fallback'}]}
@@ -392,10 +397,10 @@ def test_incomplete_titles_preserve_existing_chapters(app_client, seeded, monkey
     monkeypatch.setattr(chapters_generator, 'call_llm', lambda **kwargs: (
         SimpleNamespace(content=response), None))
     headers = _authed(app_client)
-    with patch('api.episodes.threading', SimpleNamespace(Thread=SyncThread)), \
-         patch('api.episodes.ChaptersGenerator', return_value=generator), \
-         patch('api.episodes.embed_chapters') as embed, \
-         patch('main_app.processing._refresh_rss_for_slug') as refresh:
+    with patch('api.episodes.chapters.threading', SimpleNamespace(Thread=SyncThread)), \
+         patch('api.episodes.chapters.ChaptersGenerator', return_value=generator), \
+         patch('api.episodes.chapters.embed_chapters') as embed, \
+         patch('main_app.pipeline.common._refresh_rss_for_slug') as refresh:
         result = app_client.post(
             f'/api/v1/feeds/{SLUG}/episodes/{EPISODE_ID}/regenerate-chapters', headers=headers)
 
@@ -452,7 +457,7 @@ def test_regenerate_endpoint_reports_the_run_on_the_episode(app_client, seeded):
     # Patch the module reference, not threading.Thread itself: a global patch
     # also breaks the rate limiter's expiry Timer on any concurrent request.
     thread = MagicMock()
-    with patch('api.episodes.threading', SimpleNamespace(Thread=thread)):
+    with patch('api.episodes.chapters.threading', SimpleNamespace(Thread=thread)):
         resp = app_client.post(
             f'/api/v1/feeds/{SLUG}/episodes/{EPISODE_ID}/regenerate-chapters',
             headers=headers)
@@ -508,10 +513,10 @@ def test_regen_job_records_the_hold_on_a_provider_rate_limit(app_client, seeded)
     error = ProviderRateLimitedError('resets in 900s', retry_after_seconds=900.0)
     seeded.set_setting('rate_limit_hold_enabled', 'true')
     try:
-        with patch('api.episodes.threading', SimpleNamespace(Thread=SyncThread)), \
-             patch('main_app.processing._resolve_or_load_route_snapshot',
+        with patch('api.episodes.chapters.threading', SimpleNamespace(Thread=SyncThread)), \
+             patch('main_app.pipeline.admission._resolve_or_load_route_snapshot',
                    return_value={'chapters': CHAPTERS_ROUTE}), \
-             patch('api.episodes.ChaptersGenerator') as generator, \
+             patch('api.episodes.chapters.ChaptersGenerator') as generator, \
              patch('rate_limit_hold.fire_queue_held_event') as fire, \
              patch('rate_limit_hold.get_llm_usage_url', lambda _db: ''):
             generator.return_value.generate_chapters.side_effect = error
@@ -554,15 +559,15 @@ def test_regen_job_under_an_active_hold_does_not_alert_again(app_client, seeded)
     error = ProviderRateLimitedError('resets in 900s', retry_after_seconds=900.0)
     seeded.set_setting('rate_limit_hold_enabled', 'true')
     try:
-        with patch('main_app.processing._resolve_or_load_route_snapshot',
+        with patch('main_app.pipeline.admission._resolve_or_load_route_snapshot',
                    return_value={'chapters': CHAPTERS_ROUTE}), \
-             patch('api.episodes.ChaptersGenerator') as generator, \
+             patch('api.episodes.chapters.ChaptersGenerator') as generator, \
              patch('rate_limit_hold.fire_queue_held_event') as fire, \
              patch('rate_limit_hold.get_llm_usage_url', lambda _db: ''):
             generator.return_value.generate_chapters.side_effect = error
             record_hold_until(seeded, CHAPTERS_ROUTE['provider_key'], active_until,
                               credential_slot=CHAPTERS_ROUTE['credential_slot'])
-            from api.episodes import _regenerate_chapters_job
+            from api.episodes.chapters import _regenerate_chapters_job
             _regenerate_chapters_job(SLUG, EPISODE_ID, stamp)
         held_until = get_hold_until(seeded, CHAPTERS_HOLD_KEY)
     finally:
@@ -667,12 +672,12 @@ def test_regenerate_merges_the_markers_as_of_the_save(app_client, seeded):
         seeded.save_episode_details(SLUG, EPISODE_ID, ad_markers=[])
         return {'version': '1.2.0', 'chapters': [{'startTime': 1, 'title': 'Intro'}]}
 
-    with patch('api.episodes.threading', SimpleNamespace(Thread=SyncThread)), \
-         patch('api.episodes.ChaptersGenerator') as generator, \
-         patch('api.episodes.embed_chapters', return_value=False), \
-         patch('api.episodes.resolve_ad_chapter_config',
+    with patch('api.episodes.chapters.threading', SimpleNamespace(Thread=SyncThread)), \
+         patch('api.episodes.chapters.ChaptersGenerator') as generator, \
+         patch('api.episodes.chapters.embed_chapters', return_value=False), \
+         patch('api.episodes.chapters.resolve_ad_chapter_config',
                lambda db, row: AD_CFG), \
-         patch('main_app.processing._refresh_rss_for_slug'):
+         patch('main_app.pipeline.common._refresh_rss_for_slug'):
         generator.return_value.generate_chapters.side_effect = reject_the_marker
         resp = app_client.post(
             f'/api/v1/feeds/{SLUG}/episodes/{EPISODE_ID}/regenerate-chapters',
@@ -695,9 +700,9 @@ def test_regenerate_does_not_save_once_its_stamp_was_taken_over(app_client, seed
         conn.commit()
         return {'version': '1.2.0', 'chapters': [{'startTime': 1, 'title': 'Intro'}]}
 
-    with patch('api.episodes.threading', SimpleNamespace(Thread=SyncThread)), \
-         patch('api.episodes.ChaptersGenerator') as generator, \
-         patch('main_app.processing._refresh_rss_for_slug'):
+    with patch('api.episodes.chapters.threading', SimpleNamespace(Thread=SyncThread)), \
+         patch('api.episodes.chapters.ChaptersGenerator') as generator, \
+         patch('main_app.pipeline.common._refresh_rss_for_slug'):
         generator.return_value.generate_chapters.side_effect = take_the_stamp_over
         resp = app_client.post(
             f'/api/v1/feeds/{SLUG}/episodes/{EPISODE_ID}/regenerate-chapters',
@@ -714,7 +719,7 @@ def test_regenerate_does_not_save_once_its_stamp_was_taken_over(app_client, seed
 def test_regenerate_endpoint_reports_a_thread_that_will_not_start(app_client, seeded):
     """A refused thread leaves no stamp behind for the 15 minute takeover."""
     refuses = SimpleNamespace(Thread=MagicMock(side_effect=RuntimeError('no threads')))
-    with patch('api.episodes.threading', refuses):
+    with patch('api.episodes.chapters.threading', refuses):
         resp = app_client.post(
             f'/api/v1/feeds/{SLUG}/episodes/{EPISODE_ID}/regenerate-chapters',
             headers=_authed(app_client))
@@ -730,11 +735,11 @@ def test_regen_job_records_the_error_when_the_hold_write_fails(app_client, seede
     error = ProviderRateLimitedError('resets in 900s', retry_after_seconds=900.0)
     stamp = seeded.claim_chapters_regen(SLUG, EPISODE_ID)
 
-    with patch('api.episodes.ChaptersGenerator') as generator, \
-         patch('api.episodes.hold_queue_for_provider_limit',
+    with patch('api.episodes.chapters.ChaptersGenerator') as generator, \
+         patch('api.episodes.chapters.hold_queue_for_provider_limit',
                side_effect=RuntimeError('settings write failed')):
         generator.return_value.generate_chapters.side_effect = error
-        from api.episodes import _regenerate_chapters_job
+        from api.episodes.chapters import _regenerate_chapters_job
         _regenerate_chapters_job(SLUG, EPISODE_ID, stamp)
 
     row = seeded.get_episode(SLUG, EPISODE_ID)
@@ -744,7 +749,9 @@ def test_regen_job_records_the_error_when_the_hold_write_fails(app_client, seede
 
 def test_chapter_step_publishes_ad_chapters_when_the_hold_write_fails(monkeypatch):
     """The audio is already cut; a failed hold write must not cost it its chapters."""
-    monkeypatch.setattr(processing, 'hold_queue_for_provider_limit',
+    monkeypatch.setattr(publish, 'hold_queue_for_provider_limit',
+                        MagicMock(side_effect=RuntimeError('settings write failed')))
+    monkeypatch.setattr(failure, 'hold_queue_for_provider_limit',
                         MagicMock(side_effect=RuntimeError('settings write failed')))
     storage_mock, embed_mock, _ = _run(
         monkeypatch, _db(chapters_mode='generate'), publisher_chapters=[],
@@ -771,7 +778,7 @@ def test_regenerate_runs_under_the_chapters_route_and_a_run_id(app_client, seede
         seen['route'] = run_context.route_for_phase('chapters')
         return {'version': '1.2.0', 'chapters': [{'startTime': 0, 'title': 'One'}]}
 
-    with patch('main_app.processing._resolve_or_load_route_snapshot',
+    with patch('main_app.pipeline.admission._resolve_or_load_route_snapshot',
                return_value=snapshot) as resolve:
         resp = _post_regenerate(app_client, capture)
 
@@ -817,7 +824,7 @@ def test_regenerate_records_own_history_and_log_with_ledger_totals(
             provider_reported_cost_usd=0.42)
         return {'version': '1.2.0', 'chapters': [{'startTime': 1, 'title': 'Intro'}]}
 
-    with patch('main_app.processing._resolve_or_load_route_snapshot',
+    with patch('main_app.pipeline.admission._resolve_or_load_route_snapshot',
                return_value={'chapters': CHAPTERS_ROUTE}):
         response = _post_regenerate(app_client, generate)
 
@@ -862,7 +869,7 @@ def test_failed_regeneration_records_history_and_log(app_client, seeded, monkeyp
     def fail(*_args, **_kwargs):
         raise RuntimeError('chapter failure')
 
-    with patch('main_app.processing._resolve_or_load_route_snapshot',
+    with patch('main_app.pipeline.admission._resolve_or_load_route_snapshot',
                return_value={'chapters': CHAPTERS_ROUTE}):
         response = _post_regenerate(app_client, fail)
 
@@ -883,7 +890,7 @@ def test_successful_regeneration_respects_disabled_episode_logs(app_client, seed
     seeded.update_podcast(SLUG, episode_logs='off')
     monkeypatch.setattr(processing, 'db', seeded)
     monkeypatch.setattr(processing, 'storage', get_storage())
-    with patch('main_app.processing._resolve_or_load_route_snapshot',
+    with patch('main_app.pipeline.admission._resolve_or_load_route_snapshot',
                return_value={'chapters': CHAPTERS_ROUTE}):
         response = _post_regenerate(
             app_client, {'version': '1.2.0', 'chapters': [
@@ -912,7 +919,7 @@ def test_manual_native_chapters_reject_before_claim_thread_or_log_mutation(app_c
         headers = _authed(app_client)
         thread = MagicMock()
         with patch.object(seeded, 'claim_chapters_regen') as claim, \
-                patch('api.episodes.threading', SimpleNamespace(Thread=thread)):
+                patch('api.episodes.chapters.threading', SimpleNamespace(Thread=thread)):
             response = app_client.post(
                 f'/api/v1/feeds/{SLUG}/episodes/{EPISODE_ID}/regenerate-chapters', headers=headers)
         assert response.status_code == 400

@@ -16,11 +16,8 @@ from tests.app_bootstrap import bootstrap
 _test_data_dir = bootstrap('whisper_conn_test_', passphrase='whisper-conn-test-pass')
 
 from main_app import app  # noqa: E402
-from transcriber import (  # noqa: E402
-    _probe_wav_bytes,
-    _probe_upload,
-    probe_transcription_endpoint,
-)
+from transcriber.common import probe_wav_bytes
+from transcriber.remote import _probe_upload, probe_transcription_endpoint
 from utils.connection_probe import PROBE_RESPONSE_CAP_BYTES  # noqa: E402
 from utils.url import SSRFError  # noqa: E402
 
@@ -63,7 +60,7 @@ def _response(status, body=b'', json_body=None):
 
 class TestProbeWav:
     def test_is_valid_wav(self):
-        data = _probe_wav_bytes()
+        data = probe_wav_bytes()
         with wave.open(io.BytesIO(data), 'rb') as w:
             assert w.getnchannels() == 1
             assert w.getsampwidth() == 2
@@ -73,14 +70,14 @@ class TestProbeWav:
     def test_is_not_suspiciously_small(self):
         # The real upload path refuses files under 1024 bytes; the probe
         # should stay comfortably above any similar server-side floor.
-        assert len(_probe_wav_bytes()) > 1024
+        assert len(probe_wav_bytes()) > 1024
 
 
 class TestProbeUpload:
     def test_skip_flac_sends_wav(self):
         filename, audio = _probe_upload(skip_flac_compression=True)
         assert filename == 'probe.wav'
-        assert audio == _probe_wav_bytes()
+        assert audio == probe_wav_bytes()
 
     def test_flac_mode_encodes(self):
         def fake_ffmpeg(cmd, **kwargs):
@@ -99,12 +96,12 @@ class TestProbeUpload:
                    return_value=MagicMock(returncode=1)):
             filename, audio = _probe_upload(skip_flac_compression=False)
         assert filename == 'probe.wav'
-        assert audio == _probe_wav_bytes()
+        assert audio == probe_wav_bytes()
 
 
 class TestProbeTranscriptionEndpoint:
     def test_success_json_response(self):
-        with patch('transcriber.safe_post',
+        with patch('transcriber.remote.safe_post',
                    return_value=_response(200, json_body={'text': ''})) as sp:
             result = probe_transcription_endpoint(
                 'http://transcriber:8001/v3', api_key='sk-x', model='whisper-1')
@@ -120,13 +117,13 @@ class TestProbeTranscriptionEndpoint:
         assert sp.call_args[1]['files']['file'][0] == 'probe.wav'
 
     def test_trailing_slash_stripped(self):
-        with patch('transcriber.safe_post',
+        with patch('transcriber.remote.safe_post',
                    return_value=_response(200, json_body={})) as sp:
             probe_transcription_endpoint('http://transcriber:8001/v3/')
         assert sp.call_args[0][0] == 'http://transcriber:8001/v3/audio/transcriptions'
 
     def test_no_key_sends_no_auth_header(self):
-        with patch('transcriber.safe_post',
+        with patch('transcriber.remote.safe_post',
                    return_value=_response(200, json_body={})) as sp:
             probe_transcription_endpoint('http://transcriber:8001/v3')
         assert 'Authorization' not in sp.call_args[1]['headers']
@@ -138,14 +135,14 @@ class TestProbeTranscriptionEndpoint:
             return MagicMock(returncode=0)
 
         with patch('transcriber.utils.subprocess_registry.tracked_run', side_effect=fake_ffmpeg), \
-             patch('transcriber.safe_post',
+             patch('transcriber.remote.safe_post',
                    return_value=_response(200, json_body={})) as sp:
             probe_transcription_endpoint('http://transcriber:8001/v3',
                                          skip_flac_compression=False)
         assert sp.call_args[1]['files']['file'][0] == 'probe.flac'
 
     def test_200_non_json_is_not_ok(self):
-        with patch('transcriber.safe_post',
+        with patch('transcriber.remote.safe_post',
                    return_value=_response(200, body=b'<html>hi</html>')):
             result = probe_transcription_endpoint('http://some-web-server')
         assert result['ok'] is False
@@ -154,14 +151,14 @@ class TestProbeTranscriptionEndpoint:
 
     def test_200_oversized_body_is_not_ok(self):
         huge = b'x' * (PROBE_RESPONSE_CAP_BYTES + 1)
-        with patch('transcriber.safe_post',
+        with patch('transcriber.remote.safe_post',
                    return_value=_response(200, body=huge)):
             result = probe_transcription_endpoint('http://some-file-server')
         assert result['ok'] is False
         assert result['reachable'] is True
 
     def test_401_points_at_api_key(self):
-        with patch('transcriber.safe_post', return_value=_response(401)):
+        with patch('transcriber.remote.safe_post', return_value=_response(401)):
             result = probe_transcription_endpoint('http://transcriber:8001/v3')
         assert result['ok'] is False
         assert result['reachable'] is True
@@ -169,20 +166,20 @@ class TestProbeTranscriptionEndpoint:
         assert 'API key' in result['detail']
 
     def test_401_with_key_names_saved_key(self):
-        with patch('transcriber.safe_post', return_value=_response(401)):
+        with patch('transcriber.remote.safe_post', return_value=_response(401)):
             result = probe_transcription_endpoint('http://transcriber:8001/v3',
                                                   api_key='sk-x')
         assert 'rejected the saved API key' in result['detail']
 
     def test_404_points_at_path(self):
-        with patch('transcriber.safe_post', return_value=_response(404)):
+        with patch('transcriber.remote.safe_post', return_value=_response(404)):
             result = probe_transcription_endpoint('http://transcriber:8001/wrong')
         assert result['ok'] is False
         assert result['reachable'] is True
         assert '/v3' in result['detail']
 
     def test_400_includes_body_snippet(self):
-        with patch('transcriber.safe_post',
+        with patch('transcriber.remote.safe_post',
                    return_value=_response(400, body=b'{"error": "unsupported model"}')):
             result = probe_transcription_endpoint('http://transcriber:8001/v3')
         assert result['ok'] is False
@@ -190,13 +187,13 @@ class TestProbeTranscriptionEndpoint:
         assert 'unsupported model' in result['detail']
 
     def test_error_snippet_truncated(self):
-        with patch('transcriber.safe_post',
+        with patch('transcriber.remote.safe_post',
                    return_value=_response(500, body=b'x' * 5000)):
             result = probe_transcription_endpoint('http://transcriber:8001/v3')
         assert len(result['detail']) < 400
 
     def test_connection_error_unreachable(self):
-        with patch('transcriber.safe_post',
+        with patch('transcriber.remote.safe_post',
                    side_effect=requests_lib.ConnectionError('refused')):
             result = probe_transcription_endpoint('http://transcriber:8001/v3')
         assert result['ok'] is False
@@ -204,7 +201,7 @@ class TestProbeTranscriptionEndpoint:
         assert 'connect' in result['detail'].lower()
 
     def test_connect_timeout_unreachable(self):
-        with patch('transcriber.safe_post',
+        with patch('transcriber.remote.safe_post',
                    side_effect=requests_lib.ConnectTimeout('slow handshake')):
             result = probe_transcription_endpoint('http://transcriber:8001/v3')
         assert result['ok'] is False
@@ -213,7 +210,7 @@ class TestProbeTranscriptionEndpoint:
     def test_read_timeout_is_reachable(self):
         # The connection succeeded; inference was just slow (e.g. a server
         # cold-loading its model). Must not present as "server down".
-        with patch('transcriber.safe_post',
+        with patch('transcriber.remote.safe_post',
                    side_effect=requests_lib.ReadTimeout('slow inference')):
             result = probe_transcription_endpoint('http://transcriber:8001/v3')
         assert result['ok'] is False
@@ -221,7 +218,7 @@ class TestProbeTranscriptionEndpoint:
         assert 'try again' in result['detail']
 
     def test_ssrf_rejected(self):
-        with patch('transcriber.safe_post', side_effect=SSRFError('nope')):
+        with patch('transcriber.remote.safe_post', side_effect=SSRFError('nope')):
             result = probe_transcription_endpoint('http://169.254.169.254/v1')
         assert result['ok'] is False
         assert result['reachable'] is False
@@ -243,18 +240,18 @@ class TestEndpoint:
     def test_empty_body_base_url_never_falls_back_to_saved(self, client):
         # The form always sends the field's current value; an empty field
         # must not silently probe the previously saved URL.
-        with patch('api.providers.transcriber._get_whisper_settings',
+        with patch('api.providers.transcriber.settings._get_whisper_settings',
                    return_value=dict(SAVED)), \
-             patch('api.providers.transcriber.probe_transcription_endpoint') as probe:
+             patch('api.providers.transcriber.remote.probe_transcription_endpoint') as probe:
             r = self._post(client, {'baseUrl': '', 'model': 'whisper-1'})
         assert r.status_code == 200
         assert 'base URL' in r.get_json()['detail']
         probe.assert_not_called()
 
     def test_body_values_reach_probe(self, client):
-        with patch('api.providers.transcriber._get_whisper_settings',
+        with patch('api.providers.transcriber.settings._get_whisper_settings',
                    return_value=dict(SAVED)), \
-             patch('api.providers.transcriber.probe_transcription_endpoint',
+             patch('api.providers.transcriber.remote.probe_transcription_endpoint',
                    return_value={'ok': True, 'reachable': True,
                                  'status': 200, 'detail': 'Connected.'}) as probe:
             r = self._post(client, {'baseUrl': 'http://transcriber:8001/v3',
@@ -269,9 +266,9 @@ class TestEndpoint:
 
     def test_saved_key_sent_only_to_saved_server(self, client):
         # Same scheme/host/port as the saved base URL: key goes out.
-        with patch('api.providers.transcriber._get_whisper_settings',
+        with patch('api.providers.transcriber.settings._get_whisper_settings',
                    return_value=dict(SAVED)), \
-             patch('api.providers.transcriber.probe_transcription_endpoint',
+             patch('api.providers.transcriber.remote.probe_transcription_endpoint',
                    return_value={'ok': True, 'reachable': True,
                                  'status': 200, 'detail': 'Connected.'}) as probe:
             self._post(client, {'baseUrl': 'http://transcriber:8001/v1'})
@@ -280,9 +277,9 @@ class TestEndpoint:
     def test_saved_key_withheld_from_other_server(self, client):
         # Different host: the stored key must not be exfiltratable by
         # "testing" an attacker-controlled URL.
-        with patch('api.providers.transcriber._get_whisper_settings',
+        with patch('api.providers.transcriber.settings._get_whisper_settings',
                    return_value=dict(SAVED)), \
-             patch('api.providers.transcriber.probe_transcription_endpoint',
+             patch('api.providers.transcriber.remote.probe_transcription_endpoint',
                    return_value={'ok': True, 'reachable': True,
                                  'status': 200, 'detail': 'Connected.'}) as probe:
             self._post(client, {'baseUrl': 'http://evil.example.com/v3'})
@@ -314,12 +311,12 @@ class TestEndpoint:
         assert r.status_code == 400
 
     def test_detail_gains_health_clause_when_backend_reports_health(self, client):
-        with patch('api.providers.transcriber._get_whisper_settings',
+        with patch('api.providers.transcriber.settings._get_whisper_settings',
                    return_value=dict(SAVED)), \
-             patch('api.providers.transcriber.probe_transcription_endpoint',
+             patch('api.providers.transcriber.remote.probe_transcription_endpoint',
                    return_value={'ok': True, 'reachable': True,
                                  'status': 200, 'detail': 'Connected.'}), \
-             patch('api.providers.transcriber.probe_whisper_health',
+             patch('api.providers.transcriber.remote.probe_whisper_health',
                    return_value={
                        'available': True,
                        'instances': [
@@ -336,12 +333,12 @@ class TestEndpoint:
         assert health.call_args.kwargs['api_key'] == 'sk-saved'
 
     def test_detail_states_an_exact_count_when_sampling_converged(self, client):
-        with patch('api.providers.transcriber._get_whisper_settings',
+        with patch('api.providers.transcriber.settings._get_whisper_settings',
                    return_value=dict(SAVED)), \
-             patch('api.providers.transcriber.probe_transcription_endpoint',
+             patch('api.providers.transcriber.remote.probe_transcription_endpoint',
                    return_value={'ok': True, 'reachable': True,
                                  'status': 200, 'detail': 'Connected.'}), \
-             patch('api.providers.transcriber.probe_whisper_health',
+             patch('api.providers.transcriber.remote.probe_whisper_health',
                    return_value={
                        'available': True,
                        'instances': [{'instance': 'whisper-1', 'model': 'large-v3'}],
@@ -353,12 +350,12 @@ class TestEndpoint:
     def test_detail_reports_disagreement_instead_of_one_replica_model(self, client):
         # Must not echo instances[0]'s model as if the fleet were uniform;
         # Settings warns about the same mismatch from this payload.
-        with patch('api.providers.transcriber._get_whisper_settings',
+        with patch('api.providers.transcriber.settings._get_whisper_settings',
                    return_value=dict(SAVED)), \
-             patch('api.providers.transcriber.probe_transcription_endpoint',
+             patch('api.providers.transcriber.remote.probe_transcription_endpoint',
                    return_value={'ok': True, 'reachable': True,
                                  'status': 200, 'detail': 'Connected.'}), \
-             patch('api.providers.transcriber.probe_whisper_health',
+             patch('api.providers.transcriber.remote.probe_whisper_health',
                    return_value={
                        'available': True,
                        'instances': [
@@ -372,12 +369,12 @@ class TestEndpoint:
             'Connected. 2 instances, disagreeing on model, compute type.')
 
     def test_detail_unchanged_when_health_unavailable(self, client):
-        with patch('api.providers.transcriber._get_whisper_settings',
+        with patch('api.providers.transcriber.settings._get_whisper_settings',
                    return_value=dict(SAVED)), \
-             patch('api.providers.transcriber.probe_transcription_endpoint',
+             patch('api.providers.transcriber.remote.probe_transcription_endpoint',
                    return_value={'ok': True, 'reachable': True,
                                  'status': 200, 'detail': 'Connected.'}), \
-             patch('api.providers.transcriber.probe_whisper_health',
+             patch('api.providers.transcriber.remote.probe_whisper_health',
                    return_value={'available': False}):
             r = self._post(client, {'baseUrl': 'http://transcriber:8001/v3'})
         assert r.get_json()['detail'] == 'Connected.'

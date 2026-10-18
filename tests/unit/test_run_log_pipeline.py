@@ -14,6 +14,9 @@ from tests.app_bootstrap import bootstrap
 _data_dir = bootstrap('run_log_pipeline_test_', reset_storage=True)
 
 import main_app.processing as processing  # noqa: E402
+from main_app.pipeline import finalize
+from main_app.pipeline import common, transcribe, signals, detect, review, cuts, verify, publish, failure
+from main_app.pipeline import recut
 import run_context  # noqa: E402
 import run_log  # noqa: E402
 from ad_detector import AdDetector  # noqa: E402
@@ -40,36 +43,41 @@ def _run_pipeline(fail=False):
         p(processing, 'status_service')
         p(processing, 'start_episode_token_tracking')
         p(processing, 'get_available_memory_gb', return_value=None)
-        p(processing, 'get_min_cut_confidence', return_value=0.8)
+        p(finalize, 'get_available_memory_gb', return_value=None)
+        p(common, 'get_min_cut_confidence', return_value=0.8)
         p(processing.ad_detector, 'get_model', return_value='test-model')
         p(processing.ad_detector, 'get_verification_model', return_value='test-model')
         if fail:
-            p(processing, '_download_and_transcribe',
+            p(transcribe, '_download_and_transcribe',
               side_effect=RuntimeError('transcription exploded'))
         else:
-            p(processing, '_download_and_transcribe',
+            p(transcribe, '_download_and_transcribe',
               return_value=('/tmp/run-log.mp3', SEGMENTS))
-        p(processing, '_run_differential_fetch', return_value=None)
-        p(processing, '_run_audio_analysis', return_value=None)
+        p(signals, '_run_differential_fetch', return_value=None)
+        p(signals, '_run_audio_analysis', return_value=None)
         p(processing, 'load_positional_prior', return_value=None)
-        p(processing, '_detect_ads_first_pass', return_value=([], 0, None))
-        p(processing, '_refine_and_validate', return_value=([], []))
-        p(processing, '_run_ad_reviewer', return_value=([], []))
-        p(processing, '_snap_terminal_starts', return_value=[])
-        p(processing, '_complete_cut_tails', return_value=[])
+        p(detect, '_detect_ads_first_pass', return_value=([], 0, None))
+        p(detect, '_refine_and_validate', return_value=([], []))
+        p(review, '_run_ad_reviewer', return_value=([], []))
+        p(cuts, '_snap_terminal_starts', return_value=[])
+        p(cuts, '_complete_cut_tails', return_value=[])
         local_ap_cls = p(processing, 'AudioProcessor')
-        p(processing, '_run_verification_pass',
+        p(recut, 'AudioProcessor', new=local_ap_cls)
+        p(verify, '_run_verification_pass',
           return_value=(0, [], [], [], '/tmp/cut.mp3', 0, True, 0))
-        p(processing, '_generate_assets')
-        p(processing, '_persist_episode_state')
-        p(processing, '_refresh_rss_for_slug')
-        p(processing, '_log_completion_summary',
+        p(publish, '_generate_assets')
+        p(finalize, '_persist_episode_state')
+        p(common, '_refresh_rss_for_slug')
+        p(finalize, '_log_completion_summary',
           return_value={'input_tokens': 0, 'output_tokens': 0, 'cost': 0.0})
-        p(processing, 'get_episode_token_totals',
+        p(finalize, 'get_episode_token_totals',
           return_value={'input_tokens': 0, 'output_tokens': 0, 'cost': 0.0})
-        p(processing, 'fire_event')
-        p(processing, '_maybe_fire_low_ad_yield_action')
-        p(processing, '_maybe_enqueue_degraded_redetect')
+        p(failure, 'get_episode_token_totals',
+          return_value={'input_tokens': 0, 'output_tokens': 0, 'cost': 0.0})
+        p(finalize, 'fire_event')
+        p(failure, 'fire_event')
+        p(finalize, '_maybe_fire_low_ad_yield_action')
+        p(finalize, '_maybe_enqueue_degraded_redetect')
         p(processing.shutil, 'move')
         p(processing.os, 'unlink')
         p(processing.os.path, 'exists', return_value=False)
@@ -140,9 +148,10 @@ class TestFallbackFailurePath:
                 processing, 'process_episode',
                 side_effect=RuntimeError('handler itself exploded')))
             stack.enter_context(patch.object(processing, 'status_service'))
-            stack.enter_context(patch.object(
-                processing, 'get_episode_token_totals',
-                return_value={'input_tokens': 0, 'output_tokens': 0, 'cost': 0.0}))
+            for stage in (finalize, failure):
+                stack.enter_context(patch.object(
+                    stage, 'get_episode_token_totals',
+                    return_value={'input_tokens': 0, 'output_tokens': 0, 'cost': 0.0}))
             processing._process_episode_background(
                 SLUG, EPISODE_ID, 'https://example.com/ep1.mp3',
                 'Run Log Episode', 'Run Log Feed', None, None)
@@ -172,7 +181,7 @@ class TestThinkingNoticeHistory:
         }
         try:
             ctx.add_thinking_notice('run-a', notice)
-            processing._record_history_row(
+            finalize._record_history_row(
                 db, SLUG, EPISODE_ID, 'One', 'Run Log Feed', 'completed',
                 1.0, 0,
                 {'input_tokens': 0, 'output_tokens': 0, 'cost': 0.0},
@@ -210,7 +219,7 @@ class TestRecordHistoryRowUsesLedgerTotals:
 
             # A stale accumulator snapshot passed as token_totals must be
             # ignored once a run_id is bound: the ledger sum wins.
-            processing._record_history_row(
+            finalize._record_history_row(
                 db, SLUG, EPISODE_ID, 'One', 'Run Log Feed', 'completed',
                 1.0, 0,
                 {'input_tokens': 999999, 'output_tokens': 999999, 'cost': 999.0},
@@ -236,7 +245,7 @@ class TestSlotGuard:
                 podcast_title='Run Log Feed', episode_id=EPISODE_ID,
                 episode_title='One', status='completed')
 
-            processing._finalize_run_log(db, history_id, SLUG, EPISODE_ID)
+            finalize._finalize_run_log(db, history_id, SLUG, EPISODE_ID)
         finally:
             other.detach()
             other.discard()
@@ -297,7 +306,6 @@ class TestWorkerThreadRegistration:
         worker_logger = logging.getLogger('podcast.test.chunks')
         worker_logger.setLevel(logging.INFO)
         fake = MagicMock()
-        fake.filter_hallucinations.side_effect = lambda segments: segments
         fake._transcribe_via_api.side_effect = (
             lambda *a, **k: (worker_logger.info('chunk failed without a tag'),
                              [{'start': 0.0, 'end': 1.0, 'text': 'hi'}])[1])
@@ -305,7 +313,7 @@ class TestWorkerThreadRegistration:
         ctx = run_context.begin('w-feed', 'w-ep')
         recorder.attach()
         try:
-            with patch.object(transcriber_mod, 'extract_audio_chunk',
+            with patch.object(transcriber_mod.chunking, 'extract_audio_chunk',
                               return_value='/tmp/does-not-exist.flac'):
                 transcriber_mod.Transcriber._transcribe_chunked_parallel_api(
                     fake, '/tmp/audio.mp3', 1800.0,
@@ -325,7 +333,7 @@ class TestWorkerThreadRegistration:
         reviewer = MagicMock()
         reviewer._review_single.side_effect = (
             lambda **kwargs: (worker_logger.info('reviewing without a tag'),
-                              ('verdict', kwargs['ad']))[1])
+                              (MagicMock(), kwargs['ad']))[1])
 
         ctx = run_context.begin('w-feed', 'w-ep')
         recorder.attach()

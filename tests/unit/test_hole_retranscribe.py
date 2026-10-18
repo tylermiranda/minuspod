@@ -16,6 +16,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 import main_app.processing as processing
+from main_app.pipeline import common, transcribe
 import transcriber as transcriber_mod
 from transcriber import Transcriber
 from utils import audio as audio_utils
@@ -51,7 +52,7 @@ def _repair(tmp_path, segments, decoded, volume=-20.0, min_s=8.0, skip=()):
     else:
         decode.side_effect = lambda *a: [dict(s, words=[dict(w) for w in s['words']])
                                          for s in decoded] if decoded is not None else None
-    with patch.object(transcriber_mod, 'extract_audio_chunk', side_effect=_extract), \
+    with patch.object(transcriber_mod.chunking, 'extract_audio_chunk', side_effect=_extract), \
          patch.object(audio_utils, 'mean_volume_db', return_value=volume) as probe, \
          patch.object(Transcriber, '_transcribe_sequential', decode):
         added, empty = Transcriber().repair_gaps(
@@ -155,7 +156,7 @@ def _hole_min(setting):
     mock_db.get_setting.return_value = setting
     with patch.object(processing, 'transcriber', mock_t), \
          patch.object(processing, 'db', mock_db):
-        processing._retranscribe_holes_no_vad('/audio.mp3', _production_shape(), None)
+        transcribe._retranscribe_holes_no_vad('/audio.mp3', _production_shape(), None)
     return mock_t.repair_gaps.call_args.args[2]
 
 
@@ -172,11 +173,11 @@ def test_sequential_decode_uses_the_base_model_without_batching():
     word = MagicMock(word='hi', start=0.1, end=0.4)
     seg = MagicMock(start=0.0, end=0.5, text=' hi ', words=[word])
     base.transcribe.return_value = (iter([seg]), MagicMock())
-    with patch.object(transcriber_mod, '_get_whisper_settings',
+    with patch.object(transcriber_mod.settings, '_get_whisper_settings',
                       return_value={'backend': 'local', 'language': 'en'}), \
-         patch.object(transcriber_mod.WhisperModelSingleton, 'get_instance',
+         patch.object(transcriber_mod.local.WhisperModelSingleton, 'get_instance',
                       return_value=(base, batched)), \
-         patch.object(transcriber_mod, '_record_local_transcription_outcome') as record, \
+         patch.object(transcriber_mod.local, '_record_local_transcription_outcome') as record, \
          patch.object(Transcriber, 'preprocess_audio', return_value=None), \
          patch.object(Transcriber, 'get_audio_duration') as probe:
         t = Transcriber()
@@ -196,11 +197,11 @@ def test_sequential_decode_uses_the_base_model_without_batching():
 def test_sequential_decode_failure_keeps_the_main_run_stats():
     base = MagicMock()
     base.transcribe.side_effect = RuntimeError('decoder broke')
-    with patch.object(transcriber_mod, '_get_whisper_settings',
+    with patch.object(transcriber_mod.settings, '_get_whisper_settings',
                       return_value={'backend': 'local', 'language': 'en'}), \
-         patch.object(transcriber_mod.WhisperModelSingleton, 'get_instance',
+         patch.object(transcriber_mod.local.WhisperModelSingleton, 'get_instance',
                       return_value=(base, MagicMock())), \
-         patch.object(transcriber_mod, '_record_local_transcription_outcome') as record, \
+         patch.object(transcriber_mod.local, '_record_local_transcription_outcome') as record, \
          patch.object(Transcriber, 'preprocess_audio', return_value=None):
         t = Transcriber()
         t.last_transcription_stats = {'outcome': 'success'}
@@ -210,7 +211,7 @@ def test_sequential_decode_failure_keeps_the_main_run_stats():
 
 
 def test_sequential_decode_on_the_api_backend_disables_vad():
-    with patch.object(transcriber_mod, '_get_whisper_settings',
+    with patch.object(transcriber_mod.settings, '_get_whisper_settings',
                       return_value={'backend': transcriber_mod.WHISPER_BACKEND_API}), \
          patch.object(Transcriber, '_transcribe_via_api', return_value=[]) as api:
         Transcriber()._transcribe_sequential('/hole.wav', 'de')
@@ -236,12 +237,12 @@ def _reuse(tmp_path, holes):
          patch.object(processing, 'db', mock_db), \
          patch.object(processing, 'transcriber', mock_t), \
          patch.object(processing, 'sponsor_service', mock_sponsor), \
-         patch.object(processing, '_copy_retained_original_to_temp',
+         patch.object(common, '_copy_retained_original_to_temp',
                       return_value='/tmp/work.mp3'), \
-         patch.object(processing, 'get_feed_language_override',
+         patch.object(transcribe, 'get_feed_language_override',
                       return_value=None), \
-         patch.object(processing, '_retranscribe_tail_no_vad', return_value=[]):
-        _, segments = processing._download_and_transcribe(
+         patch.object(transcribe, '_retranscribe_tail_no_vad', return_value=[]):
+        _, segments = transcribe._download_and_transcribe(
             'show', 'ep1', 'http://example.com/e.mp3')
     return segments, mock_storage, mock_db, mock_t
 
@@ -291,11 +292,11 @@ def test_first_run_writes_originals_once_and_records_empty_holes():
          patch.object(processing, 'transcriber', mock_t), \
          patch.object(processing, 'sponsor_service', mock_sponsor), \
          patch.object(processing, 'status_service', MagicMock()), \
-         patch.object(processing, 'get_feed_language_override', return_value=None), \
-         patch.object(processing, '_retranscribe_holes_no_vad',
+         patch.object(transcribe, 'get_feed_language_override', return_value=None), \
+         patch.object(transcribe, '_retranscribe_holes_no_vad',
                       return_value=([], empty)) as holes, \
-         patch.object(processing, '_retranscribe_tail_no_vad', return_value=[]):
-        processing._download_and_transcribe('show', 'ep1', 'http://example.com/e.mp3')
+         patch.object(transcribe, '_retranscribe_tail_no_vad', return_value=[]):
+        transcribe._download_and_transcribe('show', 'ep1', 'http://example.com/e.mp3')
     assert holes.call_args.args[3] == ()
     mock_storage.save_original_transcript.assert_called_once_with('show', 'ep1', 'joined')
     mock_storage.save_original_segments.assert_called_once_with('show', 'ep1', base)

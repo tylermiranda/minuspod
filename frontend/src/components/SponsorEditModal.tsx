@@ -1,4 +1,5 @@
-import { useState } from 'react';
+import { useDraftClose } from '../hooks/useDraftClose';
+import { useId, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { addSponsor, updateSponsor } from '../api/sponsors';
 import { getTagVocabulary, updateSponsorTags } from '../api/community';
@@ -7,7 +8,7 @@ import { getErrorMessage } from '../api/client';
 import { btnOutline, btnPrimary } from './buttonStyles';
 import { Modal } from './Modal';
 import Checkbox from './Checkbox';
-import { focusRing, selectBase } from './fieldStyles';
+import { focusRing, inputBase, selectBase } from './fieldStyles';
 import { SEGMENT_CATEGORIES, SEGMENT_CATEGORY_LABELS, type SegmentCategory } from '../utils/segmentCategory';
 import { badgeBase, tint } from './badgeStyles';
 
@@ -21,6 +22,7 @@ interface Props {
 function SponsorEditModal({ sponsor, onClose, onSaved }: Props) {
   const queryClient = useQueryClient();
   const isNew = sponsor === null;
+  const fieldId = useId();
 
   const [name, setName] = useState(sponsor?.name ?? '');
   const [aliasesText, setAliasesText] = useState((sponsor?.aliases ?? []).join(', '));
@@ -67,16 +69,21 @@ function SponsorEditModal({ sponsor, onClose, onSaved }: Props) {
     onError: (e: unknown) => setError(getErrorMessage(e, 'Failed to save sponsor')),
   });
 
+  const dirty = name !== (sponsor?.name ?? '') || aliasesText !== (sponsor?.aliases ?? []).join(', ')
+    || category !== (sponsor?.category ?? '') || segmentCategory !== (sponsor?.segment_category ?? '')
+    || isActive !== (sponsor?.is_active ?? true) || JSON.stringify(tags) !== JSON.stringify(sponsor?.tags ?? []);
+  const { requestClose, confirmation } = useDraftClose(dirty, onClose, save.isPending);
+
   const toggleTag = (tag: string) =>
     setTags((prev) => (prev.includes(tag) ? prev.filter((t) => t !== tag) : [...prev, tag]));
 
   return (
-    <Modal onClose={onClose} panelClassName="max-w-lg w-full max-h-[90vh] overflow-y-auto">
+    <Modal ariaLabel={isNew ? 'Add Sponsor' : `Edit ${sponsor!.name}`} onClose={requestClose} panelClassName="max-w-lg w-full max-h-[90vh] overflow-y-auto">
       <div className="flex items-center justify-between p-4 border-b border-border">
         <h2 className="text-lg font-semibold text-foreground">
           {isNew ? 'Add Sponsor' : `Edit ${sponsor!.name}`}
         </h2>
-        <button onClick={onClose} className={`p-1 text-muted-foreground hover:text-foreground ${focusRing}`}>
+        <button aria-label="Close" onClick={requestClose} className={`p-1 text-muted-foreground hover:text-foreground ${focusRing}`}>
           <svg className="w-5 h-5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
             <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
           </svg>
@@ -85,36 +92,42 @@ function SponsorEditModal({ sponsor, onClose, onSaved }: Props) {
 
       <div className="p-4 space-y-4">
         <div>
-          <label className="block text-sm font-medium text-foreground mb-1">Name</label>
+          <label htmlFor={`${fieldId}-name`} className="block text-sm font-medium text-foreground mb-1">Name</label>
           <input
             type="text"
+            id={`${fieldId}-name`}
             value={name}
+            aria-required="true"
+            aria-invalid={!!error && !name.trim()}
+            aria-describedby={error ? `${fieldId}-error` : undefined}
             onChange={(e) => setName(e.target.value)}
-            className="w-full px-3 py-2 text-sm bg-secondary border border-border rounded"
+            className={`w-full ${inputBase}`}
             placeholder="Sponsor name"
           />
         </div>
 
         <div>
-          <label className="block text-sm font-medium text-foreground mb-1">
+          <label htmlFor={`${fieldId}-aliases`} className="block text-sm font-medium text-foreground mb-1">
             Aliases <span className="text-muted-foreground font-normal">(comma-separated)</span>
           </label>
           <input
             type="text"
+            id={`${fieldId}-aliases`}
             value={aliasesText}
             onChange={(e) => setAliasesText(e.target.value)}
-            className="w-full px-3 py-2 text-sm bg-secondary border border-border rounded"
+            className={`w-full ${inputBase}`}
             placeholder="alt name, abbreviation"
           />
         </div>
 
         <div>
-          <label className="block text-sm font-medium text-foreground mb-1">Category</label>
+          <label htmlFor={`${fieldId}-category`} className="block text-sm font-medium text-foreground mb-1">Category</label>
           <input
             type="text"
+            id={`${fieldId}-category`}
             value={category}
             onChange={(e) => setCategory(e.target.value)}
-            className="w-full px-3 py-2 text-sm bg-secondary border border-border rounded"
+            className={`w-full ${inputBase}`}
             placeholder="e.g. technology"
           />
         </div>
@@ -125,6 +138,7 @@ function SponsorEditModal({ sponsor, onClose, onSaved }: Props) {
           </label>
           <select
             id="sponsor-segment-category"
+            aria-describedby={`${fieldId}-segment-help`}
             value={segmentCategory}
             onChange={(e) => setSegmentCategory(e.target.value as SegmentCategory | '')}
             className={`w-full ${selectBase}`}
@@ -134,13 +148,13 @@ function SponsorEditModal({ sponsor, onClose, onSaved }: Props) {
               <option key={c} value={c}>{SEGMENT_CATEGORY_LABELS[c]}</option>
             ))}
           </select>
-          <p className="mt-1 text-xs text-muted-foreground">
+          <p id={`${fieldId}-segment-help`} className="mt-1 text-xs text-muted-foreground">
             Overrides the detected category for this sponsor.
           </p>
         </div>
 
-        <div>
-          <label className="block text-sm font-medium text-foreground mb-2">Tags</label>
+        <fieldset>
+          <legend className="block text-sm font-medium text-foreground mb-2">Tags</legend>
           <div className="flex flex-wrap gap-1.5 max-h-40 overflow-y-auto">
             {(vocab?.all_tags ?? []).map((tag) => {
               const on = tags.includes(tag);
@@ -161,7 +175,7 @@ function SponsorEditModal({ sponsor, onClose, onSaved }: Props) {
               );
             })}
           </div>
-        </div>
+        </fieldset>
 
         {!isNew && (
           <div className="flex items-center gap-2">
@@ -176,12 +190,12 @@ function SponsorEditModal({ sponsor, onClose, onSaved }: Props) {
           </div>
         )}
 
-        {error && <p className="text-sm text-destructive">{error}</p>}
+        {error && <p id={`${fieldId}-error`} role="alert" className="text-sm text-destructive">{error}</p>}
       </div>
 
       <div className="flex items-center justify-end gap-2 p-4 border-t border-border">
         <button
-          onClick={onClose}
+          onClick={requestClose}
           className={`px-3 py-1.5 text-sm rounded ${btnOutline} transition-colors ${focusRing}`}
         >
           Cancel
@@ -194,6 +208,7 @@ function SponsorEditModal({ sponsor, onClose, onSaved }: Props) {
           {save.isPending ? 'Saving...' : isNew ? 'Add Sponsor' : 'Save'}
         </button>
       </div>
+      {confirmation}
     </Modal>
   );
 }

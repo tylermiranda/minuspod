@@ -408,6 +408,10 @@ def _parsed_skip_patterns(patterns_json):
     return tuple(str(p).lower() for p in patterns if p)
 
 
+DESCRIPTION_CHAPTER_STAGE = 'description_chapter'
+CHAPTER_TRIM_SOURCES = ('generated_chapter', 'upstream_chapter')
+
+
 def _matches_skip_patterns(text, patterns_json):
     """Case-insensitive fnmatch of text against the pattern list encoded in patterns_json."""
     if not text or not patterns_json:
@@ -984,6 +988,13 @@ EPISODE_LOG_LEVEL_DEBUG = 'debug'
 EPISODE_LOG_LEVEL_INFO = 'info'
 EPISODE_LOG_LEVELS = (EPISODE_LOG_LEVEL_DEBUG, EPISODE_LOG_LEVEL_INFO)
 
+DOWNLOAD_HISTORY_RETENTION_DAYS_MIN = 1
+DOWNLOAD_HISTORY_RETENTION_DAYS_MAX = 3650
+DOWNLOAD_HISTORY_RETENTION_DAYS_DEFAULT = 90
+
+MAX_LLM_WINDOW_AD_MIN = 60
+MAX_LLM_WINDOW_AD_MAX = 900
+
 
 def _episode_log_setting(db, key):
     """One episode-log setting from the given handle, or None to use the
@@ -1317,6 +1328,33 @@ def resolve_splice_veto_enabled(db, podcast_id, global_default: bool) -> bool:
     return global_default if override is None else override
 
 
+def resolve_download_history_retention_days(db) -> int:
+    """Download history retention in days, clamped to the allowed range."""
+    days = db.get_setting_int('download_history_retention_days',
+                              DOWNLOAD_HISTORY_RETENTION_DAYS_DEFAULT)
+    return min(max(days, DOWNLOAD_HISTORY_RETENTION_DAYS_MIN),
+               DOWNLOAD_HISTORY_RETENTION_DAYS_MAX)
+
+
+def resolve_max_llm_window_ad_seconds(db) -> float:
+    """Longest single ad one LLM detection window may report."""
+    try:
+        value = float(db.get_setting_float('max_llm_window_ad_seconds',
+                                           MAX_AD_DURATION_WINDOW))
+        return min(max(value, MAX_LLM_WINDOW_AD_MIN), MAX_LLM_WINDOW_AD_MAX)
+    except Exception:
+        return MAX_AD_DURATION_WINDOW
+
+
+def resolve_window_ad_cap(db, podcast_id) -> float:
+    """Longest single LLM detection kept for a feed: the global window cap,
+    raised by the feed's hold cap or reject override when larger."""
+    return max(resolve_max_llm_window_ad_seconds(db),
+               resolve_max_ad_duration_override(db, podcast_id) or 0,
+               _resolve_override(db, podcast_id,
+                                 'max_ad_duration_reject_override', float, None) or 0)
+
+
 def resolve_max_ad_duration_confirmed(db) -> float:
     """Hard ceiling that even a confirmed sponsor cannot pass. Global only."""
     try:
@@ -1576,8 +1614,24 @@ CHUNK_DEFAULT_DURATION_SECONDS = 1800  # Default if memory detection fails (30 m
 API_CHUNK_DURATION_SECONDS = 600
 
 # Whisper backend identifiers
+# Seconds the queue must stay empty before the local transcription model is unloaded.
+LOCAL_MODEL_IDLE_UNLOAD_SECONDS = 300
+
 WHISPER_BACKEND_LOCAL = 'local'
 WHISPER_BACKEND_API = 'openai-api'
+WHISPER_BACKEND_PARAKEET = 'parakeet'
+WHISPER_LOCAL_BACKENDS = (WHISPER_BACKEND_LOCAL, WHISPER_BACKEND_PARAKEET)
+WHISPER_BACKENDS = (WHISPER_BACKEND_LOCAL, WHISPER_BACKEND_API, WHISPER_BACKEND_PARAKEET)
+
+PARAKEET_MODEL_NAME = 'nemo-parakeet-tdt-0.6b-v3'
+PARAKEET_MODEL_REPO = 'istupakov/parakeet-tdt-0.6b-v3-onnx'  # Hub repo onnx-asr maps the model name to
+# Parakeet decode tuning (#834).
+PARAKEET_WINDOW_S = 30.0  # No dropped speech at 30 s windows
+PARAKEET_OVERLAP_S = 2.0
+PARAKEET_SEGMENT_MAX_S = 25.0
+PARAKEET_SEGMENT_PAUSE_S = 1.0  # Pause that starts a new segment
+PARAKEET_WORD_MAX_S = 1.5  # Cap on a word's end past its start
+PARAKEET_TOKEN_STEP_S = 0.08  # Token timestamp resolution
 
 # Failover targets by API name (#806); shared by failover and webhook_service.
 FAILOVER_API_TARGET_NAMES = {'llm-a': 'llm:primary', 'llm-b': 'llm:secondary', 'transcriber': 'whisper'}
@@ -2117,7 +2171,7 @@ def get_stage_tunable(key: str, settings: dict | None = None) -> Any:
         if isinstance(entry, dict):
             db_val = entry.get('value')
         elif hasattr(entry, 'value'):
-            # SettingEntry dataclass (api.settings._settings_view wraps the
+            # SettingEntry dataclass (api.settings.common._settings_view wraps the
             # raw dict shape into typed entries). hasattr check keeps the
             # resolver pluggable to other entry shapes consumers add.
             db_val = entry.value
@@ -2169,7 +2223,7 @@ def stage_tunable_env_override(key: str) -> str | None:
 
 
 # Public mapping: payload key (camelCase) + DB key (snake_case) + kind tag used
-# by the settings API to dispatch validation. Single source of truth; api/settings
+# by the settings API to dispatch validation. Single source of truth; api/settings/ad_detection.py
 # imports this rather than maintaining a parallel list.
 STAGE_TUNABLE_PAYLOAD_KEYS = (
     ('detectionTemperature',           'detection_temperature',           'float'),

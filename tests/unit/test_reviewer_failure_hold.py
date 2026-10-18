@@ -12,11 +12,12 @@ from config import (HOLD_REASON_REVIEWER_FAILED, PASS2_AUTOAPPROVE_HOLD_REASONS,
                     PASS2_COVERAGE_ONLY_HOLD_REASONS, is_pending_review)
 from ad_reviewer import inconclusive_bounds_supported, stamp_reviewer_fields
 from main_app import processing
+from main_app.pipeline import common, review
 from main_app.verification_reconciliation import _gate_verification_ads_by_confidence
 from utils.markers import normalize_loaded_markers
 from tests.unit.marker_test_utils import _ad
 from tests.unit.pass2_test_utils import _ctx
-from tests.unit.pipeline_test_utils import _run_pipeline
+from tests.unit.pipeline_test_utils import _run_pipeline, stub_clear_fallback
 from tests.unit.reviewer_test_utils import _meta, _reviewer
 
 SUPPORTED_FLAG = 'INFO: Reviewer failed; bounds supported'
@@ -92,9 +93,9 @@ def test_failure_with_fingerprint_cover_is_accepted_with_flag(monkeypatch):
 def test_pass2_verification_marker_with_422_is_held(monkeypatch):
     _fail_review(monkeypatch)
     reviewer = _reviewer()
-    monkeypatch.setattr(processing, '_ad_review_enabled', lambda db: True)
-    monkeypatch.setattr(processing, '_build_reviewer', lambda db, detector: reviewer)
-    monkeypatch.setattr(processing, 'clear_fallback', lambda *args: None)
+    monkeypatch.setattr(review, '_ad_review_enabled', lambda db: True)
+    monkeypatch.setattr(review, '_build_reviewer', lambda db, detector: reviewer)
+    stub_clear_fallback(monkeypatch)
     monkeypatch.setattr(processing.ad_detector, 'get_verification_model',
                         lambda: 'test-model')
     original = {'start': 3544.2, 'end': 3680.7, 'confidence': 0.98,
@@ -104,7 +105,7 @@ def test_pass2_verification_marker_with_422_is_held(monkeypatch):
     cuts, ui, held, _, _rel = _gate_verification_ads_by_confidence(
         [processed], [original], 0.80, pass1_held_markers=[])
     assert len(cuts) == 1
-    processing._apply_pass2_reviewer(
+    review._apply_pass2_reviewer(
         _ctx(), cuts, ui, held, [processed], [original], [], 0.80,
         pass1_cuts=[])
     assert cuts == []
@@ -117,7 +118,7 @@ def test_pass2_verification_marker_with_422_is_held(monkeypatch):
 
 def test_pipeline_does_not_render_a_failed_review(monkeypatch):
     reviewer = _reviewer()
-    monkeypatch.setattr(processing, '_build_reviewer', lambda db, detector: reviewer)
+    monkeypatch.setattr(review, '_build_reviewer', lambda db, detector: reviewer)
     _fail_review(monkeypatch)
     candidate = {'start': 3544.2, 'end': 3573.2, 'confidence': 0.98,
                  'detection_stage': 'claude', 'sponsor': 'Acme',
@@ -172,14 +173,14 @@ def test_batch_failure_holds_unsupported_pass1_marker(monkeypatch):
     reviewer = _reviewer()
     monkeypatch.setattr(reviewer, '_review_inner',
                         lambda *a, **k: (_ for _ in ()).throw(RuntimeError('boom')))
-    monkeypatch.setattr(processing, '_ad_review_enabled', lambda db: True)
-    monkeypatch.setattr(processing, '_build_reviewer', lambda db, detector: reviewer)
-    monkeypatch.setattr(processing, 'clear_fallback', lambda *args: None)
-    monkeypatch.setattr(processing, '_publish_status', lambda *args: None)
+    monkeypatch.setattr(review, '_ad_review_enabled', lambda db: True)
+    monkeypatch.setattr(review, '_build_reviewer', lambda db, detector: reviewer)
+    stub_clear_fallback(monkeypatch)
+    monkeypatch.setattr(common, '_publish_status', lambda *args: None)
     monkeypatch.setattr(processing.storage, 'save_combined_ads', lambda *args: None)
     unsupported, supported, _ = _batch_failure_ads()
     markers = [unsupported, supported]
-    cuts, markers = processing._run_ad_reviewer(
+    cuts, markers = review._run_ad_reviewer(
         'example-podcast', 'a1b2c3d4e5f6', 1, list(markers), markers, [],
         'Example Podcast', 'Episode', '', '', 0.80, 1, 'test-model')
     assert cuts == [supported]

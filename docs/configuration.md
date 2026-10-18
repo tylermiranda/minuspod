@@ -126,6 +126,10 @@ Raise the correlation ceiling if genuine ad swaps are being missed as alignment 
 
 `adDetectionExcludeStartSeconds` (Settings > Ad Detection, 0 to 600 s, default 0) ignores any ad marker that begins inside the first N seconds of an episode, so a show's opening cue is not mistaken for an ad break. The exclusion applies to the first pass, cue pairs, and the verification pass. Each feed can inherit the global value, disable it with 0, or set its own 1 to 600 s window (`adDetectionExcludeStartOverride` in Feed Settings). A marker that starts inside the window is not cut; markers that start at or after the boundary are handled normally. The setting takes effect on the next process or reprocess.
 
+#### Longest single LLM detection
+
+`maxLlmWindowAdSeconds` (Settings > Ad Detection, "Longest single LLM detection", 60 to 900 s, default 420 s) is the longest single ad the model may report for one detection window. A longer one is discarded as implausible. For each feed the cap is the largest of this global value, the feed's max ad duration cap and the feed's max ad duration (reject) override. A show whose mid-roll is one continuous 8 to 10 minute block can be detected as one span by raising either feed value. The global max ad duration setting does not raise it. The verification pass uses the same per-feed cap. API: `PUT /api/v1/settings/ad-detection` with `maxLlmWindowAdSeconds` (number); feed caps are `maxAdDurationOverride` and `maxAdDurationRejectOverride` on `PATCH /api/v1/feeds/{slug}`.
+
 ### Tuning LLM behavior per stage
 
 Each LLM pass can be tuned independently from Settings. The five passes:
@@ -173,7 +177,7 @@ When the provider returns a 429 because a single window's request exceeds the pe
 
 ### VAD Gap Detector (advanced)
 
-Whisper uses Voice Activity Detection to skip regions it classifies as silence or non-speech. Sped-up legal disclaimers at the tail of DIA ads, distorted interstitials, and some ad intros fall into that bucket and never make it into the transcript. Since MinusPod's Claude, text-pattern, and roll detectors all run against the transcript, these regions are invisible to them and can leak into the processed output, usually at the very start or end of an episode.
+The transcriber uses Voice Activity Detection to skip regions it classifies as silence or non-speech. Sped-up legal disclaimers at the tail of DIA ads, distorted interstitials, and some ad intros fall into that bucket and never make it into the transcript. Since MinusPod's Claude, text-pattern, and roll detectors all run against the transcript, these regions are invisible to them and can leak into the processed output, usually at the very start or end of an episode.
 
 The VAD gap detector runs after the other stages and treats untranscribed spans as ad candidates:
 
@@ -356,6 +360,26 @@ The shared **Skipped episodes** choice applies to title, description, and durati
 
 API: `descriptionSkipPatterns` (array of strings, max 50 patterns, 200 characters each) on `PATCH /api/v1/feeds/{slug}`; `titleSkipAction` governs served-RSS visibility for all three filters.
 
+### Chapter trim
+
+Some shows publish an episode whose second half is a re-run, and the description lists the cut point as a timestamp line such as `(31:26) - Throwback ...`. Under **Chapter trim** (beside Chapters in the feed's settings), enter a chapter title pattern (whole title, case-insensitive, `*` is a wildcard, for example `*Throwback*`) and choose **Cut to the end of the episode** or **Cut until the next chapter**.
+
+When a timestamp line in the description matches, that span becomes an Outro marker with the stage badge Description chapter. It is cut regardless of detection confidence or duration, is not sent to the reviewer, and is re-applied on every process, re-detect, and recut. The feed's segment action for Outro still decides the result: remove cuts it, mark or keep leaves it in the audio. A span that ends within 1 s of the episode end is treated as cut to the end.
+
+User corrections win: a keep range or a Not an ad on an overlapping marker can carve the trimmed span, and with the Outro action set to keep or mark the span is not cut. Matching reads the upstream description, not the served one with MinusPod's chapter list appended.
+
+The pattern also matches the episode's chapters, whether the feed publishes them or MinusPod generates them. `Cut until the next chapter` ends at the next chapter start, and the last chapter runs to the end of the episode. Generated chapters only exist after a run. When one matches and no marker already covers its span, the run adds the marker and recuts the episode once. This needs the retained original; without it no recut is queued. A recut never triggers another. The marker's reason reads `Chapter: <title>`. On a later recut, a chapter-derived marker stays while the pattern still matches its title. Changing the mode re-ends it: to the episode end, or the stored span for the next-chapter mode. The automatic trim runs only when chapters are enabled for the feed (mode not off), and the manual Regenerate Chapters action does not queue a trim.
+
+Timestamp lines accepted at the start of a line: `(mm:ss)`, `(h:mm:ss)`, `mm:ss -`, `[mm:ss]`.
+
+API: `descriptionTrimPattern` (string up to 200 characters, or null) and `descriptionTrimMode` (`to_end` or `to_next`) on `PATCH /api/v1/feeds/{slug}`.
+
+### Chapter notes
+
+Under **Chapters > Chapter notes**, enter up to 1000 characters sent with every chapter request for the feed as a final `Feed notes:` paragraph, for example: Always make the listener donation and producer thank-you segment its own chapter titled Donations. Pair it with a trim pattern such as `Donations` to cut that segment automatically.
+
+API: `chapterNotes` (string up to 1000 characters, or null) on `PATCH /api/v1/feeds/{slug}`.
+
 ### Episode duration filters
 
 The feed's **Episode filters** section has optional **Minimum (minutes)** and **Maximum (minutes)** fields. Leave either blank for no limit, then choose **Save duration limits**.
@@ -417,13 +441,16 @@ source-coded audio outside splice transitions. When replacement sound is on, its
 encoded to match the source. The copy path repairs frame packing around joins
 and validates the output before publishing it.
 
-Cuts snap to the nearest MP3 frame. Chapters and transcript timing use those
+Ordinary cut edges snap to the nearest MP3 frame. A word-timed, quote-aligned,
+reviewer-locked or confirmed edge snaps inward instead, so kept audio is never
+shortened and at most one frame of the ad remains. Cuts at the start or end of the
+file are copied too. Chapters and transcript timing use those
 actual cuts and the encoded replacement duration. Validation uses temporary
 decoded-audio files, limited to 4 GiB each, and checks free disk space. Unsupported
 headers or gapless tags, protected boundaries and failed resource checks fall
 back to re-encoding.
 
-Leveling, Beep actions, unsupported audio, cuts at the start or end, unsafe joins
+Leveling, Beep actions, unsupported audio, unsafe joins
 or failed validation use the existing encoder. Output Bitrate applies to that
 re-encoded output. Bitrate and leveling remain configurable with stream copy on.
 
@@ -442,6 +469,8 @@ The Experiments section in Settings holds opt-in features that are still being e
 Settings > Experiments has an Ad addressing mode select, marked experimental. Timestamps, the default, asks the model for a start and end time for each ad. Segment IDs asks the model to name numbered transcript lines instead; MinusPod then maps those line numbers back to the exact Whisper times, so the model never has to guess a timestamp. Random draws one of the two per detection run (and independently again for the verification pass), so production traffic accumulates an unbiased comparison over time. Segment IDs is still being benchmarked against Timestamps, and the results decide whether the default ever changes.
 
 How often each mode's LLM contract is actually honored shows up on the Stats page, under Addressing modes: runs, windows judged, and compliance percentage per mode. Random-mode runs count toward whichever mode was drawn for that pass.
+
+From 2.100.13 each LLM-detected marker also records the mode it was detected under (`addressing_mode`) and the model's bounds before snapping (`llm_start`, `llm_end`), and the Ad Reviewer log and corrections carry the mode. Two stats blocks use them. `GET /api/v1/stats/reviewer` returns `byMode` with reviews, verdict counts and mean boundary shift per mode. `GET /api/v1/stats/addressing` returns `byMode` with the held, approved and rejected rate of corrections and `avgSnapDistance`, the mean seconds between the model's raw start and end and the stored marker (both edges added, every correction stage included). These blocks are API only; the Stats page does not chart them. The snap distance covers the 2000 most recent episodes processed in the last 90 days. Markers and log rows from before 2.100.13 carry no mode and are excluded.
 
 Default `timestamps`. API: `PUT /api/v1/settings/ad-detection` with `adAddressingMode` (`timestamps`, `segment_ids`, or `random`).
 

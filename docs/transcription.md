@@ -1,4 +1,4 @@
-# Whisper / Transcription
+# Transcription
 
 [< Docs index](README.md) | [Project README](../README.md)
 
@@ -6,21 +6,50 @@
 
 ## Contents
 
-- [GPU Compute Type](#gpu-compute-type)
-- [whisper.cpp with Docker (NVIDIA GPU)](#whispercpp-with-docker-nvidia-gpu)
-- [whisper.cpp on Apple Silicon (native)](#whispercpp-on-apple-silicon-native)
-- [Intel GPU (OpenVINO Model Server)](#intel-gpu-openvino-model-server)
-- [Testing a remote endpoint](#testing-a-remote-endpoint)
-- [Groq](#groq)
-- [OpenAI Whisper API](#openai-whisper-api)
+- [Choosing between Whisper and Parakeet](#choosing-between-whisper-and-parakeet)
+- [Whisper (faster-whisper)](#whisper-faster-whisper)
+  - [GPU compute type](#gpu-compute-type)
+- [Parakeet](#parakeet)
+- [Remote Whisper APIs](#remote-whisper-apis)
+  - [whisper.cpp with Docker (NVIDIA GPU)](#whispercpp-with-docker-nvidia-gpu)
+  - [whisper.cpp on Apple Silicon (native)](#whispercpp-on-apple-silicon-native)
+  - [Intel GPU (OpenVINO Model Server)](#intel-gpu-openvino-model-server)
+  - [Testing a remote endpoint](#testing-a-remote-endpoint)
+  - [Groq](#groq)
+  - [OpenAI Whisper API](#openai-whisper-api)
 - [Chunked transcription](#chunked-transcription)
 - [Failover transcriber](#failover-transcriber)
 - [Transcription language](#transcription-language)
 - [Processing timeouts](#processing-timeouts)
 
-By default, MinusPod uses faster-whisper with a local NVIDIA GPU for transcription. If you don't have an NVIDIA GPU (e.g. Apple Silicon Mac), you can use any OpenAI-compatible whisper API as the transcription backend.
+MinusPod has three transcription backends. Pick one with `WHISPER_BACKEND` or in Settings > Transcription > Backend. The setting names still say "whisper" for all of them.
 
-## GPU Compute Type
+| Backend | `WHISPER_BACKEND` | Runs where | Good at | Settings that apply |
+|---|---|---|---|---|
+| faster-whisper (default) | `local` | In the container: CUDA in the GPU image, CPU in the CPU image | Proper names, sponsor names, promo codes; several model sizes | `WHISPER_MODEL`, `WHISPER_COMPUTE_TYPE`, `WHISPER_DEVICE`, language |
+| Parakeet TDT 0.6B v3 | `parakeet` | In the container through onnx-asr: CUDA in the GPU image, CPU in the CPU image | Speed on a GPU; fewer repetition loops | `WHISPER_DEVICE`, language |
+| Remote API | `openai-api` | A separate server (whisper.cpp, Groq, OpenAI, OpenVINO) | Hosts with no GPU; offloading to another machine | `WHISPER_API_BASE_URL`, `WHISPER_API_KEY`, `WHISPER_API_MODEL`, `whisperMaxAttempts` |
+
+Every backend runs without a GPU.
+
+A local model, from either local backend, stays loaded while the queue has work and unloads 300 seconds after the queue empties.
+
+## Choosing between Whisper and Parakeet
+
+Measured on a Tesla T4 across three episodes:
+
+- Speed: Parakeet transcribed 1.8x to 2.5x faster than Whisper large-v3.
+- Ad detection: results matched. Every ad found with both transcripts started and ended within 3 seconds of each other.
+- Names: Parakeet is weaker on sponsor names and promo codes, so transcript normalization rules (Settings > AI & Processing > Transcript Normalization) matter more with it.
+- Fillers: Parakeet keeps "uh" and "um" in the transcript.
+
+Based on those numbers, Parakeet suits a GPU host that wants shorter processing time, and faster-whisper suits shows where sponsor names and codes drive detection. Use the remote API backend when the host has no usable GPU.
+
+## Whisper (faster-whisper)
+
+The default local backend. It runs faster-whisper on CTranslate2, with the model set by `WHISPER_MODEL` (default `small` on GPU, `tiny` in the CPU image). `WHISPER_MODEL` and `WHISPER_COMPUTE_TYPE` apply to this backend only.
+
+### GPU compute type
 
 faster-whisper runs on CTranslate2, which only supports certain compute types per GPU generation. MinusPod exposes `WHISPER_COMPUTE_TYPE` as an env var and as a dropdown in Settings > Transcription. The default `auto` picks `float16` on CUDA and `int8` on CPU, matching the prior hardcoded behavior. If `float16` fails at model init (common on Pascal GTX 10xx and Maxwell GTX 9xx, which cannot do fp16 math in CTranslate2), the server retries `int8_float16`, then `int8`, then `float32` and logs the final active type. Any other explicit choice that fails is raised instead of silently masked.
 
@@ -40,7 +69,37 @@ Sources:
 - CTranslate2 compute-type support matrix: [opennmt.net/CTranslate2/quantization.html](https://opennmt.net/CTranslate2/quantization.html)
 - Official NVIDIA CUDA compute-capability table: [developer.nvidia.com/cuda-gpus](https://developer.nvidia.com/cuda-gpus)
 
-## whisper.cpp with Docker (NVIDIA GPU)
+## Parakeet
+
+NVIDIA Parakeet TDT 0.6B v3 is the second local transcription backend. It runs through ONNX Runtime inside the MinusPod container: on CUDA in the GPU image and on CPU in the CPU image. No separate server is needed.
+
+Select it in Settings > Transcription > Backend with "Local (Parakeet TDT 0.6B v3)", or set:
+
+```bash
+WHISPER_BACKEND=parakeet
+```
+
+Use `WHISPER_DEVICE=cpu` with the CPU image or `WHISPER_DEVICE=cuda` with the NVIDIA image. The shipped Compose files pass these values from `.env`; existing saved settings take precedence over environment defaults.
+
+The first use downloads weights into `$HF_HOME/parakeet/nemo-parakeet-tdt-0.6b-v3`, normally `/app/data/.cache/parakeet/nemo-parakeet-tdt-0.6b-v3`. CPU uses int8 weights; CUDA uses the unquantized export. Download sizes, RAM guidance, and the resource-measurement procedure are in [Installation > Parakeet sizing](installation.md#parakeet-sizing).
+
+The decoder uses 30-second windows with 2-second overlap. Each model call is bounded, but the input WAV and transcript data still consume system RAM. Longer inputs and concurrent processing can increase total memory use.
+
+For an offline installation, first complete a transcription on a connected instance using the same device mode. Preserve the entire model directory, including external weights and vocabulary. A complete local copy lets the loader continue when a later download attempt fails; an incomplete cache cannot. Keep the directory writable for normal model updates.
+
+Parakeet v3 is multilingual and cannot be pinned to a language. With the transcription language set to `en`, words written in other scripts (Cyrillic, Greek, CJK, Arabic and so on) are dropped before the transcript is built, and the count is logged at INFO. With `auto` or a non-English language, nothing is dropped.
+
+The faster-whisper model, compute type and the API settings do not apply to this backend. Parakeet can also be the failover transcriber: choose it under Settings > AI & Processing > Failover, or set `failoverWhisperBackend` to `parakeet`. See [Failover](failover.md#configuration-reference).
+
+In tests on narrative shows with music beds (issue #834), Parakeet ran faster than the Whisper large models and produced fewer repetition loops. See [Choosing between Whisper and Parakeet](#choosing-between-whisper-and-parakeet) for the measured trade-offs.
+
+The CPU image supports Linux arm64, including Docker on Apple Silicon. This uses the CPU provider; MinusPod does not select Metal or CoreML acceleration. Native macOS and Mac GPU performance have not been measured. For an accelerated external transcriber, use an OpenAI-compatible server with `WHISPER_BACKEND=openai-api`.
+
+## Remote Whisper APIs
+
+The `openai-api` backend sends audio to any OpenAI-compatible transcription endpoint. The sections below cover common servers.
+
+### whisper.cpp with Docker (NVIDIA GPU)
 
 A ready-to-use compose file is provided at [`docker-compose.whisper.yml`](../docker-compose.whisper.yml). It runs [whisper.cpp](https://github.com/ggml-org/whisper.cpp) as a standalone GPU-accelerated transcription server.
 
@@ -74,7 +133,7 @@ The `--dtw large.v3.turbo` flag enables word-level timestamps for precise ad bou
 
 > **Warning:** If you add `--convert` for use with other clients, be aware that whisper.cpp writes temporary converted files to the current working directory. In Docker, the default CWD may not be writable, causing whisper.cpp to silently return empty transcription results (200 with 0 segments). Set `working_dir: /tmp` in your compose file or mount a writable volume if you need `--convert`.
 
-## whisper.cpp on Apple Silicon (native)
+### whisper.cpp on Apple Silicon (native)
 
 whisper.cpp runs natively on Apple Silicon with Metal acceleration. Build from source or use Homebrew:
 
@@ -99,11 +158,11 @@ WHISPER_DEVICE=cpu
 
 > **Linux users:** Replace `host.docker.internal` with your host IP, or add `extra_hosts: ["host.docker.internal:host-gateway"]` to your Docker service definition.
 
-## Intel GPU (OpenVINO Model Server)
+### Intel GPU (OpenVINO Model Server)
 
 On an Intel host with a capable integrated or discrete GPU, you can offload transcription to the GPU instead of the CPU. OpenVINO Model Server runs Whisper as a remote OpenAI-compatible backend with word-level timestamps, so the CPU image's transcription stops pinning every core. See the dedicated [Intel GPU Transcription (OpenVINO)](transcription-openvino.md) guide for the full setup.
 
-## Testing a remote endpoint
+### Testing a remote endpoint
 
 Getting the base URL path right is the fiddly part of a remote backend: most servers answer something on every path, but only one path accepts transcription requests. The **Test connection** button under the API Base URL field (Settings > Transcription, with the backend set to Remote API) uploads a one-second generated audio sample using the same request the real pipeline sends, so a passing test means an actual episode upload will work. The values currently in the form are used, saved or not, so you can test a URL before committing it.
 
@@ -117,7 +176,7 @@ The sample is uploaded in the same format a real episode would use: FLAC by defa
 
 A saved whisper API key is sent with the probe only when the URL being tested points at the same server as the saved base URL. The key is never sent to a URL you have not saved, so save both the key and the base URL before testing a keyed endpoint.
 
-## Groq
+### Groq
 
 [Groq](https://groq.com) offers fast cloud-based whisper transcription:
 
@@ -129,7 +188,7 @@ WHISPER_API_MODEL=whisper-large-v3-turbo
 WHISPER_DEVICE=cpu
 ```
 
-## OpenAI Whisper API
+### OpenAI Whisper API
 
 ```bash
 WHISPER_BACKEND=openai-api
@@ -143,10 +202,7 @@ All settings can also be configured via the Settings UI under the Transcription 
 
 ## Chunked transcription
 
-Episodes longer than one chunk are transcribed in pieces. Chunk size is
-computed from free GPU memory at run time (larger models leave room for
-shorter chunks; the log line "Calculated chunk duration" shows the math), with
-a 30-second overlap between chunks so no sentence is lost at a boundary.
+Episodes longer than one chunk are transcribed in pieces. Local faster-whisper sizes chunks from available GPU memory; the log line "Calculated chunk duration" shows the result. Parakeet starts with 1,800-second outer chunks and decodes each through its 30-second windows. Outer chunks overlap by 30 seconds. Remote API chunk sizes come from their separate settings.
 
 Each chunk is cut from the source file by its own ffmpeg pass, which also
 applies loudness normalization and band-pass filtering in the same step. Those
@@ -164,7 +220,7 @@ An optional standby transcriber (Settings > AI & Processing > Failover) takes ov
 
 ## Transcription language
 
-Whisper is pinned to English by default. That keeps it from misdetecting on music intros or cold opens (a common failure mode on podcasts). If you run a non-English show, pick the language in Settings > Transcription or set `WHISPER_LANGUAGE` on first boot. Use `auto` for multilingual feeds; Whisper will detect per request. Full list: [supported languages](https://whisper-api.com/docs/languages/).
+faster-whisper and remote transcription requests default to English. Parakeet detects language itself; its `en` setting applies the script filter described [above](#parakeet). If you run a non-English show, pick the language in Settings > Transcription or set `WHISPER_LANGUAGE` on first boot. Use `auto` for multilingual feeds; the model detects the language per request. Full list: [supported languages](https://whisper-api.com/docs/languages/).
 
 ## Processing timeouts
 

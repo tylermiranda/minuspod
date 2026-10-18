@@ -9,8 +9,10 @@ Every term the app uses, in plain words, with a link to the part of the docs tha
 - [D](#d)
 - [E](#e)
 - [F](#f)
+- [G](#g)
 - [H](#h)
 - [I](#i)
+- [J](#j)
 - [K](#k)
 - [L](#l)
 - [N](#n)
@@ -32,7 +34,7 @@ Every term the app uses, in plain words, with a link to the part of the docs tha
 
 **Ad Reviewer** - An optional second LLM that double-checks each planned cut before it happens and can confirm, adjust, reject, or resurrect a detection. Off by default. [Configuration > Ad Reviewer](configuration.md#ad-reviewer)
 
-**Addressing mode** - An experimental detector setting where the LLM names numbered transcript lines (`segment_ids`) instead of inventing start and end timestamps (`timestamps`), or where `random` draws one of the two per run. [Configuration > Ad Addressing Mode](configuration.md#ad-addressing-mode)
+**Addressing mode** - How the LLM names an ad's position: `timestamps` (it invents start and end times) or `segment_ids` (it names numbered transcript lines that MinusPod maps to exact times). The Ad addressing mode setting is experimental and `random` draws one per run. Each LLM-detected marker records the mode it was detected under (`addressing_mode`) and the model's raw bounds (`llm_start`, `llm_end`), and the stats API compares reviewer verdicts, correction rates and snap distance per mode. [Configuration > Ad Addressing Mode](configuration.md#ad-addressing-mode)
 
 **Archive mode** - A per-feed retention setting that keeps every processed episode indefinitely, ignoring the global retention window and the "Clear all processed audio" action. Set it on shows you never want swept, such as ones that have stopped publishing. [Configuration > Per-feed retention](configuration.md#per-feed-retention)
 
@@ -86,7 +88,11 @@ Every term the app uses, in plain words, with a link to the part of the docs tha
 
 **Differential hold** - An uncorroborated cross-fetch differential candidate: the two fetches measurably differ, but no other stage, overlap, or matched audio cue backs it as an ad. [How It Works > Cross-Fetch Differential](how-it-works.md#cross-fetch-differential)
 
+**Download history** - The History page's Downloads tab: one row per client download of episode audio, with time, client IP, optional location, subscriber label and client app. Repeat requests from one client within 15 minutes merge into one row, and rows are pruned after 90 days by default. [Download History](download-history.md)
+
 **Download User-Agent override** - A per-feed download identifier in Feed settings > Advanced. Blank inherits the global string; cross-fetch still uses a different podcast client. [Configuration > Outbound Requests](configuration.md#outbound-requests)
+
+**Description chapter trim** - A per-feed rule that cuts a span regardless of detection. The span starts at a description timestamp line or a chapter (published or generated) whose title matches a pattern and runs to the end of the episode or to the next chapter. A matching generated chapter queues one recut. [Configuration > Chapter trim](configuration.md#chapter-trim)
 
 **Dry-run import plan** - The preview a bulk archive-import scan returns before anything is written: every file matched to an episode, every rejected file with a reason, and the publish date each episode would get. Committing re-checks the same files and refuses if anything changed underneath the plan. [Local Feeds > Scan, then commit](local-feeds.md#scan-then-commit)
 
@@ -108,11 +114,17 @@ Every term the app uses, in plain words, with a link to the part of the docs tha
 
 **First pass (Pass 1)** - The main detection run over the freshly transcribed episode: patterns, cross-fetch, and the LLM reading the transcript in windows. [How It Works](how-it-works.md#how-it-works)
 
+## G
+
+**Geo lookup** - An off-by-default option that sends public client IPs from download history to the ipwho.is service over HTTPS to show a city, region and country. Private and shared-address-space IPs are never sent. [Download History > Privacy](download-history.md#privacy)
+
 ## H
 
 **Health probe** - A periodic check that an LLM or transcription endpoint is usable. Failover uses probe results to detect outages and recover the original provider; fresh results are shared across queued episodes. [Failover > Health probes](failover.md#health-probes)
 
 **Held for Review** - An ad that detection wanted to cut but a per-feed guard (max ad duration, cue-gated approval, a reviewer contradiction, or a verification conflict) stopped. The audio stays intact until you approve or dismiss it. [Web Interface > Held for Review](web-interface.md#held-for-review)
+
+**Held remainder** - The part of a larger detection that stays held for review after a piece of it was cut or released. It inherits the original's reviewer proposal, which is dropped or clamped when it no longer overlaps the remainder. [Web Interface > Held for Review](web-interface.md)
 
 **Hold (queue)** - Any reason the queue is waiting rather than working: a rate-limit pause that stops new claims outright, or an offline-queue wait that parks specific episodes while the rest keep processing. The status bar names which one is in effect, and `GET /api/v1/status` reports it in a `hold` block. [Configuration > Rate-Limit Hold](configuration.md#rate-limit-hold)
 
@@ -120,11 +132,17 @@ Every term the app uses, in plain words, with a link to the part of the docs tha
 
 **Import directory** - The user-managed folder for a local feed's archive import, `<data>/import/<slug>/`. You place audio and sidecar files there yourself; on a successful commit MinusPod moves the audio out and deletes that episode's sidecars along with it, leaving a rejected or errored file's sidecars in place to fix and re-scan. [Local Feeds > Bulk import](local-feeds.md#bulk-import)
 
+## J
+
+**JIT blocked user agent** - An entry in Settings > Security > Agents that skip processing. A client whose User-Agent matches is redirected to the original audio when it asks for an episode MinusPod has not processed yet, instead of starting a run. Download history's Block action adds `^` plus the client's first product token. [Configuration > Blocked user agents](configuration.md#blocked-user-agents-for-just-in-time-processing)
+
 ## K
 
 **Keep action** - A per-category segment action that leaves a detected span in the audio untouched. [How It Works > Segment Categories](how-it-works.md#segment-categories)
 
 ## L
+
+**LLM window cap** - The longest single ad the LLM may report within one detection window; a longer one is discarded. The global Longest single LLM detection setting defaults to 7 minutes (60 to 900 s), and a feed's max ad duration cap or reject override raises it for that feed. Also called the longest single LLM detection. [Configuration > Longest single LLM detection](configuration.md#longest-single-llm-detection)
 
 **Local feed** - A podcast feed MinusPod builds and serves from your own audio files, with no upstream RSS feed behind it. Episodes still run through the same ad-removal pipeline; MinusPod is the publisher rather than a proxy. [Local Feeds](local-feeds.md)
 
@@ -156,6 +174,8 @@ Every term the app uses, in plain words, with a link to the part of the docs tha
 
 **Prompt caching** - Reusing a static prompt prefix across LLM calls. MinusPod requests a 5-minute cache for Anthropic system prompts and records cache reads and writes in input-token usage. [LLM Providers > Prompt caching](llm-providers.md#prompt-caching)
 
+**Parakeet** - NVIDIA Parakeet TDT 0.6B v3, the second local transcription backend. It runs in-process through ONNX Runtime and is selected with `WHISPER_BACKEND=parakeet`. [Transcription > Parakeet](transcription.md#parakeet)
+
 **Partial detection** - An episode published from pattern and cross-fetch cuts alone after the AI detection pass failed. Shows an amber badge and a Re-run detection banner on the episode page; one automatic low-priority re-detect is also queued. [How It Works > Partial Detection](how-it-works.md#partial-detection)
 
 **Pass-through** - One of the five presets on the per-feed Processing mode select. It turns processing off entirely: episodes are downloaded and relayed with no transcription or ad removal, though the audio may be transcoded for serving. The feed URL stays the same, so switching to another mode resumes processing later without touching your podcast app. [Configuration > Pass-through mode](configuration.md#pass-through-mode)
@@ -167,6 +187,8 @@ Every term the app uses, in plain words, with a link to the part of the docs tha
 **Pattern Cleanup** - An experiment that reviews learned text patterns with an LLM and suggests trims, splits, sponsor corrections, category changes, and disabling unused or unreliable patterns. It supports scheduled and manual runs, with a separate provider and model choice. [Pattern Cleanup](pattern-cleanup.md)
 
 **Podping** - An opt-in listener that watches the Hive blockchain for publish notifications and refreshes a matching feed immediately. Its RPC server list is editable in settings and through the API. System Health identifies the active RPC node, checks every fallback every five minutes, and can check them on demand. Scheduled feed polling continues either way. [Podcasting 2.0 > Podping](podcasting-2.0.md#podping)
+
+**Preparing stage** - The first stage a job shows in the status bar, before any download or transcription starts. A run that reuses a retained original, such as a local-feed reprocess or re-detect, stays in Preparing and never shows Downloading. [How It Works](how-it-works.md)
 
 **Processing mode** - The per-feed preset that decides what the pipeline does with each episode: standard ad removal, keep-content detection, skip ad detection (transcripts and chapters only), pass-through, or cue-only (cuts from cue pairs and previously learned ad patterns, no LLM call). One select in Feed Settings; the REST API also accepts the underlying per-field flags. [How It Works](how-it-works.md)
 
@@ -198,11 +220,15 @@ Every term the app uses, in plain words, with a link to the part of the docs tha
 
 **Resurrected** - A detection the validator rejected that the Ad Reviewer overruled and put back in the cut list. [Configuration > Ad Reviewer](configuration.md#ad-reviewer)
 
-**Retired pattern** - A pattern disabled after an approved cleanup suggestion because it has gone unused. Its record is retained and the approval can be undone if it has not been changed afterward. [Pattern Cleanup > Suggestion kinds](pattern-cleanup.md#suggestion-kinds)
-
 **Retention** - How long processed audio is kept before the episode resets to Discovered. The pre-cut original can have its own shorter window, and any feed can override the whole window on its own settings page. [Configuration > Per-feed retention](configuration.md#per-feed-retention)
 
+**Retired pattern** - A pattern disabled after an approved cleanup suggestion because it has gone unused. Its record is retained and the approval can be undone if it has not been changed afterward. [Pattern Cleanup > Suggestion kinds](pattern-cleanup.md#suggestion-kinds)
+
+**Reviewer proposal (trimmed confirm)** - The narrower span the Ad Reviewer suggests for a held detection, kept as `reviewer_proposed_start` and `reviewer_proposed_end`. Confirming it approves only that span. The button appears only when the proposal overlaps the held span. [Configuration > Ad Reviewer](configuration.md#ad-reviewer)
+
 ## S
+
+**Search index journal** - The `search_index_changes` table that records every change to searchable content. The search index applies it every 6 hours (refresh) and is rebuilt in full weekly, so a new title or transcript can take up to 6 hours to appear in search. [Web Interface](web-interface.md#search-index)
 
 **Second scan** - See Verification pass.
 
@@ -226,6 +252,8 @@ Every term the app uses, in plain words, with a link to the part of the docs tha
 
 **Staging area** - The per-feed holding folder for a local feed's uploaded archive-import batch, `<data>/import-staging/<slug>/`. Unlike the import directory, MinusPod fully manages it: it is populated by the upload endpoint and cleared out as the import commits. [Local Feeds > Bulk import](local-feeds.md#bulk-import)
 
+**Subscriber feed / subscriber key** - A credential scoped to one podcast, labelled for a person or device and revocable on its own, in the form of a 16-character key ID, a dot and a 64-character secret. Download history shows the label of the key that fetched each row. Revoking one leaves the global key and other subscribers working. [Security > Authenticated feeds](security-and-storage.md#authenticated-feeds-optional)
+
 **System One** - A structured question protocol used by the native TypeSafe and System One-compatible providers. Detection, verification, and ad categorization are supported; review is experimental. Profiles are independent for each credential slot and provider type. Stats separate logical adapter calls from actual HTTP attempts. [System One](system-one.md)
 
 **Synthesized publish date** - The publish date MinusPod assigns a local-feed episode when none was given explicitly: episodes are sorted by season and episode, the newest anchors at import time, and earlier ones step back a day each (or space evenly between two explicit dates). [Local Feeds > Publish dates](local-feeds.md#publish-dates)
@@ -244,6 +272,8 @@ Every term the app uses, in plain words, with a link to the part of the docs tha
 
 **Transcript differential** - Comparing the locally transcribed audio with a publisher transcript to find speech absent from the publisher's copy. Gaps need corroboration before they can be cut. [Upstream Transcript Differential](transcript-differential.md)
 
+**Transcription backend** - The engine that turns audio into timed words: faster-whisper, Parakeet, or a remote OpenAI-compatible API. Chosen by `WHISPER_BACKEND` or in Settings > Transcription. [Transcription](transcription.md)
+
 ## U
 
 **User-Agent** - The string MinusPod sends to identify itself on an outbound request; there are two, because hosts disagree about what they will answer. [Configuration > Outbound Requests](configuration.md#outbound-requests)
@@ -261,6 +291,8 @@ Every term the app uses, in plain words, with a link to the part of the docs tha
 ## W
 
 **Waveform Ad Editor** - The visual editor for a single detection: waveform, transcript context, and draggable boundaries, with the original audio for reference. [Web Interface > Waveform Ad Editor](web-interface.md#waveform-ad-editor)
+
+**Whisper (faster-whisper)** - The default local transcription backend (`WHISPER_BACKEND=local`). `WHISPER_MODEL` and `WHISPER_COMPUTE_TYPE` apply to it only. [Transcription > Whisper (faster-whisper)](transcription.md#whisper-faster-whisper)
 
 **Webhook events** - Notifications MinusPod can send: Episode Processed, Episode Failed, Auth Failure, Limit Exceeded, Rate Limit Structural, Feed Refresh Failed, Update Available, Cue Template Quiet, Queue Held, Queue Resumed, Service Offline, Service Reachable, Failover Triggered, and Failover Cancelled. Each can also go out by email. [API & Webhooks > Events](api-and-webhooks.md#events)
 

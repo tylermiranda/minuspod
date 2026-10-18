@@ -26,7 +26,7 @@ from config import (
     SEGMENT_CATEGORIES, SEGMENT_ACTIONS, DEFAULT_SEGMENT_ACTION,
     normalize_segment_category,
 )
-from main_app.processing import _partition_keep_ads
+from main_app.pipeline.keep_rules import _partition_keep_ads
 
 
 class TestNormalizeSegmentCategory:
@@ -149,7 +149,7 @@ class TestParseAdsFromResponseCarriesCategory:
 
 def _episode_marker_payload_fields(markers):
     """Replicates the get_episode category/actionApplied mapping (see
-    src/api/episodes.py) without spinning up Flask/DB, matching the
+    src/api/episodes/core.py) without spinning up Flask/DB, matching the
     _split_markers idiom used by test_pending_review_bucket.py."""
     out = []
     for marker in markers:
@@ -256,7 +256,7 @@ class TestMergeGatedOnResolvedAction:
         assert by_cat['interaction']['end'] == 30.0
 
     def test_true_overlap_gives_mark_action_the_contested_audio(self):
-        """Mark must win contested audio exactly like keep (spec 1.2)."""
+        """Mark must win contested audio exactly like keep (docs/specs/2026-07-24-segment-categories-design.md#actions-and-resolution)."""
         det = self._det()
         action_map = dict(_all_remove_map(), interaction='mark')
         sponsor_ad = _ad(0.0, 25.0, 'text_pattern', category='sponsor')
@@ -601,7 +601,7 @@ class TestUnsetStaysUnsetOnEverySavePath:
     """The merge seam is not the only place a marker's category is settled."""
 
     def test_a_pass2_marker_with_no_category_stays_unset(self):
-        from main_app.processing import _stamp_pass2_marker_categories
+        from main_app.pipeline.verify import _stamp_pass2_marker_categories
 
         markers = [{'start': 1.0, 'end': 2.0},
                    {'start': 3.0, 'end': 4.0, 'category': 'not-a-category'},
@@ -678,7 +678,7 @@ class TestUnsetHasOneRepresentation:
             assert 'category' not in temp_db.get_ad_pattern_by_id(pid)
 
     def test_markers_and_patterns_agree_on_absence(self, temp_db):
-        from main_app.processing import _stamp_pass2_marker_categories
+        from main_app.pipeline.verify import _stamp_pass2_marker_categories
 
         pid = temp_db.create_ad_pattern(
             scope='global', text_template='agreement row ' * 4)

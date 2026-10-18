@@ -280,7 +280,7 @@ def test_nullable_models_remain_inherited_during_provider_restore(temp_db, monke
     temp_db.set_setting('llm_provider', 'anthropic')
     temp_db.set_setting('verification_model', 'old-model')
     temp_db.set_setting('chapters_model', 'old-model')
-    monkeypatch.setattr('api.settings._probe_after_provider_change', lambda: None)
+    monkeypatch.setattr('api.settings.provider_phases._probe_after_provider_change', lambda: None)
     document = _document({'llm_provider': 'ollama', 'claude_model': 'new-model',
                           'verification_model': None, 'chapters_model': None})
     preview = config_transfer.build_preview(temp_db, document, 'global')
@@ -882,3 +882,36 @@ def test_feed_feed_ua_round_trip(temp_db, override, monkeypatch):
     preview = config_transfer.build_preview(temp_db, document, 'feeds')
     config_transfer.apply_config(temp_db, document, 'feeds', None, preview['previewToken'])
     assert temp_db.get_podcast_by_slug('example-feed')['feed_user_agent_override'] == override
+
+
+def test_description_trim_restores_from_backup(temp_db, monkeypatch):
+    db = temp_db
+    db.create_podcast('trim-feed', 'https://example.com/feed.xml', 'Show')
+    db.update_podcast('trim-feed', description_trim_pattern='*Throwback*',
+                      description_trim_mode='to_next')
+    exported = config_transfer.export_config(db, '2.98.2')
+    db.update_podcast('trim-feed', description_trim_pattern=None, description_trim_mode='to_end')
+    preview = config_transfer.build_preview(db, exported, 'everything')
+    monkeypatch.setattr(config_transfer, '_after_feed_commit', lambda *_args: [])
+
+    config_transfer.apply_config(
+        db, exported, 'everything', None, preview['previewToken'])
+
+    restored = db.get_podcast_by_slug('trim-feed')
+    assert (restored['description_trim_pattern'], restored['description_trim_mode']) == (
+        '*Throwback*', 'to_next')
+
+
+def test_chapter_notes_restores_from_backup(temp_db, monkeypatch):
+    db = temp_db
+    db.create_podcast('notes-feed', 'https://example.com/feed.xml', 'Show')
+    db.update_podcast('notes-feed', chapter_notes='Give donations their own chapter.')
+    exported = config_transfer.export_config(db, '2.98.2')
+    db.update_podcast('notes-feed', chapter_notes=None)
+    preview = config_transfer.build_preview(db, exported, 'everything')
+    monkeypatch.setattr(config_transfer, '_after_feed_commit', lambda *_args: [])
+
+    config_transfer.apply_config(
+        db, exported, 'everything', None, preview['previewToken'])
+
+    assert db.get_podcast_by_slug('notes-feed')['chapter_notes'] == 'Give donations their own chapter.'

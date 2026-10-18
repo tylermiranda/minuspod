@@ -12,7 +12,8 @@ os.environ.setdefault('SECRET_KEY', 'test-secret')
 
 from ad_validator import user_trimmed_keep_ranges
 from api.patterns import _handle_confirm_correction
-import main_app.processing as processing_mod
+import main_app.processing as processing
+from main_app.pipeline import verify
 from tests.unit.pass2_test_utils import _user_corrections
 
 
@@ -417,12 +418,12 @@ def test_auto_filed_confirm_remainder_is_not_a_keep_range(temp_db, monkeypatch):
                 pass2_corroborated=True,
                 pass2_corroborated_span={'start': 2485.2, 'end': 2545.3})
     slug, eid = _seed(temp_db, [hold])
-    monkeypatch.setattr(processing_mod, 'db', temp_db)
-    monkeypatch.setattr(processing_mod, 'storage', MagicMock())
+    monkeypatch.setattr(processing, 'db', temp_db)
+    monkeypatch.setattr(processing, 'storage', MagicMock())
     monkeypatch.setattr(temp_db, 'get_original_segments',
                         lambda *a: [{'start': 0.0, 'end': 30.0}])
 
-    assert processing_mod._file_corroborated_hold_approvals(slug, eid, [hold], corrections=_user_corrections(slug, eid)) == 1
+    assert verify._file_corroborated_hold_approvals(slug, eid, [hold], corrections=_user_corrections(slug, eid)) == 1
 
     podcast_id = temp_db.get_podcast_by_slug(slug)['id']
     corrections = temp_db.get_confirmed_corrections(podcast_id, eid)
@@ -435,3 +436,20 @@ def test_auto_filed_confirm_remainder_is_not_a_keep_range(temp_db, monkeypatch):
         "WHERE podcast_id = ? AND episode_id = ?", (podcast_id, eid)).fetchone()
     assert dict(row) == {'origin': 'auto_pass2',
                          'source_hold_reason': 'estimated_pattern_bounds'}
+
+
+class TestStaleReviewerProposal:
+    def test_disjoint_proposal_names_both_spans(self, temp_db):
+        marker = _held(2086.0, 2093.69)
+        marker['hold_reason'] = 'reviewer_boundary_conflict'
+        marker['reviewer_proposed_start'] = 2158.3
+        marker['reviewer_proposed_end'] = 2203.1
+        slug, eid = _seed(temp_db, [marker])
+        resp = _confirm_raw(temp_db, slug, eid,
+                            {'start': 2086.0, 'end': 2093.69},
+                            {'adjusted_start': 2158.3, 'adjusted_end': 2203.1})
+        assert _status(resp) == 400
+        body = (resp[0] if isinstance(resp, tuple) else resp).get_json()
+        assert body['error'] == (
+            'Reviewer trim 2158.3-2203.1 does not overlap this held span '
+            '2086.0-2093.7; confirm or reject the whole span')

@@ -12,7 +12,7 @@ from tests.app_bootstrap import bootstrap
 _test_data_dir = bootstrap('settings_test_', passphrase='settings-validation-test-passphrase')
 
 import database
-from api import settings as settings_api
+from api.settings import ad_detection, provider_phases
 from main_app import app
 from rate_limit_hold import (
     clear_hold, get_hold_until, is_queue_paused, record_hold_until,
@@ -30,8 +30,8 @@ def client():
 @pytest.fixture(autouse=True)
 def _disable_settings_background_jobs(monkeypatch):
     monkeypatch.setattr(
-        'api.settings.trigger_reviewer_calibration', lambda *args: None)
-    monkeypatch.setattr('api.settings.force_refresh_pricing', lambda: None)
+        'api.settings.ad_detection.trigger_reviewer_calibration', lambda *args: None)
+    monkeypatch.setattr('api.settings.provider_phases.force_refresh_pricing', lambda: None)
 
 
 class TestOpenRouterKeyValidation:
@@ -422,8 +422,8 @@ class TestWebhookTestEndpointMessage:
     @staticmethod
     def _post_test(client, results):
         webhook = {'id': 'wh1', 'url': 'https://hook.example.com', 'events': []}
-        with patch('api.settings.load_webhooks', return_value=[webhook]), \
-             patch('api.settings.fire_test_event', return_value=results):
+        with patch('api.settings.notifications.load_webhooks', return_value=[webhook]), \
+             patch('api.settings.notifications.fire_test_event', return_value=results):
             response = client.post('/api/v1/settings/webhooks/wh1/test')
         assert response.status_code == 200
         return json.loads(response.data)
@@ -516,6 +516,27 @@ class TestPartialUpdatePreservesOtherFields:
         assert db.get_setting('whisper_api_model') == 'whisper-1'
 
 
+class TestParakeetBackendSetting:
+    def test_whisper_backend_accepts_parakeet(self, client):
+        db = database.Database()
+        response = client.put(
+            '/api/v1/settings/ad-detection',
+            data=json.dumps({'whisperBackend': 'parakeet'}),
+            content_type='application/json',
+        )
+        assert response.status_code == 200, response.data
+        assert db.get_setting('whisper_backend') == 'parakeet'
+        db.set_setting('whisper_backend', 'local', is_default=False)
+
+    def test_whisper_backend_rejects_unknown(self, client):
+        response = client.put(
+            '/api/v1/settings/ad-detection',
+            data=json.dumps({'whisperBackend': 'nemo'}),
+            content_type='application/json',
+        )
+        assert response.status_code == 400
+
+
 class TestProviderChangeModelIdentity:
     """Provider identity changes clear stale models without a catalog request."""
 
@@ -531,7 +552,7 @@ class TestProviderChangeModelIdentity:
         fake_client = MagicMock()
         fake_client.list_models.return_value = []
         fake_client.probe_json_format_support.return_value = None
-        with patch('api.settings.get_llm_client', return_value=fake_client):
+        with patch('api.settings.provider_phases.get_llm_client', return_value=fake_client):
             response = client.put(
                 '/api/v1/settings/ad-detection',
                 data=json.dumps({'llmProvider': 'openai-compatible'}),
@@ -555,7 +576,7 @@ class TestProviderChangeModelIdentity:
         fake_client = MagicMock()
         fake_client.list_models.side_effect = RuntimeError('network down')
         fake_client.probe_json_format_support.return_value = None
-        with patch('api.settings.get_llm_client', return_value=fake_client):
+        with patch('api.settings.provider_phases.get_llm_client', return_value=fake_client):
             response = client.put(
                 '/api/v1/settings/ad-detection',
                 data=json.dumps({'llmProvider': 'openai-compatible'}),
@@ -575,7 +596,7 @@ class TestProviderChangeModelIdentity:
         fake_client = MagicMock()
         fake_client.list_models.return_value = [fake_model_a, fake_model_b]
         fake_client.probe_json_format_support.return_value = None
-        with patch('api.settings.get_llm_client', return_value=fake_client):
+        with patch('api.settings.provider_phases.get_llm_client', return_value=fake_client):
             response = client.put(
                 '/api/v1/settings/ad-detection',
                 data=json.dumps({'llmProvider': 'anthropic'}),
@@ -594,7 +615,7 @@ class TestProviderChangeModelIdentity:
         fake_client = MagicMock()
         fake_client.list_models.return_value = [fake_model]
         fake_client.probe_json_format_support.return_value = None
-        with patch('api.settings.get_llm_client', return_value=fake_client):
+        with patch('api.settings.provider_phases.get_llm_client', return_value=fake_client):
             response = client.put(
                 '/api/v1/settings/ad-detection',
                 data=json.dumps({
@@ -619,7 +640,7 @@ class TestProviderChangeModelIdentity:
         fake_client = MagicMock()
         fake_client.list_models.return_value = [fake_model]
         fake_client.probe_json_format_support.return_value = None
-        with patch('api.settings.get_llm_client', return_value=fake_client):
+        with patch('api.settings.provider_phases.get_llm_client', return_value=fake_client):
             response = client.put(
                 '/api/v1/settings/ad-detection',
                 data=json.dumps({'llmProvider': 'openrouter'}),
@@ -646,7 +667,7 @@ class TestProviderChangeModelIdentity:
         fake_client = MagicMock()
         fake_client.list_models.return_value = [fake_model]
         fake_client.probe_json_format_support.return_value = None
-        with patch('api.settings.get_llm_client', return_value=fake_client):
+        with patch('api.settings.provider_phases.get_llm_client', return_value=fake_client):
             response = client.put(
                 '/api/v1/settings/ad-detection',
                 data=json.dumps({
@@ -666,7 +687,7 @@ class TestProviderChangeModelIdentity:
         fake_client = MagicMock()
         fake_client.list_models.return_value = []
         fake_client.probe_json_format_support.return_value = None
-        with patch('api.settings.get_llm_client', return_value=fake_client):
+        with patch('api.settings.provider_phases.get_llm_client', return_value=fake_client):
             response = client.put(
                 '/api/v1/settings/ad-detection',
                 data=json.dumps({'llmProvider': 'openai-compatible'}),
@@ -688,7 +709,7 @@ class TestProviderChangeModelIdentity:
         fake_client = MagicMock()
         fake_client.list_models.return_value = [fake_model]
         fake_client.probe_json_format_support.return_value = None
-        with patch('api.settings.get_llm_client', return_value=fake_client):
+        with patch('api.settings.provider_phases.get_llm_client', return_value=fake_client):
             response = client.put(
                 '/api/v1/settings/ad-detection',
                 data=json.dumps({'llmProvider': 'openai-compatible'}),
@@ -747,11 +768,11 @@ class TestProviderChangeModelIdentity:
         db = database.Database()
         db.set_setting('llm_provider', 'openrouter', is_default=False)
         db.set_setting('claude_model', 'private/openrouter-model', is_default=False)
-        monkeypatch.setattr('api.settings.set_or_clear_secret', lambda *_args: None)
+        monkeypatch.setattr('api.settings.provider_phases.set_or_clear_secret', lambda *_args: None)
         fake_client = MagicMock()
         fake_client.probe_json_format_support.return_value = None
 
-        with patch('api.settings.get_llm_client', return_value=fake_client):
+        with patch('api.settings.provider_phases.get_llm_client', return_value=fake_client):
             response = client.put(
                 '/api/v1/settings/ad-detection',
                 data=json.dumps({'openrouterApiKey': 'sk-or-new-key'}),
@@ -808,7 +829,7 @@ class TestProviderChangeModelIdentity:
         fake_client = MagicMock()
         fake_client.list_models.return_value = [fake_model]
         fake_client.probe_json_format_support.return_value = None
-        with patch('api.settings.get_llm_client', return_value=fake_client):
+        with patch('api.settings.provider_phases.get_llm_client', return_value=fake_client):
             response = client.put(
                 '/api/v1/settings/ad-detection',
                 data=json.dumps({'llmProvider': 'openai-compatible'}),
@@ -830,7 +851,7 @@ class TestProviderChangeModelIdentity:
         fake_client.list_models.return_value = [fake_model]
         fake_client.probe_json_format_support.return_value = None
         try:
-            with patch('api.settings.get_llm_client', return_value=fake_client):
+            with patch('api.settings.provider_phases.get_llm_client', return_value=fake_client):
                 response = client.put(
                     '/api/v1/settings/ad-detection',
                     data=json.dumps({
@@ -868,7 +889,7 @@ class TestProviderSaveHoldInvalidation:
         fake_client.list_models.return_value = []
         fake_client.probe_json_format_support.return_value = None
         try:
-            with patch('api.settings.get_llm_client', return_value=fake_client):
+            with patch('api.settings.provider_phases.get_llm_client', return_value=fake_client):
                 response = client.put(
                     '/api/v1/settings/ad-detection',
                     data=json.dumps({'openaiBaseUrl': 'http://localhost:9001/v1'}),
@@ -890,7 +911,7 @@ class TestProviderSaveHoldInvalidation:
         fake_client.list_models.return_value = []
         fake_client.probe_json_format_support.return_value = None
         try:
-            with patch('api.settings.get_llm_client', return_value=fake_client):
+            with patch('api.settings.provider_phases.get_llm_client', return_value=fake_client):
                 response = client.put(
                     '/api/v1/settings/ad-detection',
                     data=json.dumps({'llmProvider': 'openai-compatible'}),
@@ -914,7 +935,7 @@ class TestProviderSaveHoldInvalidation:
         fake_client.list_models.return_value = []
         fake_client.probe_json_format_support.return_value = None
         try:
-            with patch('api.settings.get_llm_client', return_value=fake_client), \
+            with patch('api.settings.provider_phases.get_llm_client', return_value=fake_client), \
                     patch('rate_limit_hold.fire_queue_resumed_event') as fire:
                 response = client.put(
                     '/api/v1/settings/ad-detection',
@@ -1101,12 +1122,12 @@ class TestOpenaiBaseUrlValidation:
     def test_pure_settings_validator_checks_url_syntax_without_dns(self, monkeypatch):
         db = database.Database()
         monkeypatch.setattr(
-            settings_api, 'validate_base_url',
+            provider_phases, 'validate_base_url',
             lambda *_args: pytest.fail('pure settings validation must not resolve provider URLs'))
 
-        assert settings_api.validate_settings_payload(
+        assert ad_detection.validate_settings_payload(
             db, {'openaiBaseUrl': 'https://provider.example/v1'}) is None
-        assert settings_api.validate_settings_payload(
+        assert ad_detection.validate_settings_payload(
             db, {'openaiBaseUrl': 'file:///etc/passwd'}) == (
                 "Invalid base URL: Blocked URL scheme: 'file'", 400)
 
@@ -1117,7 +1138,7 @@ class TestOpenaiBaseUrlValidation:
         def validate_outside_transaction(value):
             assert not db.in_settings_transaction()
 
-        monkeypatch.setattr(settings_api, 'validate_base_url', validate_outside_transaction)
+        monkeypatch.setattr(provider_phases, 'validate_base_url', validate_outside_transaction)
         response = client.put(
             '/api/v1/settings/ad-detection',
             data=json.dumps({'secondaryProviderBaseUrl': 'https://provider.example/v1'}),
@@ -1135,12 +1156,15 @@ class TestOpenaiBaseUrlValidation:
         ({'audioCueFreqMinHz': 500, 'audioCueFreqMaxHz': 400},
          'audioCueFreqMinHz must be below audioCueFreqMaxHz'),
         ({'maxAdDurationSeconds': 901}, 'maxAdDurationSeconds cannot exceed'),
+        ({'maxLlmWindowAdSeconds': 59}, 'maxLlmWindowAdSeconds must be between 60 and 900'),
+        ({'maxLlmWindowAdSeconds': 901}, 'maxLlmWindowAdSeconds must be between 60 and 900'),
+        ({'maxLlmWindowAdSeconds': 'abc'}, 'maxLlmWindowAdSeconds must be a number'),
     ])
     def test_shared_validator_rejects_invalid_values_without_writes(self, payload, expected):
         db = database.Database()
         before = db.get_all_settings()
 
-        issue = settings_api.validate_settings_payload(db, payload)
+        issue = ad_detection.validate_settings_payload(db, payload)
 
         assert issue is not None
         assert issue[0].startswith(expected)
@@ -1160,9 +1184,9 @@ class TestOpenaiBaseUrlValidation:
         db.set_setting('chapter_window_seconds', '2700')
         db.set_setting('chapter_min_duration_seconds', '700')
 
-        window_issue = settings_api.validate_settings_payload(
+        window_issue = ad_detection.validate_settings_payload(
             db, {'windowSizeSeconds': None})
-        chapter_issue = settings_api.validate_settings_payload(
+        chapter_issue = ad_detection.validate_settings_payload(
             db, {'chapterTargetSeconds': None})
 
         assert window_issue == (
@@ -1180,7 +1204,7 @@ class TestOpenaiBaseUrlValidation:
         db.set_setting('window_size_seconds', '3600')
         db.set_setting('window_overlap_seconds', '1500')
 
-        assert settings_api.validate_settings_payload(db, {
+        assert ad_detection.validate_settings_payload(db, {
             'windowSizeSeconds': None,
             'windowOverlapSeconds': None,
         }) is None
@@ -1934,6 +1958,22 @@ class TestAdLengthCeilingPair:
         assert self._current(client) == (240.0, 800.0)
 
 
+class TestMaxLlmWindowAdSetting:
+    def _put(self, client, payload):
+        return client.put('/api/v1/settings/ad-detection',
+                          data=json.dumps(payload),
+                          content_type='application/json')
+
+    def test_value_persists_and_is_returned(self, client):
+        assert self._put(client, {'maxLlmWindowAdSeconds': 600}).status_code == 200
+        assert database.Database().get_setting_float('max_llm_window_ad_seconds', 420.0) == 600.0
+        body = json.loads(client.get('/api/v1/settings').data)
+        assert body['maxLlmWindowAdSeconds']['value'] == 600.0
+
+    def test_out_of_range_is_rejected(self, client):
+        assert self._put(client, {'maxLlmWindowAdSeconds': 30}).status_code == 400
+
+
 class TestWhisperApiTimeoutSetting:
     """Issue #593: the per-request timeout for a remote Whisper backend."""
 
@@ -2095,7 +2135,7 @@ class TestProviderChangeLiftsRateLimitHold:
         fake_client = MagicMock()
         fake_client.list_models.return_value = []
         fake_client.probe_json_format_support.return_value = None
-        with patch('api.settings.get_llm_client', return_value=fake_client):
+        with patch('api.settings.provider_phases.get_llm_client', return_value=fake_client):
             return client.put(
                 '/api/v1/settings/ad-detection',
                 data=json.dumps(payload),

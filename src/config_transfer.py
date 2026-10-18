@@ -120,7 +120,7 @@ FEED_COLUMNS = (
     'title', 'description', 'source_url', 'network_id', 'dai_platform',
     'network_id_override', 'audio_analysis_override', 'auto_process_override',
     'language_override', 'download_user_agent_override', 'feed_user_agent_override',
-    'title_override', 'detection_notes', 'detection_mode',
+    'title_override', 'detection_notes', 'detection_mode', 'chapter_notes',
     'chapters_mode', 'chapters_in_notes', 'own_episode_guids',
     'cue_template_score_override', 'cue_create_from_pairs_override',
     'cue_pair_min_break_override', 'cue_pair_max_break_override',
@@ -134,6 +134,7 @@ FEED_COLUMNS = (
     'segment_category_actions', 'detect_show_segments', 'skip_second_pass',
     'transcript_differential', 'skip_transcription', 'cue_only_safety',
     'queue_priority', 'title_skip_patterns', 'description_skip_patterns',
+    'description_trim_pattern', 'description_trim_mode',
     'title_skip_action', 'min_duration_seconds', 'max_duration_seconds',
     'low_ad_yield_action', 'episode_logs', 'retention_days_override',
     'keep_original_audio_override', 'user_tags', 'author', 'explicit',
@@ -774,7 +775,7 @@ def _resolve_scope(plan, scope, selected_feeds):
 
 
 def _normalize_import_settings(settings, db=None):
-    from api import settings as settings_api
+    from api.settings import ad_detection
 
     normalized = dict(settings)
     snapshot = db.get_all_settings() if db is not None else {}
@@ -789,7 +790,7 @@ def _normalize_import_settings(settings, db=None):
         except SystemOneSettingsError as exc:
             raise ConfigTransferError(f'{key} is invalid: {exc}') from None
     if 'model_pricing_overrides' in normalized:
-        pricing, issue = settings_api._model_pricing_patch(normalized['model_pricing_overrides'])
+        pricing, issue = ad_detection._model_pricing_patch(normalized['model_pricing_overrides'])
         if issue:
             raise ConfigTransferError(*issue)
         normalized['model_pricing_overrides'] = {
@@ -995,13 +996,14 @@ def _validated_feed_updates(db, podcast, payload, feed_type, *, confirmed_ceilin
             if key == 'queue_priority' and (isinstance(value, bool) or value not in (-10, 0, 10)):
                 raise ConfigTransferError('queue_priority must be -10, 0, 10, or null')
         elif key in ('language_override', 'download_user_agent_override', 'feed_user_agent_override',
-                     'title_override', 'detection_notes'):
+                     'title_override', 'detection_notes', 'chapter_notes'):
             normalizer = {
                 'language_override': feed_api._normalize_language_override,
                 'download_user_agent_override': feed_api._normalize_download_user_agent_override,
                 'feed_user_agent_override': feed_api._normalize_feed_user_agent_override,
                 'title_override': feed_api._normalize_title_override,
                 'detection_notes': feed_api._normalize_detection_notes,
+                'chapter_notes': feed_api._normalize_chapter_notes,
             }[key]
             value, error = normalizer(value)
             if error:
@@ -1025,6 +1027,15 @@ def _validated_feed_updates(db, podcast, payload, feed_type, *, confirmed_ceilin
                 raise ConfigTransferError(error)
         elif key == 'description_skip_patterns':
             value, error = feed_api._normalize_description_skip_patterns(value)
+            if error:
+                raise ConfigTransferError(error)
+        elif key == 'description_trim_pattern':
+            value, error = feed_api._normalize_description_trim_pattern(value)
+            if error:
+                raise ConfigTransferError(error)
+        elif key == 'description_trim_mode':
+            value, error = feed_api._normalize_description_trim_mode(
+                'to_end' if value is None else value)
             if error:
                 raise ConfigTransferError(error)
         elif key in ('min_duration_seconds', 'max_duration_seconds'):
@@ -1134,14 +1145,14 @@ def _setting_payload(settings):
 
 
 def _settings_validation_error(db, payload, feeds=None):
-    from api import settings as settings_api
+    from api.settings import ad_detection
     feed_modes = {
         feed['slug']: feed.get('settings', {}).get('chapters_mode')
         for feed in (feeds or ()) if 'chapters_mode' in feed.get('settings', {})
     }
     if not payload and not feed_modes:
         return None
-    issue = settings_api.validate_settings_payload(
+    issue = ad_detection.validate_settings_payload(
         db, payload, allow_inactive_tunables=True,
         prospective_feed_modes=feed_modes)
     if issue is not None:
@@ -1194,7 +1205,7 @@ def _phase_applied_setting_keys(settings):
 
 
 def apply_config(db, document, scope, selected_feeds, preview_token):
-    from api import settings as settings_api
+    from api.settings import ad_detection, common, provider_phases
 
     plan = _validate_document(document)
     settings, feeds = _resolve_scope(plan, scope, selected_feeds)
@@ -1208,7 +1219,7 @@ def apply_config(db, document, scope, selected_feeds, preview_token):
     issue = _settings_validation_error(db, payload, feeds)
     if issue:
         raise issue
-    endpoint_issue = settings_api.validate_provider_endpoint_security(payload)
+    endpoint_issue = provider_phases.validate_provider_endpoint_security(payload)
     if endpoint_issue:
         raise ConfigTransferError(*endpoint_issue)
     if any(key in SECRET_SETTING_KEYS and value for key, value in settings.items()) and not is_available():
@@ -1219,8 +1230,6 @@ def apply_config(db, document, scope, selected_feeds, preview_token):
             fx_rate = get_usd_rate(settings['provider_budget_display_currency'])
         except FxRateError as exc:
             raise ConfigTransferError(str(exc), 503) from exc
-    _deferred = {name: [] for name in settings_api._POST_COMMIT_BUCKETS}
-    settings_api._deferred.buckets = _deferred
     changed_stages = []
     previous_calibration = None
     changed_feeds = []
@@ -1235,170 +1244,165 @@ def apply_config(db, document, scope, selected_feeds, preview_token):
         'title', 'author', 'explicit', 'categories',
         'p20_channel_json', 'description', 'chapters_in_notes',
     }
-    try:
-        with db.settings_transaction() as conn:
-            current = build_preview(db, document, scope, selected_feeds)
-            if current['previewToken'] != preview_token:
-                raise ConfigTransferError('Destination changed since preview; preview again', 409)
-            previous_identities = settings_api._model_identity_snapshot(db)
-            model_settings = {
-                'detection': 'claude_model', 'review': 'review_model',
-                'verification': 'verification_model', 'chapters': 'chapters_model',
-            }
-            old_models = {stage: db.get_setting(key) for stage, key in model_settings.items()
-                          if key in settings}
-            if old_models and previous_calibration is None:
-                previous_calibration = settings_api.calibration_revision()
-            if payload:
-                changed_stages, previous_calibration = settings_api.apply_settings_payload_in_transaction(
-                    db, payload, allow_inactive_tunables=True)
-            phase_applied_setting_keys = _phase_applied_setting_keys(settings)
-            primary_credentials = {
-                'anthropic_api_key': 'anthropic',
-                'openai_api_key': 'openai-compatible',
-                'ollama_api_key': 'ollama',
-                'typesafe_api_key': 'typesafe',
-                'systemone_api_key': 'systemone-compatible',
-            }
-            for key, value in settings.items():
-                if key in phase_applied_setting_keys:
-                    continue
-                if (key == 'pattern_cleanup_enabled' and value is True
-                        and not db.get_setting_bool(key, default=False)):
-                    db.set_setting('pattern_cleanup_schedule_anchor', utc_now_iso(), is_default=False)
-                if key in SECRET_SETTING_KEYS:
-                    old_secret = db.get_setting(key)
-                    if old_secret and is_ciphertext(old_secret):
-                        old_secret = decrypt(db, old_secret)
-                    try:
-                        set_or_clear_secret(db, key, value)
-                    except SecretWriteRejected:
-                        raise ConfigTransferError('Destination secret encryption is unavailable', 409) from None
-                    if key in primary_credentials and (old_secret or '') != (value or ''):
-                        settings_api._after_commit(
-                            partial(clear_hold_for_provider_change, db, 'Provider credentials restored',
-                                    provider_key=primary_credentials[key]), bucket='holds')
-                elif key == 'pattern_cleanup_provider' and value == '':
-                    db.clear_setting(key)
-                elif value is None:
-                    db.clear_setting(key)
-                else:
-                    db.set_setting(key, _setting_to_storage(value), is_default=False)
-            if fx_rate is not None:
-                for key, value in {
-                    'provider_budget_display_currency': fx_rate.currency,
-                    'provider_budget_fx_rate': str(fx_rate.local_per_usd),
-                    'provider_budget_fx_source_date': fx_rate.source_date,
-                    'provider_budget_fx_fetched_at': utc_now_iso(),
-                }.items():
-                    if value is None:
+    with common.post_commit_scope() as _deferred:
+        try:
+            with db.settings_transaction() as conn:
+                current = build_preview(db, document, scope, selected_feeds)
+                if current['previewToken'] != preview_token:
+                    raise ConfigTransferError('Destination changed since preview; preview again', 409)
+                previous_identities = ad_detection._model_identity_snapshot(db)
+                model_settings = {
+                    'detection': 'claude_model', 'review': 'review_model',
+                    'verification': 'verification_model', 'chapters': 'chapters_model',
+                }
+                old_models = {stage: db.get_setting(key) for stage, key in model_settings.items()
+                              if key in settings}
+                if old_models and previous_calibration is None:
+                    previous_calibration = ad_detection.calibration_revision()
+                if payload:
+                    changed_stages, previous_calibration = ad_detection.apply_settings_payload_in_transaction(
+                        db, payload, allow_inactive_tunables=True)
+                phase_applied_setting_keys = _phase_applied_setting_keys(settings)
+                primary_credentials = {
+                    'anthropic_api_key': 'anthropic',
+                    'openai_api_key': 'openai-compatible',
+                    'ollama_api_key': 'ollama',
+                    'typesafe_api_key': 'typesafe',
+                    'systemone_api_key': 'systemone-compatible',
+                }
+                for key, value in settings.items():
+                    if key in phase_applied_setting_keys:
+                        continue
+                    if (key == 'pattern_cleanup_enabled' and value is True
+                            and not db.get_setting_bool(key, default=False)):
+                        db.set_setting('pattern_cleanup_schedule_anchor', utc_now_iso(), is_default=False)
+                    if key in SECRET_SETTING_KEYS:
+                        old_secret = db.get_setting(key)
+                        if old_secret and is_ciphertext(old_secret):
+                            old_secret = decrypt(db, old_secret)
+                        try:
+                            set_or_clear_secret(db, key, value)
+                        except SecretWriteRejected:
+                            raise ConfigTransferError('Destination secret encryption is unavailable', 409) from None
+                        if key in primary_credentials and (old_secret or '') != (value or ''):
+                            common.after_commit(
+                                partial(clear_hold_for_provider_change, db, 'Provider credentials restored',
+                                        provider_key=primary_credentials[key]), bucket='holds')
+                    elif key == 'pattern_cleanup_provider' and value == '':
+                        db.clear_setting(key)
+                    elif value is None:
                         db.clear_setting(key)
                     else:
-                        db.set_setting(key, value, is_default=False)
-            if any(key in settings for key in (
-                    'anthropic_api_key', 'openai_api_key', 'ollama_api_key',
-                    'typesafe_api_key', 'systemone_api_key', 'systemone_base_url')):
-                settings_api._after_commit(settings_api.invalidate_provider_cache)
-            null_keys = {key for key, value in settings.items() if value is None}
-            if null_keys & {'llm_provider', 'openai_base_url', 'claude_model',
-                            'verification_model', 'review_model', 'chapters_model',
-                            'detection_provider', 'verification_provider', 'chapters_provider',
-                            'anthropic_api_key', 'openai_api_key', 'openrouter_api_key',
-                            'ollama_api_key', 'secondary_provider_api_key', 'failover_llm_api_key',
-                            'typesafe_api_key', 'systemone_api_key', 'systemone_base_url'}:
-                settings_api._after_commit(settings_api.invalidate_provider_cache)
-            if null_keys & {'whisper_model', 'whisper_backend', 'whisper_api_base_url',
-                            'whisper_api_key', 'whisper_api_model', 'failover_whisper_api_key'}:
-                settings_api._after_commit(settings_api._mark_whisper_for_reload)
-                settings_api._after_commit(settings_api._refresh_whisper_pool)
-            if null_keys & {'download_user_agent', 'feed_user_agent'}:
-                settings_api._after_commit(settings_api.invalidate_user_agent_cache)
-            if 'feed_auth_key' in settings:
-                settings_api._after_commit(db.clear_all_podcast_etags)
-            for feed in feeds:
-                slug = feed['slug']
-                current_row = conn.execute(
-                    f"SELECT slug, id, feed_type, {', '.join(FEED_COLUMNS)} "  # noqa: S608
-                    "FROM podcasts WHERE slug = ?",
-                    (slug,),
-                ).fetchone()
-                if current_row and (current_row['feed_type'] != feed['feedType']
-                                    or current_row['source_url'] != feed.get('settings', {}).get('source_url', '')):
-                    raise ConfigTransferError(f'Feed identity conflict for {slug}')
-                source_url = feed.get('settings', {}).get('source_url', '')
-                duplicate_source = conn.execute(
-                    'SELECT slug FROM podcasts WHERE source_url = ? AND slug != ? LIMIT 1',
-                    (source_url, slug),
-                ).fetchone()
-                if feed['feedType'] == 'subscribed' and duplicate_source:
-                    raise ConfigTransferError('Source URL already belongs to another feed')
-                updates = _validated_feed_updates(
-                    db, dict(current_row) if current_row else None,
-                    feed['settings'], feed['feedType'])
-                if current_row and feed['feedType'] == 'subscribed':
-                    updates.pop('title', None)
-                if current_row is None:
-                    if feed['feedType'] == 'recents':
-                        raise ConfigTransferError('A recents feed must already exist on the destination')
-                    title = updates.pop('title', None)
-                    source_url = updates.pop('source_url', f'local://{slug}')
-                    db.create_podcast(slug, source_url, title, feed['feedType'], conn=conn)
-                    if feed['feedType'] == 'local' and 'p20_channel_json' not in updates:
-                        from api.feeds import _apply_p20_merge, _public_feed_url
-                        feed_url = _public_feed_url(slug, db.get_setting('feed_auth_key'))
-                        channel = _apply_p20_merge(
-                            {'medium': 'podcast', 'locked': 'yes'}, {})
-                        channel['guid'] = compute_feed_guid(feed_url)
-                        updates['p20_channel_json'] = _canonical_json(channel)
-                    db.update_podcast(slug, conn=conn, **updates)
-                    added_feeds.append(slug)
-                    refresh_slugs.add(slug)
-                else:
-                    updates.pop('source_url', None)
-                    db.update_podcast(slug, conn=conn, **updates)
-                    changed_feeds.append(slug)
-                    if rss_fields & updates.keys():
+                        db.set_setting(key, _setting_to_storage(value), is_default=False)
+                if fx_rate is not None:
+                    for key, value in {
+                        'provider_budget_display_currency': fx_rate.currency,
+                        'provider_budget_fx_rate': str(fx_rate.local_per_usd),
+                        'provider_budget_fx_source_date': fx_rate.source_date,
+                        'provider_budget_fx_fetched_at': utc_now_iso(),
+                    }.items():
+                        if value is None:
+                            db.clear_setting(key)
+                        else:
+                            db.set_setting(key, value, is_default=False)
+                if any(key in settings for key in (
+                        'anthropic_api_key', 'openai_api_key', 'ollama_api_key',
+                        'typesafe_api_key', 'systemone_api_key', 'systemone_base_url')):
+                    common.after_commit(provider_phases.invalidate_provider_cache)
+                null_keys = {key for key, value in settings.items() if value is None}
+                if null_keys & {'llm_provider', 'openai_base_url', 'claude_model',
+                                'verification_model', 'review_model', 'chapters_model',
+                                'detection_provider', 'verification_provider', 'chapters_provider',
+                                'anthropic_api_key', 'openai_api_key', 'openrouter_api_key',
+                                'ollama_api_key', 'secondary_provider_api_key', 'failover_llm_api_key',
+                                'typesafe_api_key', 'systemone_api_key', 'systemone_base_url'}:
+                    common.after_commit(provider_phases.invalidate_provider_cache)
+                if null_keys & {'whisper_model', 'whisper_backend', 'whisper_api_base_url',
+                                'whisper_api_key', 'whisper_api_model', 'failover_whisper_api_key'}:
+                    common.after_commit(provider_phases._mark_whisper_for_reload)
+                    common.after_commit(provider_phases._refresh_whisper_pool)
+                if null_keys & {'download_user_agent', 'feed_user_agent'}:
+                    common.after_commit(ad_detection.invalidate_user_agent_cache)
+                if 'feed_auth_key' in settings:
+                    common.after_commit(db.clear_all_podcast_etags)
+                for feed in feeds:
+                    slug = feed['slug']
+                    current_row = conn.execute(
+                        f"SELECT slug, id, feed_type, {', '.join(FEED_COLUMNS)} "  # noqa: S608
+                        "FROM podcasts WHERE slug = ?",
+                        (slug,),
+                    ).fetchone()
+                    if current_row and (current_row['feed_type'] != feed['feedType']
+                                        or current_row['source_url'] != feed.get('settings', {}).get('source_url', '')):
+                        raise ConfigTransferError(f'Feed identity conflict for {slug}')
+                    source_url = feed.get('settings', {}).get('source_url', '')
+                    duplicate_source = conn.execute(
+                        'SELECT slug FROM podcasts WHERE source_url = ? AND slug != ? LIMIT 1',
+                        (source_url, slug),
+                    ).fetchone()
+                    if feed['feedType'] == 'subscribed' and duplicate_source:
+                        raise ConfigTransferError('Source URL already belongs to another feed')
+                    updates = _validated_feed_updates(
+                        db, dict(current_row) if current_row else None,
+                        feed['settings'], feed['feedType'])
+                    if current_row and feed['feedType'] == 'subscribed':
+                        updates.pop('title', None)
+                    if current_row is None:
+                        if feed['feedType'] == 'recents':
+                            raise ConfigTransferError('A recents feed must already exist on the destination')
+                        title = updates.pop('title', None)
+                        source_url = updates.pop('source_url', f'local://{slug}')
+                        db.create_podcast(slug, source_url, title, feed['feedType'], conn=conn)
+                        if feed['feedType'] == 'local' and 'p20_channel_json' not in updates:
+                            from api.feeds import _apply_p20_merge, _public_feed_url
+                            feed_url = _public_feed_url(slug, db.get_setting('feed_auth_key'))
+                            channel = _apply_p20_merge(
+                                {'medium': 'podcast', 'locked': 'yes'}, {})
+                            channel['guid'] = compute_feed_guid(feed_url)
+                            updates['p20_channel_json'] = _canonical_json(channel)
+                        db.update_podcast(slug, conn=conn, **updates)
+                        added_feeds.append(slug)
                         refresh_slugs.add(slug)
-                    if ('queue_priority' in updates
-                            and updates['queue_priority'] != current_row['queue_priority']):
-                        priority_changes.append((current_row['id'], updates['queue_priority'] or 0))
-                fresh = conn.execute('SELECT id, network_id, network_id_override, queue_priority FROM podcasts WHERE slug = ?', (slug,)).fetchone()
-                if 'network_id' in updates or 'network_id_override' in updates:
-                    effective_network = updates.get('network_id_override') or fresh['network_id_override'] or fresh['network_id']
-                    db.retag_network_cue_templates(fresh['id'], effective_network, conn=conn)
-            for stage, key in model_settings.items():
-                if stage in old_models and db.get_setting(key) != old_models[stage]:
-                    changed_stages.append(stage)
-            supplied_models = dict(payload)
-            for key, value in settings.items():
-                spec = SETTINGS_REGISTRY.get(key)
-                if spec and spec.payload_key:
-                    supplied_models[spec.payload_key] = value
-            if 'pattern_cleanup_model' in settings:
-                supplied_models['patternCleanupModel'] = settings['pattern_cleanup_model']
-            changed_stages.extend(settings_api._clear_models_for_identity_changes(
-                db, previous_identities, supplied_models))
-            changed_stages = sorted(set(changed_stages))
-            try:
-                transfer_revision = int(db.get_setting('config_transfer_revision') or 0)
-            except (TypeError, ValueError):
-                transfer_revision = 0
-            db.set_setting('config_transfer_revision', str(transfer_revision + 1), is_default=False)
-    except settings_api._PhaseRejected as rejected:
-        settings_api._deferred.buckets = None
-        response = rejected.response
-        body = response.get_json(silent=True) if hasattr(response, 'get_json') else {}
-        status = getattr(response, 'status_code', 400)
-        raise ConfigTransferError(
-            (body or {}).get('error', 'Settings failed validation'), status) from rejected
-    except BaseException:
-        settings_api._deferred.buckets = None
-        raise
-    settings_api._deferred.buckets = None
-    settings_api._run_post_commit(_deferred['side_effects'])
-    settings_api._run_post_commit(_deferred['holds'])
+                    else:
+                        updates.pop('source_url', None)
+                        db.update_podcast(slug, conn=conn, **updates)
+                        changed_feeds.append(slug)
+                        if rss_fields & updates.keys():
+                            refresh_slugs.add(slug)
+                        if ('queue_priority' in updates
+                                and updates['queue_priority'] != current_row['queue_priority']):
+                            priority_changes.append((current_row['id'], updates['queue_priority'] or 0))
+                    fresh = conn.execute('SELECT id, network_id, network_id_override, queue_priority FROM podcasts WHERE slug = ?', (slug,)).fetchone()
+                    if 'network_id' in updates or 'network_id_override' in updates:
+                        effective_network = updates.get('network_id_override') or fresh['network_id_override'] or fresh['network_id']
+                        db.retag_network_cue_templates(fresh['id'], effective_network, conn=conn)
+                for stage, key in model_settings.items():
+                    if stage in old_models and db.get_setting(key) != old_models[stage]:
+                        changed_stages.append(stage)
+                supplied_models = dict(payload)
+                for key, value in settings.items():
+                    spec = SETTINGS_REGISTRY.get(key)
+                    if spec and spec.payload_key:
+                        supplied_models[spec.payload_key] = value
+                if 'pattern_cleanup_model' in settings:
+                    supplied_models['patternCleanupModel'] = settings['pattern_cleanup_model']
+                changed_stages.extend(ad_detection._clear_models_for_identity_changes(
+                    db, previous_identities, supplied_models))
+                changed_stages = sorted(set(changed_stages))
+                try:
+                    transfer_revision = int(db.get_setting('config_transfer_revision') or 0)
+                except (TypeError, ValueError):
+                    transfer_revision = 0
+                db.set_setting('config_transfer_revision', str(transfer_revision + 1), is_default=False)
+        except common._PhaseRejected as rejected:
+            response = rejected.response
+            body = response.get_json(silent=True) if hasattr(response, 'get_json') else {}
+            status = getattr(response, 'status_code', 400)
+            raise ConfigTransferError(
+                (body or {}).get('error', 'Settings failed validation'), status) from rejected
+    common.run_post_commit(_deferred)
     if previous_calibration is not None:
-        settings_api.finish_settings_payload_after_commit(db, changed_stages, previous_calibration)
+        ad_detection.finish_settings_payload_after_commit(db, changed_stages, previous_calibration)
     warnings = _after_feed_commit(
         db, changed_feeds + added_feeds, priority_changes, refresh_slugs)
     return {'message': 'Configuration imported', 'addedFeeds': added_feeds,

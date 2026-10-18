@@ -21,14 +21,14 @@ from config import (
     PROVIDER_ANTHROPIC, PROVIDER_OPENROUTER, PROVIDER_OPENAI_COMPATIBLE,
     PROVIDER_OLLAMA,
     SYSTEMONE_PROVIDERS,
-    WHISPER_BACKEND_LOCAL, WHISPER_BACKEND_API,
+    WHISPER_BACKEND_LOCAL, WHISPER_BACKEND_API, WHISPER_BACKEND_PARAKEET,
     WHISPER_COMPUTE_TYPE_DEFAULT,
     AD_DETECTION_PARALLEL_WINDOWS_DEFAULT,
     AD_REVIEWER_PARALLEL_ADS_DEFAULT,
     MAX_ARTWORK_BYTES_MIN, MAX_ARTWORK_BYTES_MAX, MAX_RSS_BYTES_MIN,
     MAX_AUDIO_DOWNLOAD_MB_MIN,
     MIN_CONTENT_BETWEEN_ADS_SECONDS,
-    MAX_AD_DURATION, MAX_AD_DURATION_CONFIRMED,
+    MAX_AD_DURATION, MAX_AD_DURATION_CONFIRMED, MAX_AD_DURATION_WINDOW,
     REVIEW_MAX_BOUNDARY_SHIFT_DEFAULT,
     AUDIO_CUE_FREQ_MIN_HZ, AUDIO_CUE_FREQ_MAX_HZ, AUDIO_CUE_PROMINENCE_DB,
     AUDIO_CUE_MIN_CONFIDENCE, AUDIO_CUE_TEMPLATE_SCORE,
@@ -122,8 +122,8 @@ DEFAULT_MODEL_PRICING = {
 # audio-cue reset gap for the drift bugs that motivated this):
 #   1. schema seeding: iter_seed_defaults() (database/schema/__init__.py)
 #   2. reset_setting() below
-#   3. the bulk reset endpoint key list: AD_RESET_SETTING_KEYS (api/settings.py)
-#   4. GET /settings 'defaults' payload: registry_get_default() (api/settings.py)
+#   3. the bulk reset endpoint key list: AD_RESET_SETTING_KEYS (api/settings/ad_detection.py)
+#   4. GET /settings 'defaults' payload: registry_get_default() (api/settings/core.py)
 #
 # Env-backed keys (ENV_BACKED_SETTINGS) and stage tunables
 # (STAGE_TUNABLE_DEFAULTS) keep their existing resolution mechanisms;
@@ -363,7 +363,8 @@ SETTINGS_REGISTRY: dict[str, SettingSpec] = {
         payload_key='failoverWhisperEnabled', payload_kind='bool'),
     'failover_whisper_backend': SettingSpec(
         default='openai-api', seeded=True, payload_key='failoverWhisperBackend',
-        validator=_one_of(WHISPER_BACKEND_LOCAL, WHISPER_BACKEND_API)),
+        validator=_one_of(WHISPER_BACKEND_LOCAL, WHISPER_BACKEND_API,
+                          WHISPER_BACKEND_PARAKEET)),
     'failover_whisper_model': SettingSpec(
         default='', seeded=True, payload_key='failoverWhisperModel'),
     'failover_whisper_api_base_url': SettingSpec(
@@ -666,7 +667,9 @@ SETTINGS_REGISTRY: dict[str, SettingSpec] = {
         seeded=True, in_ad_reset=True, payload_key='whisperLanguage'),
     'whisper_backend': SettingSpec(
         default='local', env='WHISPER_BACKEND', in_ad_reset=True,
-        payload_key='whisperBackend'),
+        payload_key='whisperBackend',
+        validator=_one_of(WHISPER_BACKEND_LOCAL, WHISPER_BACKEND_API,
+                          WHISPER_BACKEND_PARAKEET)),
     'whisper_api_base_url': SettingSpec(
         default='', env='WHISPER_API_BASE_URL', in_ad_reset=True,
         payload_key='whisperApiBaseUrl'),
@@ -706,6 +709,11 @@ SETTINGS_REGISTRY: dict[str, SettingSpec] = {
     'max_ad_duration_confirmed_seconds': SettingSpec(
         default=str(MAX_AD_DURATION_CONFIRMED),
         payload_key='maxAdDurationConfirmedSeconds', payload_kind='float'),
+    # Longest single ad one LLM detection window may report; a feed's max ad
+    # duration caps raise it for that feed.
+    'max_llm_window_ad_seconds': SettingSpec(
+        default=str(MAX_AD_DURATION_WINDOW),
+        payload_key='maxLlmWindowAdSeconds', payload_kind='float'),
 
     # -- LLM provider (env-backed keys resolve via ENV_BACKED_SETTINGS) --
     # Operator override: skip temperature on every LLM call, taking precedence
@@ -739,6 +747,15 @@ SETTINGS_REGISTRY: dict[str, SettingSpec] = {
         payload_key='feedAuthEnabled',
         payload_factory=lambda: coerce_bool_setting(
             resolve_env_backed_default('feed_auth_enabled'))),
+    'download_history_enabled': SettingSpec(
+        default='true',
+        payload_key='downloadHistoryEnabled', payload_kind='bool'),
+    'download_geo_lookup_enabled': SettingSpec(
+        default='false',
+        payload_key='downloadGeoLookupEnabled', payload_kind='bool'),
+    'download_history_retention_days': SettingSpec(
+        default='90',
+        payload_key='downloadHistoryRetentionDays', payload_kind='int'),
     'artwork_watermark_enabled': SettingSpec(
         env_backed=True,
         payload_key='artworkWatermarkEnabled',
@@ -1390,7 +1407,7 @@ class SettingsMixin:
         if spec.stage_tunable:
             # Stage tunables resolve DB > env > default at read time. Clear the
             # row (empty value, is_default=True) so that resolution takes over --
-            # mirrors the clear path in api.settings._apply_stage_tunables and
+            # mirrors the clear path in api.settings.ad_detection._apply_stage_tunables and
             # avoids stringifying None for the reasoning budget/level defaults.
             self.set_setting(key, "", is_default=True)
             return True

@@ -7,6 +7,7 @@ import { getErrorMessage } from '../../api/client';
 import type { Feed, LowAdYieldAction, EpisodeLogsOverride } from '../../api/types';
 import CollapsibleSection, { useCollapsibleOpen } from '../../components/CollapsibleSection';
 import CopyButton from '../../components/CopyButton';
+import SubscriberKeysPanel from '../../components/SubscriberKeysPanel';
 import SearchableSectionGroup from '../../components/SearchableSectionGroup';
 import { ExperimentalBadge } from '../../components/ExperimentalBadge';
 import { FeedTagsEditor } from '../../components/FeedTagsEditor';
@@ -21,11 +22,12 @@ import {
 import { WHISPER_LANGUAGES, labelForLanguage } from '../../utils/whisperLanguages';
 import { useSyncFromQuery } from '../../hooks/useSyncFromQuery';
 import { useDraftField, type DraftField } from '../../hooks/useDraftField';
+import { useUnsavedChanges } from '../../hooks/useUnsavedChanges';
 import { btnPrimary, btnSecondary, btnOutline } from '../../components/buttonStyles';
 import { ConfirmModal } from '../../components/Modal';
 import SavedBadge from '../settings/SavedBadge';
 import DraftNumberInput, { parseOptionalNumber } from '../../components/DraftNumberInput';
-import { selectBase } from '../../components/fieldStyles';
+import { focusRing, inputBase, selectBase } from '../../components/fieldStyles';
 import { LOW_AD_YIELD_ACTION_LABELS } from '../../utils/lowAdYield';
 import { SkipPatternsField } from './SkipPatternsField';
 import { UserAgentOverrideField } from './UserAgentOverrideField';
@@ -34,7 +36,6 @@ import { UserAgentOverrideField } from './UserAgentOverrideField';
 const MAX_RETENTION_DAYS = 3650;
 
 type RetentionMode = 'global' | 'archive' | 'custom';
-import { focusRing } from '../../components/fieldStyles';
 import { badgeBase, tint } from '../../components/badgeStyles';
 import { isSystemOneChapterRoute } from '../settings/systemoneWarnings';
 
@@ -269,11 +270,18 @@ function FeedSettingsPanel({ feed, slug }: Props) {
   // Notes commit on Save, not blur: markClean runs in the mutation's onSuccess so
   // the button/badge update instantly. Dirty compare trims, so a whitespace-only edit isn't dirty.
   const notesField = useDraftField(feed, (f) => f.detectionNotes ?? '', (v) => v.trim());
+  const chapterNotesField = useDraftField(feed, (f) => f.chapterNotes ?? '', (v) => v.trim());
+  useUnsavedChanges([cueScoreField, pairMinField, pairMaxField, pairFracField, snapConfField, snapLeadField,
+    snapLagField, maxAdDurField, maxAdDurRejectField, introExclusionField, notesField, chapterNotesField]
+    .some(field => field.dirty) || isEditingSourceUrl || isEditingNetwork);
+  const [chapterNotesSaved, setChapterNotesSaved] = useState(false);
+  const [chapterNotesError, setChapterNotesError] = useState<string | null>(null);
   const [detectionNotesSaved, setDetectionNotesSaved] = useState(false);
   const [detectionNotesError, setDetectionNotesError] = useState<string | null>(null);
   // Retention days edits stay local until blur. Committing per keystroke
   // would PATCH every intermediate digit (typing 365 sends 3, then 36) and
   // retention is the one field where an intermediate value deletes audio.
+  const trimPatternField = useDraftField(feed, (f) => f.descriptionTrimPattern ?? '', (v) => v.trim());
   const retentionDaysField = useDraftField(feed, (f) =>
     f.retentionDaysOverride != null && f.retentionDaysOverride > 0 ? String(f.retentionDaysOverride) : '');
 
@@ -423,6 +431,14 @@ function FeedSettingsPanel({ feed, slug }: Props) {
     }
   }
 
+  const commitTrimPattern = () => {
+    const next = trimPatternField.value.trim();
+    if (next !== (feed.descriptionTrimPattern ?? '')) {
+      updateMutation.mutate({ descriptionTrimPattern: next || null });
+    }
+    trimPatternField.markClean(next);
+  };
+
   const saveDetectionNotes = () => {
     const next = notesField.value.trim() || null;
     setDetectionNotesError(null);
@@ -433,6 +449,24 @@ function FeedSettingsPanel({ feed, slug }: Props) {
       },
       onError: (e) => setDetectionNotesError(getErrorMessage(e, 'Failed to save detection notes')),
     });
+  };
+
+  const saveChapterNotes = () => {
+    const next = chapterNotesField.value.trim() || null;
+    setChapterNotesError(null);
+    updateMutation.mutate({ chapterNotes: next }, {
+      onSuccess: () => {
+        chapterNotesField.markClean(next ?? '');
+        setChapterNotesSaved(true);
+      },
+      onError: (e) => setChapterNotesError(getErrorMessage(e, 'Failed to save chapter notes')),
+    });
+  };
+
+  const clearChapterNotes = () => {
+    chapterNotesField.setValue('');
+    setChapterNotesSaved(false);
+    setChapterNotesError(null);
   };
 
   const clearDetectionNotes = () => {
@@ -508,6 +542,7 @@ function FeedSettingsPanel({ feed, slug }: Props) {
         onToggle={setPanelOpen}
       >
         <div className="space-y-4">
+          <p className="text-sm text-muted-foreground">Notes, source URL, and network edits need Save. Other controls apply when changed; numeric fields save when you leave the field.</p>
           <SearchableSectionGroup
             placeholder="Search feed settings..."
             ariaLabel="Search feed settings"
@@ -712,6 +747,18 @@ function FeedSettingsPanel({ feed, slug }: Props) {
           </CollapsibleSection>
 
           <CollapsibleSection
+            title="Security"
+            storageKey={`feed-security-${slug}`}
+          >
+            <div className="space-y-3 pt-1">
+              <p className="text-sm text-muted-foreground">
+                Create a separate feed URL for each subscriber of this podcast. Revoking one URL does not affect other subscribers.
+              </p>
+              <SubscriberKeysPanel slug={slug} />
+            </div>
+          </CollapsibleSection>
+
+          <CollapsibleSection
             title="Processing"
             defaultOpen
             storageKey={`feed-processing-${slug}`}
@@ -730,9 +777,10 @@ function FeedSettingsPanel({ feed, slug }: Props) {
                     setDetectionNotesError(null);
                   }}
                   placeholder="What only this show does, e.g. host-read ads start right after 'a word from our sponsors'."
-                  className={`w-full px-2 py-1 bg-secondary text-foreground placeholder:text-muted-foreground border border-border rounded resize-y ${focusRing}`}
+                  className={`w-full resize-y placeholder:text-muted-foreground ${inputBase}`}
+                  aria-describedby="detection-notes-help"
                 />
-                <p className="flex justify-between gap-2 text-xs text-muted-foreground">
+                <p id="detection-notes-help" className="flex justify-between gap-2 text-xs text-muted-foreground">
                   <span>Sent to the model with every episode of this feed.</span>
                   <span className="tabular-nums shrink-0">{notesField.value.length} / 1000</span>
                 </p>
@@ -797,6 +845,7 @@ function FeedSettingsPanel({ feed, slug }: Props) {
                     })}
                     disabled={updateMutation.isPending}
                     className={`self-start min-w-0 max-w-full disabled:opacity-50 ${selectBase} pl-2`}
+                    aria-describedby="processing-mode-help"
                   >
                     <option value="standard">Standard (detect and cut ads)</option>
                     <option value="keep_content">Keep content only (experimental)</option>
@@ -812,7 +861,7 @@ function FeedSettingsPanel({ feed, slug }: Props) {
                       ad-break end template. Mark one of each below to turn it on.
                     </p>
                   )}
-                  <p className={PROCESSING_MODE_HINTS[processingMode].className}>
+                  <p id="processing-mode-help" className={PROCESSING_MODE_HINTS[processingMode].className}>
                     {PROCESSING_MODE_HINTS[processingMode].text}
                   </p>
                   {processingMode === 'cue_only' && (
@@ -1109,6 +1158,49 @@ function FeedSettingsPanel({ feed, slug }: Props) {
                 </div>
               </div>
 
+              <div className="flex flex-col gap-1 text-sm">
+                <label htmlFor="chapter-notes" className="text-muted-foreground">Chapter notes</label>
+                <textarea
+                  id="chapter-notes"
+                  value={chapterNotesField.value}
+                  maxLength={1000}
+                  rows={3}
+                  onChange={(e) => {
+                    chapterNotesField.setValue(e.target.value);
+                    setChapterNotesError(null);
+                  }}
+                  placeholder="Make listener donations their own chapter."
+                  className={`w-full resize-y placeholder:text-muted-foreground ${inputBase}`}
+                  aria-describedby="chapter-notes-help"
+                />
+                <p id="chapter-notes-help" className="flex justify-between gap-2 text-xs text-muted-foreground">
+                  <span>Sent with every chapter request for this feed, for example: Always make the listener donation and producer thank-you segment its own chapter titled Donations.</span>
+                  <span className="tabular-nums shrink-0">{chapterNotesField.value.length} / 1000</span>
+                </p>
+                <div className="flex items-center gap-2">
+                  <button
+                    onClick={saveChapterNotes}
+                    disabled={!chapterNotesField.dirty || updateMutation.isPending}
+                    aria-label="Save chapter notes"
+                    className={`px-2 py-1 text-xs ${btnPrimary} rounded disabled:opacity-50 ${focusRing}`}
+                  >
+                    {updateMutation.isPending ? 'Saving...' : 'Save'}
+                  </button>
+                  <button
+                    onClick={clearChapterNotes}
+                    disabled={chapterNotesField.value === ''}
+                    aria-label="Clear chapter notes"
+                    className={`px-2 py-1 text-xs ${btnOutline} rounded disabled:opacity-50 ${focusRing}`}
+                  >
+                    Clear
+                  </button>
+                  {chapterNotesSaved && !chapterNotesField.dirty && !chapterNotesError && <SavedBadge />}
+                </div>
+                {chapterNotesError && (
+                  <p className="text-xs text-destructive">{chapterNotesError}</p>
+                )}
+              </div>
+
               {/* Per-feed chapter list in descriptions (#720) */}
               <GlobalOverrideRow
                 label="Chapter list"
@@ -1122,6 +1214,51 @@ function FeedSettingsPanel({ feed, slug }: Props) {
                 feed, so apps show it without starting playback.
               </GlobalOverrideRow>
 
+            </div>
+          </CollapsibleSection>
+
+          <CollapsibleSection
+            title="Chapter trim"
+            subtitle="Cut a span whose chapter title matches a pattern"
+            defaultOpen
+            storageKey={`feed-chapter-trim-${slug}`}
+          >
+            <div className="space-y-4 pt-1 max-sm:[&_select]:min-h-11">
+              <div className="flex flex-col sm:flex-row sm:items-start gap-2 sm:gap-3 text-sm">
+                <label htmlFor="description-trim-pattern" className="text-muted-foreground sm:w-32 shrink-0 sm:pt-2">
+                  Chapter title pattern:
+                </label>
+                <div className="flex flex-col gap-2 flex-1 min-w-0">
+                  <input
+                    id="description-trim-pattern"
+                    type="text"
+                    value={trimPatternField.value}
+                    onChange={(e) => trimPatternField.setValue(e.target.value)}
+                    onBlur={commitTrimPattern}
+                    onKeyDown={(e) => { if (e.key === 'Enter') commitTrimPattern(); }}
+                    maxLength={200}
+                    placeholder="*Throwback*"
+                    disabled={updateMutation.isPending}
+                    aria-label="Chapter title pattern"
+                    className={`${inputBase} w-full max-w-sm min-h-11 disabled:opacity-50`}
+                  />
+                  <select
+                    value={feed.descriptionTrimMode ?? 'to_end'}
+                    onChange={(e) => updateMutation.mutate({
+                      descriptionTrimMode: e.target.value as UpdateFeedPayload['descriptionTrimMode'],
+                    })}
+                    disabled={updateMutation.isPending}
+                    className={`self-start min-w-0 max-w-full disabled:opacity-50 ${selectBase}`}
+                    aria-label="Trim mode"
+                  >
+                    <option value="to_end">Cut to the end of the episode</option>
+                    <option value="to_next">Cut until the next chapter</option>
+                  </select>
+                  <p className="text-xs text-muted-foreground">
+                    Match the chapter title from the description&apos;s timestamp lines or the episode&apos;s chapters, ignoring case. Use * as a wildcard, for example *Throwback*.
+                  </p>
+                </div>
+              </div>
             </div>
           </CollapsibleSection>
 
@@ -1616,7 +1753,7 @@ function FeedSettingsPanel({ feed, slug }: Props) {
                 disabled={updateMutation.isPending}
                 onBlur={() => commitFloat(maxAdDurField, feed.maxAdDurationOverride,
                   'maxAdDurationOverride', 1, 3600)}
-                description="Ads longer than this cap are held for review instead of cut. Changes apply on the next reprocess." />
+                description="Ads longer than this cap are held for review instead of cut. Also raises the longest single detection the model may report for this feed (the global Longest single LLM detection, default 7 minutes). Changes apply on the next reprocess." />
 
               {/* Length past which an ad needs a confirmed sponsor */}
               <CueOverrideRow label="Sponsor needed over" min={30} max={3600} step={1}
@@ -1626,7 +1763,7 @@ function FeedSettingsPanel({ feed, slug }: Props) {
                 disabled={updateMutation.isPending}
                 onBlur={() => commitFloat(maxAdDurRejectField, feed.maxAdDurationRejectOverride,
                   'maxAdDurationRejectOverride', 30, 3600)}
-                description="Past this length an ad has to name a recognized sponsor to be cut; one that does not is held for review. Overrides the global setting for this feed." />
+                description="Ads longer than this need a confirmed sponsor. Also raises the longest single detection the LLM may report for this feed (the global Longest single LLM detection, default 7 minutes), so set it to the length of this show's longest continuous ad block." />
 
               {/* Splice-veto override. Tri-state so a feed can also be held
                   to the check when the global is off. */}

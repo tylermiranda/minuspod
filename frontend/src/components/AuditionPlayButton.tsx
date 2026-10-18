@@ -1,7 +1,7 @@
 import { Pause, Play } from 'lucide-react';
 import { btnPrimary } from './buttonStyles';
 import { focusRing } from './fieldStyles';
-import { cardActionIcon, rowActionIcon, tableActionIcon } from './rowActionStyles';
+import { cardActionHeight, cardActionIcon, rowActionIcon, tableActionIcon } from './rowActionStyles';
 
 // 'row' and 'card' take the height of the marker-row / card action buttons,
 // from the same source those buttons use, so every marker section lines up at
@@ -11,6 +11,8 @@ const SIZES = {
   row: rowActionIcon,
   card: cardActionIcon,
   table: tableActionIcon,
+  // Shares a flex row equally with sibling controls instead of a fixed width.
+  fill: `${cardActionHeight} flex-1 basis-0 min-w-0 inline-flex items-center justify-center`,
 } as const;
 
 export function AuditionPlayButton({ playing, onClick, label = 'this ad', size }: {
@@ -27,7 +29,7 @@ export function AuditionPlayButton({ playing, onClick, label = 'this ad', size }
       onClick={onClick}
       aria-label={playing ? `Pause ${label}` : `Play ${label}`}
       title={playing ? 'Pause' : `Play ${label}`}
-      className={`${SIZES[size]} rounded ${btnPrimary} transition-colors shrink-0 touch-manipulation ${focusRing}`}
+      className={`${SIZES[size]}${size === 'fill' ? '' : ' shrink-0'} rounded ${btnPrimary} transition-colors touch-manipulation ${focusRing}`}
     >
       {playing ? <Pause className="w-3.5 h-3.5" /> : <Play className="w-3.5 h-3.5" />}
     </button>

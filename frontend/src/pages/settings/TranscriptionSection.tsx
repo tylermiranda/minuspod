@@ -132,8 +132,14 @@ function TranscriptionSection({
             className={`w-full ${selectBase}`}
           >
             <option value={WHISPER_BACKENDS.LOCAL}>Local (faster-whisper)</option>
+            <option value={WHISPER_BACKENDS.PARAKEET}>Local (Parakeet TDT 0.6B v3)</option>
             <option value={WHISPER_BACKENDS.OPENAI_API}>Remote API (OpenAI-compatible)</option>
           </select>
+          {whisperBackend === WHISPER_BACKENDS.PARAKEET && (
+            <p className="mt-1 text-sm text-muted-foreground">
+              Runs in this container on the configured device. The model downloads into the data directory on first use. English transcripts drop words in other scripts.
+            </p>
+          )}
         </div>
 
         {whisperBackend === WHISPER_BACKENDS.LOCAL && (
@@ -146,6 +152,7 @@ function TranscriptionSection({
               value={whisperModel}
               onChange={(e) => onWhisperModelChange(e.target.value)}
               className={`w-full ${selectBase}`}
+              aria-describedby="whisperModel-help"
             >
               {/* WHISPER_MODEL accepts ids this list omits (distil, HF repos);
                   without an option the select would show the first entry instead. */}
@@ -158,7 +165,7 @@ function TranscriptionSection({
                 </option>
               ))}
             </select>
-            <p className="mt-1 text-sm text-muted-foreground">
+            <p id="whisperModel-help" className="mt-1 text-sm text-muted-foreground">
               Larger models produce better transcriptions but require more GPU memory
             </p>
             {whisperModels && (
@@ -182,8 +189,9 @@ function TranscriptionSection({
                 onChange={(e) => onApiConfigChange('baseUrl', e.target.value)}
                 placeholder="http://host.docker.internal:8765/v1"
                 className="w-full px-4 py-2 rounded-lg border border-input bg-background text-foreground placeholder:text-muted-foreground focus:outline-hidden focus:ring-2 focus:ring-ring font-mono text-sm"
+                aria-describedby="whisperApiBaseUrl-help"
               />
-              <p className="mt-1 text-sm text-muted-foreground">
+              <p id="whisperApiBaseUrl-help" className="mt-1 text-sm text-muted-foreground">
                 OpenAI-compatible transcription endpoint (e.g. whisper.cpp, Groq, OpenAI)
               </p>
               <ConnectionTestButton
@@ -215,8 +223,9 @@ function TranscriptionSection({
                 onChange={(e) => onApiConfigChange('model', e.target.value)}
                 placeholder="whisper-1"
                 className="w-full px-4 py-2 rounded-lg border border-input bg-background text-foreground placeholder:text-muted-foreground focus:outline-hidden focus:ring-2 focus:ring-ring font-mono text-sm"
+                aria-describedby="whisperApiModel-help"
               />
-              <p className="mt-1 text-sm text-muted-foreground">
+              <p id="whisperApiModel-help" className="mt-1 text-sm text-muted-foreground">
                 Model identifier sent to the API (e.g. whisper-1, whisper-large-v3-turbo)
               </p>
             </div>
@@ -407,6 +416,7 @@ function TranscriptionSection({
               value={whisperComputeType || 'auto'}
               onChange={(e) => onWhisperComputeTypeChange(e.target.value)}
               className={`w-full ${selectBase}`}
+              aria-describedby="whisperComputeType-help"
             >
               <option value="auto">Auto (float16 on CUDA, int8 on CPU)</option>
               <option value="float16">float16 (Volta and newer: V100, RTX 20xx+, A100, H100)</option>
@@ -414,7 +424,7 @@ function TranscriptionSection({
               <option value="int8">int8 (universal; Pascal GTX 10xx should pick this)</option>
               <option value="float32">float32 (Maxwell GTX 9xx or Pascal P100)</option>
             </select>
-            <p className="mt-1 text-sm text-muted-foreground">
+            <p id="whisperComputeType-help" className="mt-1 text-sm text-muted-foreground">
               Older GPUs (Pascal, Maxwell) cannot run float16. On init failure the server retries int8_float16, then int8, then float32 automatically. See the README &quot;GPU Compute Type&quot; section for a per-GPU table.
             </p>
           </div>

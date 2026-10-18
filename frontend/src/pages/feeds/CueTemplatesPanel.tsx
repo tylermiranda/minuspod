@@ -1,3 +1,4 @@
+import { Modal } from '../../components/Modal';
 import { useEffect, useRef, useState } from 'react';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { X, Play, Square } from 'lucide-react';
@@ -7,7 +8,7 @@ import CueMarkModal from '../../components/CueMarkModal';
 import CueWindowOptimizePanel from '../../components/CueWindowOptimizePanel';
 import CueCrossEpisodeScanModal from '../../components/CueCrossEpisodeScanModal';
 import {
-  ghostBtn, primaryBtn, fieldCls, modalBackdrop, modalPanel, useEscape,
+  ghostBtn, primaryBtn, fieldCls,
 } from '../../components/cueScanStyles';
 import { ConfirmModal } from '../../components/Modal';
 import {
@@ -48,6 +49,8 @@ interface Props {
 
 // Per-feed cue template management. Templates take precedence over the global
 // spectral cue detector when at least one is enabled for the feed.
+const cueBtn = `whitespace-nowrap px-3 py-1.5 rounded text-sm ${focusRing}`;
+
 function CueTemplatesPanel({ slug }: Props) {
   const queryClient = useQueryClient();
   // Mirrors the CollapsibleSection's persisted open state (same storage key)
@@ -323,7 +326,7 @@ function CueTemplatesPanel({ slug }: Props) {
         <div className="flex flex-wrap gap-2 mb-3">
           <button
             type="button"
-            className={`flex-1 sm:flex-none basis-0 sm:basis-auto whitespace-nowrap px-3 py-1.5 rounded ${ghostBtn} text-sm ${focusRing}`}
+            className={`${cueBtn} ${ghostBtn}`}
             onClick={() => importInputRef.current?.click()}
             disabled={importMutation.isPending}
             title="Import a cue template zip exported from another install"
@@ -332,7 +335,7 @@ function CueTemplatesPanel({ slug }: Props) {
           </button>
           <button
             type="button"
-            className={`flex-1 sm:flex-none basis-0 sm:basis-auto whitespace-nowrap px-3 py-1.5 rounded ${ghostBtn} text-sm disabled:opacity-50 ${focusRing}`}
+            className={`${cueBtn} ${ghostBtn} disabled:opacity-50`}
             onClick={() => setScanOpen(true)}
             disabled={templates.length === 0}
             title={templates.length === 0 ? 'Mark at least one cue first' : 'Run all enabled templates against an episode'}
@@ -341,7 +344,7 @@ function CueTemplatesPanel({ slug }: Props) {
           </button>
           <button
             type="button"
-            className={`flex-1 sm:flex-none basis-0 sm:basis-auto whitespace-nowrap px-3 py-1.5 rounded ${ghostBtn} text-sm disabled:opacity-50 ${focusRing}`}
+            className={`${cueBtn} ${ghostBtn} disabled:opacity-50`}
             onClick={() => { setActionError(null); setCrossEpisodeScanOpen(true); }}
             disabled={!crossEpisodeEligible}
             title={!crossEpisodeEligible ? 'Need at least 2 episodes with original audio' : 'Find recurring cue sounds across multiple episodes'}
@@ -350,7 +353,7 @@ function CueTemplatesPanel({ slug }: Props) {
           </button>
           <button
             type="button"
-            className={`flex-1 sm:flex-none basis-0 sm:basis-auto whitespace-nowrap px-3 py-1.5 rounded ${primaryBtn} text-sm ${focusRing}`}
+            className={`${cueBtn} ${primaryBtn}`}
             onClick={() => { setActionError(null); setPickerOpen(true); }}
           >
             + Mark cue
@@ -687,14 +690,7 @@ function CueTemplatesPanel({ slug }: Props) {
       )}
 
       {promoteState && (
-        <div className={modalBackdrop} onClick={() => setPromoteState(null)}>
-          <div
-            role="dialog"
-            aria-modal="true"
-            aria-label="Promote cue to network"
-            className={`${modalPanel} w-full max-w-md p-5`}
-            onClick={(e) => e.stopPropagation()}
-          >
+        <Modal onClose={() => setPromoteState(null)} ariaLabel="Promote cue to network" panelClassName="text-foreground w-full max-w-md p-5">
             <h3 className="text-base font-semibold mb-2">Promote to network</h3>
             <p className="text-sm text-muted-foreground mb-3">
               Cue "{promoteState.template.label}" will start matching every feed on
@@ -713,8 +709,7 @@ function CueTemplatesPanel({ slug }: Props) {
                 Promote
               </button>
             </div>
-          </div>
-        </div>
+          </Modal>
       )}
     </div>
   );
@@ -727,7 +722,6 @@ interface EpisodePickerProps {
 }
 
 function EpisodePicker({ slug, onClose, onPick }: EpisodePickerProps) {
-  useEscape(onClose);
   const [page, setPage] = useState(0);
 
   // Cues can only be marked on a processed episode whose original audio is
@@ -751,14 +745,7 @@ function EpisodePicker({ slug, onClose, onPick }: EpisodePickerProps) {
   const totalPages = Math.max(1, Math.ceil(total / PICKER_PAGE_SIZE));
 
   return (
-    <div className={modalBackdrop} onClick={onClose}>
-      <div
-        role="dialog"
-        aria-modal="true"
-        aria-label="Pick an episode"
-        className={`${modalPanel} w-full max-w-2xl p-5 max-h-[85vh] flex flex-col`}
-        onClick={(e) => e.stopPropagation()}
-      >
+    <Modal onClose={onClose} ariaLabel="Pick an episode" panelClassName="text-foreground w-full max-w-2xl p-5 max-h-[85vh] flex flex-col">
         <div className="flex items-start justify-between mb-3">
           <div>
             <h3 className="text-base font-semibold">Pick an episode</h3>
@@ -822,8 +809,7 @@ function EpisodePicker({ slug, onClose, onPick }: EpisodePickerProps) {
             </button>
           </div>
         )}
-      </div>
-    </div>
+      </Modal>
   );
 }
 
@@ -836,7 +822,6 @@ interface CueScanModalProps {
 // run every enabled template against the episode and show peak score + match
 // times per template. No DB writes; pure diagnostic.
 function CueScanModal({ slug, onClose }: CueScanModalProps) {
-  useEscape(onClose);
   const queryClient = useQueryClient();
   const [picking, setPicking] = useState(true);
   const [selectedEpisode, setSelectedEpisode] = useState<Episode | null>(null);
@@ -929,14 +914,7 @@ function CueScanModal({ slug, onClose }: CueScanModalProps) {
   }
 
   return (
-    <div className={modalBackdrop} onClick={onClose}>
-      <div
-        role="dialog"
-        aria-modal="true"
-        aria-label="Cue scan"
-        className={`${modalPanel} w-full max-w-3xl p-5 max-h-[90vh] overflow-y-auto`}
-        onClick={(e) => e.stopPropagation()}
-      >
+    <Modal onClose={onClose} ariaLabel="Cue scan" panelClassName="text-foreground w-full max-w-3xl p-5 max-h-[90vh] overflow-y-auto">
         <div className="flex items-start justify-between mb-3">
           <div>
             <h3 className="text-base font-semibold">Cue scan</h3>
@@ -1093,7 +1071,6 @@ function CueScanModal({ slug, onClose }: CueScanModalProps) {
             </ul>
           </div>
         )}
-      </div>
       {pendingThreshold !== null && (
         <ConfirmModal
           title="Apply the suggested threshold?"
@@ -1106,7 +1083,7 @@ function CueScanModal({ slug, onClose }: CueScanModalProps) {
           <p>Sets this feed's cue match threshold to {pendingThreshold.toFixed(2)}. The global setting does not change.</p>
         </ConfirmModal>
       )}
-    </div>
+      </Modal>
   );
 }
 

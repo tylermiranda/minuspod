@@ -11,8 +11,12 @@ export const btnOutline = btnSecondary;
 export const btnGhost = 'text-muted-foreground hover:text-foreground hover:bg-accent';
 export const btnDestructive = 'bg-destructive text-destructive-foreground hover:bg-destructive/90';
 
-// One mobile hit-target rule: 44px below `sm`, natural icon size from `sm` up.
-// Gap around a wrapper does not enlarge a clickable box, so this goes on the
-// button or link itself.
+// index.css enforces the coarse-pointer height floor at every width; width is a default a recipe may override.
 export const touchTarget =
-  'inline-flex items-center justify-center min-h-11 min-w-11 sm:min-h-0 sm:min-w-0';
+  'touch-target inline-flex items-center justify-center min-h-11 min-w-11 sm:min-h-0 sm:min-w-0';
+// Icon-only header actions beside a heading: a 36 px square on a phone, text button from sm.
+export const touchCompact =
+  'touch-compact inline-flex items-center justify-center h-9 w-9 max-sm:min-w-9 sm:h-auto sm:w-auto';
+// For a row that must stay on one line on a phone: full height, shared width below sm.
+export const touchTargetRow =
+  'inline-flex items-center justify-center min-h-11 sm:min-h-0 max-sm:min-w-0';

@@ -80,6 +80,7 @@ export interface Feed {
   feedUserAgentOverride?: string | null;
   titleOverride?: string | null;
   detectionNotes?: string | null;
+  chapterNotes?: string | null;
   detectionMode?: string | null;
   chaptersMode?: 'auto' | 'generate' | 'off' | null;
   differentialFetchMode?: 'inherit' | 'auto' | 'on' | 'off' | null;
@@ -143,6 +144,9 @@ export interface Feed {
   // Per-feed episode description blacklist (#835): fnmatch glob patterns matched
   // against the plain-text description. A match is never queued or JIT-processed.
   descriptionSkipPatterns?: string[];
+  // Per-feed description chapter trim: cut from a matching timestamp line to the end or next chapter.
+  descriptionTrimPattern?: string | null;
+  descriptionTrimMode?: 'to_end' | 'to_next';
   // RSS visibility for episodes excluded by title, description, or duration.
   titleSkipAction?: 'serve_original' | 'hide' | null;
   minDurationSeconds?: number | null;
@@ -726,7 +730,7 @@ export type LowAdYieldAction = 'nothing' | 'redetect' | 'reprocess' | 'full';
 // Per-feed run log storage (#660); null means "follow the global setting".
 export type EpisodeLogsOverride = 'on' | 'off';
 export type EpisodeLogLevel = 'debug' | 'info';
-export type WhisperBackend = 'local' | 'openai-api';
+export type WhisperBackend = 'local' | 'openai-api' | 'parakeet';
 
 export interface WhisperApiConfig {
   baseUrl: string;
@@ -812,6 +816,7 @@ export const SLOT_LABELS: Record<ProviderSlot | 'failover', string> = {
 export const WHISPER_BACKENDS = {
   LOCAL: 'local' as const,
   OPENAI_API: 'openai-api' as const,
+  PARAKEET: 'parakeet' as const,
 };
 
 export interface Settings {
@@ -867,6 +872,9 @@ export interface Settings {
   feedUserAgent: SettingValue;
   logDownloadQuery: SettingValueBoolean;
   feedAuthEnabled: SettingValueBoolean;
+  downloadHistoryEnabled: SettingValueBoolean;
+  downloadGeoLookupEnabled: SettingValueBoolean;
+  downloadHistoryRetentionDays: SettingValueNumber;
   feedAuthKey: string | null;
   // User agents served original audio instead of triggering JIT processing.
   jitBlockedUserAgents: { value: string[]; isDefault: boolean };
@@ -917,6 +925,7 @@ export interface Settings {
   adDetectionExcludeStartSeconds: SettingValueNumber;
   maxAdDurationSeconds: SettingValueNumber;
   maxAdDurationConfirmedSeconds: SettingValueNumber;
+  maxLlmWindowAdSeconds: SettingValueNumber;
   positionalPriorEnabled: SettingValueBoolean;
   verificationMissHoldMinConfidence: SettingValueNumber;
   verificationMissAutocutMinConfidence: SettingValueNumber;
@@ -1123,6 +1132,7 @@ export interface Settings {
     adDetectionExcludeStartSeconds: number;
     maxAdDurationSeconds: number;
     maxAdDurationConfirmedSeconds: number;
+    maxLlmWindowAdSeconds: number;
     positionalPriorEnabled: boolean;
     verificationMissHoldMinConfidence: number;
     verificationMissAutocutMinConfidence: number;
@@ -1194,6 +1204,9 @@ export interface UpdateSettingsPayload {
   feedUserAgent?: string;
   logDownloadQuery?: boolean;
   feedAuthEnabled?: boolean;
+  downloadHistoryEnabled?: boolean;
+  downloadGeoLookupEnabled?: boolean;
+  downloadHistoryRetentionDays?: number;
   jitBlockedUserAgents?: string[];
   audioBitrate?: string;
   audioEncoderCompressionLevel?: string;
@@ -1240,6 +1253,7 @@ export interface UpdateSettingsPayload {
   adDetectionExcludeStartSeconds?: number;
   maxAdDurationSeconds?: number;
   maxAdDurationConfirmedSeconds?: number;
+  maxLlmWindowAdSeconds?: number;
   positionalPriorEnabled?: boolean;
   verificationMissHoldMinConfidence?: number;
   verificationMissAutocutMinConfidence?: number;
@@ -1446,7 +1460,7 @@ export interface SystemStatus {
   };
   transcriber?: {
     available: boolean;
-    backend: 'local' | 'openai-api';
+    backend: 'local' | 'openai-api' | 'parakeet';
     // Local backend only; the remote one reports probe state instead.
     device?: string | null;
     // Local backend only: set when the local Whisper packages are missing.
@@ -1568,6 +1582,38 @@ export interface ProcessingHistoryResponse {
   page: number;
   limit: number;
   totalPages: number;
+}
+
+export type DownloadGeoStatus = 'ok' | 'private' | 'failed' | 'unresolvable';
+
+export interface DownloadHistoryEntry {
+  id: number;
+  episodeId: string;
+  episodeTitle: string | null;
+  podcastSlug: string;
+  podcastTitle: string;
+  clientIp: string;
+  userAgent: string;
+  subscriberLabel: string | null;
+  subscriberKeyId: string | null;
+  subscriberRevoked: boolean;
+  userAgentBlocked: boolean;
+  lastRequestLine: string | null;
+  lastRequestHeaders: Record<string, string> | null;
+  country: string | null;
+  region: string | null;
+  city: string | null;
+  geoStatus: DownloadGeoStatus | null;
+  firstSeenAt: string;
+  lastSeenAt: string;
+  requestCount: number;
+}
+
+export interface DownloadHistoryResponse {
+  downloads: DownloadHistoryEntry[];
+  total: number;
+  page: number;
+  limit: number;
 }
 
 export interface BulkActionResult {
@@ -1740,6 +1786,7 @@ export interface SystemOneStats {
   calls: number;
   requests: number;
   dispatchLatencyMsTotal: number;
+  dispatchLatencyMsAverage: number | null;
   logicalLatencyMsTotal: number;
   logicalLatencyMsAverage: number | null;
   tokens: { input: number; output: number; unknownRequestCount: number };
@@ -1749,6 +1796,21 @@ export interface SystemOneStats {
   reviewReasons: Record<string, number>;
   refinements: { attempted: number; completed: number; skipped: number; inconclusive: number; upstream_error: number };
   refinementSkipReasons: Record<string, number>;
+}
+
+export interface LlmStats {
+  calls: number;
+  requests: number;
+  outcomes: { success: number; failure: number; inconclusive: number; inFlight: number };
+  callLatencyMsAverage: number | null;
+  dispatchLatencyMsAverage: number | null;
+  tokens: {
+    input: number; output: number; cacheRead: number; cacheWrite: number;
+    reasoning: number; unknownRequestCount: number;
+  };
+  costUsd: string;
+  unknownCostRequestCount: number;
+  byPhase: Record<string, { calls: number; costUsd: string }>;
 }
 
 export interface CleanupStatsUsage {

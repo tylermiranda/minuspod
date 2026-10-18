@@ -4,7 +4,7 @@
  * one, and re-seeds the textarea from the refetched settings.
  */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { render, screen, waitFor, within } from '@testing-library/react';
+import { render, screen, within, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import Settings, { systemStatusRefetchInterval } from './Settings';
@@ -234,7 +234,7 @@ describe('Settings: per-prompt reset', () => {
 
     const resetBtn = resetButtonFor('First Pass System Prompt');
     await user.click(resetBtn);
-    await user.click(screen.getByRole('button', { name: 'Click again to confirm' }));
+    await user.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Reset' }));
 
     expect(mockResetPrompt).toHaveBeenCalledWith('system');
   });
@@ -254,7 +254,7 @@ describe('Settings: per-prompt reset', () => {
 
     const resetBtn = resetButtonFor('First Pass System Prompt');
     await user.click(resetBtn);
-    await user.click(screen.getByRole('button', { name: 'Click again to confirm' }));
+    await user.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Reset' }));
 
     await waitFor(() => {
       expect(screen.getByLabelText('First Pass System Prompt')).toHaveProperty('value', 'default system prompt');
@@ -279,11 +279,11 @@ describe('Settings: per-prompt reset', () => {
     const resurrectBtn = resetButtonFor('Resurrect prompt (resurrect / reject)');
 
     await user.click(reviewBtn);
-    await user.click(screen.getByRole('button', { name: 'Click again to confirm' }));
+    await user.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Reset' }));
     expect(mockResetPrompt).toHaveBeenCalledWith('review');
 
     await user.click(resurrectBtn);
-    await user.click(screen.getByRole('button', { name: 'Click again to confirm' }));
+    await user.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Reset' }));
     expect(mockResetPrompt).toHaveBeenCalledWith('resurrect');
   });
 });
@@ -426,6 +426,26 @@ describe('Settings: standby upload attempts', () => {
     ));
   });
 
+  it('loads and saves the parakeet failover backend', async () => {
+    mockGetSettings.mockResolvedValue(makeSettings({
+      whisperBackend: sv('local', false),
+      failoverWhisperEnabled: { value: true, isDefault: false },
+      failoverWhisperBackend: sv('openai-api', false),
+    }));
+    const user = userEvent.setup();
+    renderSettings();
+    await screen.findByLabelText('First Pass System Prompt');
+    await user.click(screen.getByRole('button', { name: /^Failover/ }));
+    const select = screen.getByLabelText('Failover backend') as HTMLSelectElement;
+    expect(select.value).toBe('openai-api');
+    await user.selectOptions(select, 'parakeet');
+    expect(select.value).toBe('parakeet');
+    await user.click(screen.getByRole('button', { name: 'Save Changes' }));
+    await waitFor(() => expect(updateSettings).toHaveBeenCalledWith(
+      expect.objectContaining({ failoverWhisperBackend: 'parakeet' }),
+    ));
+  });
+
   it('shows a rejected standby limit and keeps the edit available to correct', async () => {
     mockGetSettings.mockResolvedValue(makeSettings({
       whisperBackend: sv('local', false),
@@ -472,7 +492,7 @@ describe('Settings loading placeholder', () => {
   it('shows header and row skeletons while the settings query is pending', () => {
     mockGetSettings.mockReturnValueOnce(new Promise(() => {}));
     renderSettings();
-    expect(screen.getByTestId('skeleton-page-header')).toBeTruthy();
+    expect(screen.getByRole('heading', { name: 'Settings', level: 1 })).toBeTruthy();
     expect(screen.getByTestId('skeleton-rows')).toBeTruthy();
   });
 

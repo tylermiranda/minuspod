@@ -93,7 +93,7 @@ def test_provider_budget_currency_failure_does_not_expose_upstream_error(
 
 def test_provider_budget_converts_local_amounts_and_records_rate(app_client, temp_db):
     rate = FxRate(currency='EUR', local_per_usd=Decimal('0.8'), source='Frankfurter', source_date='2026-09-10')
-    with patch('api.settings.get_usd_rate', return_value=rate):
+    with patch('api.settings.providers.get_usd_rate', return_value=rate):
         response = app_client.put('/api/v1/settings/provider-budget', json={
             'enabled': True,
             'displayCurrency': 'eur',
@@ -112,9 +112,25 @@ def test_provider_budget_converts_local_amounts_and_records_rate(app_client, tem
     assert temp_db.get_setting('provider_budget_fx_source_date') == '2026-09-10'
 
 
+def test_provider_budget_saves_usd_display_currency(app_client):
+    response = app_client.put('/api/v1/settings/provider-budget', json={
+        'enabled': False,
+        'displayCurrency': 'USD',
+        'dailyLimit': '1',
+        'maxReservations': 2,
+        'unknownCost': 'deny',
+        'unknownReserve': '0',
+    })
+
+    assert response.status_code == 200
+    body = response.get_json()
+    assert body['displayCurrency'] == 'USD'
+    assert body['fxRate']['sourceDate'] is None
+
+
 def test_provider_budget_rate_failure_preserves_existing_values(app_client, temp_db):
     temp_db.set_setting('provider_budget_daily_limit_microusd', '2500000')
-    with patch('api.settings.get_usd_rate', side_effect=FxRateError('Currency rate is unavailable or too old')):
+    with patch('api.settings.providers.get_usd_rate', side_effect=FxRateError('Currency rate is unavailable or too old')):
         response = app_client.put('/api/v1/settings/provider-budget', json={
             'enabled': True,
             'displayCurrency': 'EUR',
@@ -133,7 +149,7 @@ def test_provider_budget_legacy_save_keeps_non_usd_snapshot_offline(app_client, 
     temp_db.set_setting('provider_budget_display_currency', 'EUR')
     temp_db.set_setting('provider_budget_fx_rate', '0.8')
     temp_db.set_setting('provider_budget_fx_source_date', '2026-09-10')
-    with patch('api.settings.get_usd_rate', side_effect=AssertionError('must not fetch')):
+    with patch('api.settings.providers.get_usd_rate', side_effect=AssertionError('must not fetch')):
         response = app_client.put('/api/v1/settings/provider-budget', json={
             'enabled': False,
             'dailyLimitMicrousd': 2_500_000,
@@ -150,7 +166,7 @@ def test_provider_budget_legacy_save_keeps_non_usd_snapshot_offline(app_client, 
 
 def test_provider_budget_rejects_tiny_positive_local_limit(app_client):
     rate = FxRate(currency='EUR', local_per_usd=Decimal('10000000'), source='Frankfurter', source_date='2026-09-10')
-    with patch('api.settings.get_usd_rate', return_value=rate):
+    with patch('api.settings.providers.get_usd_rate', return_value=rate):
         response = app_client.put('/api/v1/settings/provider-budget', json={
             'enabled': True,
             'displayCurrency': 'EUR',
@@ -165,7 +181,7 @@ def test_provider_budget_rejects_tiny_positive_local_limit(app_client):
 
 def test_provider_budget_rate_preview_rejects_extreme_exponents(app_client):
     rate = FxRate(currency='EUR', local_per_usd=Decimal('0.8'), source='Frankfurter', source_date='2026-09-10')
-    with patch('api.settings.get_usd_rate', return_value=rate):
+    with patch('api.settings.providers.get_usd_rate', return_value=rate):
         response = app_client.get(
             '/api/v1/settings/provider-budget/rate/EUR'
             '?from=USD&fromRate=1e-999999&dailyLimit=1&unknownReserve=0'
@@ -176,7 +192,7 @@ def test_provider_budget_rate_preview_rejects_extreme_exponents(app_client):
 
 def test_provider_budget_rate_preview_converts_unsaved_amounts(app_client):
     rate = FxRate(currency='EUR', local_per_usd=Decimal('0.8'), source='Frankfurter', source_date='2026-09-10')
-    with patch('api.settings.get_usd_rate', return_value=rate):
+    with patch('api.settings.providers.get_usd_rate', return_value=rate):
         response = app_client.get(
             '/api/v1/settings/provider-budget/rate/EUR'
             '?from=USD&fromRate=1&dailyLimit=2.5&unknownReserve=0.1'

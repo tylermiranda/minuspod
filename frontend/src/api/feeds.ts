@@ -213,6 +213,24 @@ export async function getSubscriberKeys(slug: string): Promise<SubscriberKey[]> 
   return response.keys;
 }
 
+// camelCase, unlike the snake_case per-feed SubscriberKey rows, because the all-feeds endpoint returns it that way.
+export interface SubscriberKeyWithFeed {
+  id: string;
+  label: string;
+  createdAt: string;
+  lastUsedAt: string | null;
+  revokedAt: string | null;
+  feedSlug: string;
+  feedTitle: string;
+}
+
+export const ALL_SUBSCRIBER_KEYS_QUERY_KEY = ['subscriber-keys-all'] as const;
+
+export async function getAllSubscriberKeys(): Promise<SubscriberKeyWithFeed[]> {
+  const response = await apiRequest<{ keys: SubscriberKeyWithFeed[] }>('/feeds/subscriber-keys');
+  return response.keys;
+}
+
 export async function createSubscriberKey(slug: string, label: string) {
   return apiRequest<CreatedSubscriberKey>(
     `/feeds/${encodeURIComponent(slug)}/subscriber-keys`,
@@ -428,6 +446,7 @@ export interface UpdateFeedPayload {
   feedUserAgentOverride?: string | null;
   titleOverride?: string | null;
   detectionNotes?: string | null;
+  chapterNotes?: string | null;
   detectionMode?: string | null;
   chaptersMode?: 'auto' | 'generate' | 'off' | null;
   differentialFetchMode?: 'inherit' | 'auto' | 'on' | 'off' | null;
@@ -467,6 +486,8 @@ export interface UpdateFeedPayload {
   audioMp3StreamCopyOverride?: boolean | null;
   titleSkipPatterns?: string[];
   descriptionSkipPatterns?: string[];
+  descriptionTrimPattern?: string | null;
+  descriptionTrimMode?: 'to_end' | 'to_next';
   titleSkipAction?: 'serve_original' | 'hide' | null;
   minDurationSeconds?: number | null;
   maxDurationSeconds?: number | null;

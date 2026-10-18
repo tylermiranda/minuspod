@@ -1,4 +1,5 @@
 """Tests for the OpenAI-compatible whisper API transcription backend."""
+import logging
 import os
 import subprocess
 import tempfile
@@ -7,17 +8,14 @@ from unittest.mock import patch, MagicMock
 import pytest
 import requests as requests_lib
 
-from transcriber import (
-    Transcriber, _get_whisper_settings, _get_whisper_compute_type,
-    _api_timeout,
-    _whisper_api_rejects_word_timestamps,
-    _whisper_api_rejects_vad_filter,
-    extract_audio_chunk,
-    _ffmpeg_error_tail,
-    PREPROCESS_AUDIO_FILTERS,
-    TranscriptionRejectedError,
-    is_whisper_failover_trigger,
+from transcriber import Transcriber, TranscriptionRejectedError
+from transcriber.settings import (
+    _get_whisper_settings, _get_whisper_compute_type, _api_timeout, PREPROCESS_AUDIO_FILTERS,
 )
+from transcriber.remote import (
+    _whisper_api_rejects_word_timestamps, _whisper_api_rejects_vad_filter, is_whisper_failover_trigger,
+)
+from transcriber.chunking import extract_audio_chunk, _ffmpeg_error_tail
 from utils.errors import (
     ServiceUnavailableError, AudioExtractionError, AudioExtractionTimeout,
 )
@@ -142,7 +140,7 @@ class TestTranscribeViaApi:
             mock_response.status_code = 200
             mock_response.json.return_value = self._make_api_response(api_segments)
 
-            with patch('transcriber.safe_post', return_value=mock_response):
+            with patch('transcriber.remote.safe_post', return_value=mock_response):
                 transcriber = Transcriber()
                 transcriber.preprocess_audio = MagicMock(return_value=None)
                 result = transcriber._transcribe_via_api(
@@ -159,6 +157,26 @@ class TestTranscribeViaApi:
         finally:
             os.unlink(temp_path)
 
+    @pytest.mark.parametrize("vad_filter,level", [(True, logging.WARNING), (False, logging.DEBUG)])
+    def test_zero_segments_log_level(self, caplog, vad_filter, level):
+        with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
+            f.write(b'fake audio data' * 200)
+            temp_path = f.name
+        mock_response = MagicMock(status_code=200, text='{}')
+        mock_response.json.return_value = self._make_api_response([])
+        try:
+            with patch('transcriber.remote.safe_post', return_value=mock_response), \
+                    caplog.at_level(logging.DEBUG):
+                transcriber = Transcriber()
+                transcriber.preprocess_audio = MagicMock(return_value=None)
+                transcriber._transcribe_via_api(
+                    temp_path, self._make_settings(), vad_filter=vad_filter)
+        finally:
+            os.unlink(temp_path)
+        records = [r for r in caplog.records if '0 usable segments' in r.getMessage()
+                   or '0 segments for repair span' in r.getMessage()]
+        assert [r.levelno for r in records] == [level]
+
     def test_sends_no_prompt_field(self):
         with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as f:
             f.write(b'fake audio data' * 200)
@@ -166,7 +184,7 @@ class TestTranscribeViaApi:
         mock_response = MagicMock(status_code=200)
         mock_response.json.return_value = self._make_api_response([])
         try:
-            with patch('transcriber.safe_post', return_value=mock_response) as mock_post:
+            with patch('transcriber.remote.safe_post', return_value=mock_response) as mock_post:
                 transcriber = Transcriber()
                 transcriber.preprocess_audio = MagicMock(return_value=None)
                 transcriber._transcribe_via_api(temp_path, self._make_settings())
@@ -182,7 +200,7 @@ class TestTranscribeViaApi:
         mock_response = MagicMock(status_code=200)
         mock_response.json.return_value = self._make_api_response([])
         try:
-            with patch('transcriber.safe_post', return_value=mock_response) as mock_post:
+            with patch('transcriber.remote.safe_post', return_value=mock_response) as mock_post:
                 transcriber = Transcriber()
                 transcriber.preprocess_audio = MagicMock(return_value=None)
                 transcriber._transcribe_via_api(
@@ -210,7 +228,7 @@ class TestTranscribeViaApi:
             [{'start': 0.0, 'end': 1.0, 'text': 'hi', 'words': []}]
         )
         try:
-            with patch('transcriber.safe_post',
+            with patch('transcriber.remote.safe_post',
                        side_effect=[rejected, accepted]) as mock_post:
                 transcriber = Transcriber()
                 transcriber.preprocess_audio = MagicMock(return_value=None)
@@ -226,7 +244,7 @@ class TestTranscribeViaApi:
         assert 'vad_filter' not in mock_post.call_args_list[1].kwargs['data']
 
     def test_returns_none_on_missing_base_url(self):
-        with patch('transcriber.safe_post') as mock_post:
+        with patch('transcriber.remote.safe_post') as mock_post:
             transcriber = Transcriber()
             result = transcriber._transcribe_via_api(
                 '/tmp/test.wav', whisper_settings=self._make_settings(api_base_url='')
@@ -241,7 +259,7 @@ class TestTranscribeViaApi:
             temp_path = f.name
 
         try:
-            with patch('transcriber.safe_post', return_value=None):
+            with patch('transcriber.remote.safe_post', return_value=None):
                 transcriber = Transcriber()
                 transcriber.preprocess_audio = MagicMock(return_value=None)
                 result = transcriber._transcribe_via_api(
@@ -261,7 +279,7 @@ class TestTranscribeViaApi:
             mock_response.status_code = 200
             mock_response.json.return_value = {'segments': []}
 
-            with patch('transcriber.safe_post', return_value=mock_response) as mock_post:
+            with patch('transcriber.remote.safe_post', return_value=mock_response) as mock_post:
                 transcriber = Transcriber()
                 transcriber.preprocess_audio = MagicMock(return_value=None)
                 transcriber._transcribe_via_api(
@@ -282,7 +300,7 @@ class TestTranscribeViaApi:
             mock_response.status_code = 200
             mock_response.json.return_value = {'segments': []}
 
-            with patch('transcriber.safe_post', return_value=mock_response) as mock_post:
+            with patch('transcriber.remote.safe_post', return_value=mock_response) as mock_post:
                 transcriber = Transcriber()
                 transcriber.preprocess_audio = MagicMock(return_value=None)
                 transcriber._transcribe_via_api(
@@ -310,7 +328,7 @@ class TestTranscribeViaApi:
             mock_response.status_code = 200
             mock_response.json.return_value = self._make_api_response(api_segments)
 
-            with patch('transcriber.safe_post', return_value=mock_response):
+            with patch('transcriber.remote.safe_post', return_value=mock_response):
                 transcriber = Transcriber()
                 transcriber.preprocess_audio = MagicMock(return_value=None)
                 result = transcriber._transcribe_via_api(
@@ -327,7 +345,7 @@ class TestTranscribeViaApi:
 class TestTranscriberBackendDispatch:
     """Tests for the backend dispatch in transcribe()."""
 
-    @patch('transcriber._get_whisper_settings', return_value={
+    @patch('transcriber.settings._get_whisper_settings', return_value={
         'backend': WHISPER_BACKEND_API,
         'api_base_url': 'http://localhost:8765/v1',
         'api_key': '', 'api_model': 'whisper-1',
@@ -339,7 +357,7 @@ class TestTranscriberBackendDispatch:
         mock_api.assert_called_once()
         assert result is not None
 
-    @patch('transcriber._get_whisper_settings', return_value={
+    @patch('transcriber.settings._get_whisper_settings', return_value={
         'backend': WHISPER_BACKEND_LOCAL,
         'api_base_url': '', 'api_key': '', 'api_model': 'whisper-1',
     })
@@ -390,7 +408,7 @@ class TestWhisperModelSingletonFallback:
     """Tests for WhisperModelSingleton float16 -> int8_float16 -> int8 -> float32 fallback."""
 
     def _reset_singleton(self):
-        from transcriber import WhisperModelSingleton
+        from transcriber.local import WhisperModelSingleton
         WhisperModelSingleton._instance = None
         WhisperModelSingleton._base_model = None
         WhisperModelSingleton._current_model_name = None
@@ -406,14 +424,14 @@ class TestWhisperModelSingletonFallback:
     @patch.dict(os.environ, {'WHISPER_DEVICE': 'cuda'})
     def test_float16_on_cuda_succeeds_first_try(self):
         self._reset_singleton()
-        from transcriber import WhisperModelSingleton
-        with patch('transcriber._get_whisper_settings', return_value=self._settings()), \
-             patch('transcriber._get_whisper_compute_type', return_value='auto'), \
-             patch('transcriber.ctranslate2.get_cuda_device_count', return_value=1), \
-             patch('transcriber.WhisperModel') as mock_model, \
-             patch('transcriber.BatchedInferencePipeline'), \
+        from transcriber.local import WhisperModelSingleton
+        with patch('transcriber.settings._get_whisper_settings', return_value=self._settings()), \
+             patch('transcriber.settings._get_whisper_compute_type', return_value='auto'), \
+             patch('transcriber.local.ctranslate2.get_cuda_device_count', return_value=1), \
+             patch('transcriber.local.WhisperModel') as mock_model, \
+             patch('transcriber.local.BatchedInferencePipeline'), \
              patch.object(WhisperModelSingleton, 'get_configured_model', return_value='small'), \
-             patch('transcriber.get_gpu_memory_info', return_value=None):
+             patch('transcriber.local.get_gpu_memory_info', return_value=None):
             WhisperModelSingleton.get_instance()
             mock_model.assert_called_once()
             _, kwargs = mock_model.call_args
@@ -423,7 +441,7 @@ class TestWhisperModelSingletonFallback:
     @patch.dict(os.environ, {'WHISPER_DEVICE': 'cuda'})
     def test_cuda_float16_failure_falls_back_to_int8_float16(self):
         self._reset_singleton()
-        from transcriber import WhisperModelSingleton
+        from transcriber.local import WhisperModelSingleton
         call_log = []
 
         def fake_model(*args, **kwargs):
@@ -432,13 +450,13 @@ class TestWhisperModelSingletonFallback:
                 raise RuntimeError("no fp16 support")
             return MagicMock()
 
-        with patch('transcriber._get_whisper_settings', return_value=self._settings()), \
-             patch('transcriber._get_whisper_compute_type', return_value='auto'), \
-             patch('transcriber.ctranslate2.get_cuda_device_count', return_value=1), \
-             patch('transcriber.WhisperModel', side_effect=fake_model), \
-             patch('transcriber.BatchedInferencePipeline'), \
+        with patch('transcriber.settings._get_whisper_settings', return_value=self._settings()), \
+             patch('transcriber.settings._get_whisper_compute_type', return_value='auto'), \
+             patch('transcriber.local.ctranslate2.get_cuda_device_count', return_value=1), \
+             patch('transcriber.local.WhisperModel', side_effect=fake_model), \
+             patch('transcriber.local.BatchedInferencePipeline'), \
              patch.object(WhisperModelSingleton, 'get_configured_model', return_value='small'), \
-             patch('transcriber.get_gpu_memory_info', return_value=None):
+             patch('transcriber.local.get_gpu_memory_info', return_value=None):
             WhisperModelSingleton.get_instance()
         assert call_log == ['float16', 'int8_float16']
 
@@ -446,7 +464,7 @@ class TestWhisperModelSingletonFallback:
     def test_cuda_fallback_walks_chain_to_float32(self):
         """Pascal consumer (CC 6.1) fails float16 and int8_float16; should land on int8."""
         self._reset_singleton()
-        from transcriber import WhisperModelSingleton
+        from transcriber.local import WhisperModelSingleton
         call_log = []
 
         def fake_model(*args, **kwargs):
@@ -455,31 +473,31 @@ class TestWhisperModelSingletonFallback:
                 raise RuntimeError("unsupported on this GPU")
             return MagicMock()
 
-        with patch('transcriber._get_whisper_settings', return_value=self._settings()), \
-             patch('transcriber._get_whisper_compute_type', return_value='auto'), \
-             patch('transcriber.ctranslate2.get_cuda_device_count', return_value=1), \
-             patch('transcriber.WhisperModel', side_effect=fake_model), \
-             patch('transcriber.BatchedInferencePipeline'), \
+        with patch('transcriber.settings._get_whisper_settings', return_value=self._settings()), \
+             patch('transcriber.settings._get_whisper_compute_type', return_value='auto'), \
+             patch('transcriber.local.ctranslate2.get_cuda_device_count', return_value=1), \
+             patch('transcriber.local.WhisperModel', side_effect=fake_model), \
+             patch('transcriber.local.BatchedInferencePipeline'), \
              patch.object(WhisperModelSingleton, 'get_configured_model', return_value='small'), \
-             patch('transcriber.get_gpu_memory_info', return_value=None):
+             patch('transcriber.local.get_gpu_memory_info', return_value=None):
             WhisperModelSingleton.get_instance()
         assert call_log == ['float16', 'int8_float16', 'int8']
 
     @patch.dict(os.environ, {'WHISPER_DEVICE': 'cuda'})
     def test_cuda_fallback_raises_when_entire_chain_fails(self):
         self._reset_singleton()
-        from transcriber import WhisperModelSingleton
+        from transcriber.local import WhisperModelSingleton
 
         def fake_model(*args, **kwargs):
             raise RuntimeError(f"boom-{kwargs['compute_type']}")
 
-        with patch('transcriber._get_whisper_settings', return_value=self._settings()), \
-             patch('transcriber._get_whisper_compute_type', return_value='auto'), \
-             patch('transcriber.ctranslate2.get_cuda_device_count', return_value=1), \
-             patch('transcriber.WhisperModel', side_effect=fake_model), \
-             patch('transcriber.BatchedInferencePipeline'), \
+        with patch('transcriber.settings._get_whisper_settings', return_value=self._settings()), \
+             patch('transcriber.settings._get_whisper_compute_type', return_value='auto'), \
+             patch('transcriber.local.ctranslate2.get_cuda_device_count', return_value=1), \
+             patch('transcriber.local.WhisperModel', side_effect=fake_model), \
+             patch('transcriber.local.BatchedInferencePipeline'), \
              patch.object(WhisperModelSingleton, 'get_configured_model', return_value='small'), \
-             patch('transcriber.get_gpu_memory_info', return_value=None):
+             patch('transcriber.local.get_gpu_memory_info', return_value=None):
             import pytest
             with pytest.raises(RuntimeError, match="boom-float32"):
                 WhisperModelSingleton.get_instance()
@@ -488,20 +506,20 @@ class TestWhisperModelSingletonFallback:
     def test_explicit_non_float16_reraises_without_fallback(self):
         """Explicit int8_float16 failure must not silently fall back."""
         self._reset_singleton()
-        from transcriber import WhisperModelSingleton
+        from transcriber.local import WhisperModelSingleton
         call_log = []
 
         def fake_model(*args, **kwargs):
             call_log.append(kwargs['compute_type'])
             raise RuntimeError("unsupported")
 
-        with patch('transcriber._get_whisper_settings', return_value=self._settings()), \
-             patch('transcriber._get_whisper_compute_type', return_value='int8_float16'), \
-             patch('transcriber.ctranslate2.get_cuda_device_count', return_value=1), \
-             patch('transcriber.WhisperModel', side_effect=fake_model), \
-             patch('transcriber.BatchedInferencePipeline'), \
+        with patch('transcriber.settings._get_whisper_settings', return_value=self._settings()), \
+             patch('transcriber.settings._get_whisper_compute_type', return_value='int8_float16'), \
+             patch('transcriber.local.ctranslate2.get_cuda_device_count', return_value=1), \
+             patch('transcriber.local.WhisperModel', side_effect=fake_model), \
+             patch('transcriber.local.BatchedInferencePipeline'), \
              patch.object(WhisperModelSingleton, 'get_configured_model', return_value='small'), \
-             patch('transcriber.get_gpu_memory_info', return_value=None):
+             patch('transcriber.local.get_gpu_memory_info', return_value=None):
             import pytest
             with pytest.raises(RuntimeError, match="unsupported"):
                 WhisperModelSingleton.get_instance()
@@ -510,13 +528,13 @@ class TestWhisperModelSingletonFallback:
     @patch.dict(os.environ, {'WHISPER_DEVICE': 'cpu'})
     def test_cpu_auto_resolves_to_int8_without_fallback(self):
         self._reset_singleton()
-        from transcriber import WhisperModelSingleton
-        with patch('transcriber._get_whisper_settings', return_value=self._settings()), \
-             patch('transcriber._get_whisper_compute_type', return_value='auto'), \
-             patch('transcriber.WhisperModel') as mock_model, \
-             patch('transcriber.BatchedInferencePipeline'), \
+        from transcriber.local import WhisperModelSingleton
+        with patch('transcriber.settings._get_whisper_settings', return_value=self._settings()), \
+             patch('transcriber.settings._get_whisper_compute_type', return_value='auto'), \
+             patch('transcriber.local.WhisperModel') as mock_model, \
+             patch('transcriber.local.BatchedInferencePipeline'), \
              patch.object(WhisperModelSingleton, 'get_configured_model', return_value='small'), \
-             patch('transcriber.get_gpu_memory_info', return_value=None):
+             patch('transcriber.local.get_gpu_memory_info', return_value=None):
             WhisperModelSingleton.get_instance()
             _, kwargs = mock_model.call_args
             assert kwargs['compute_type'] == 'int8'
@@ -666,7 +684,7 @@ class TestSkipFlacCompressionSetting:
                 {'start': 0.0, 'end': 1.0, 'text': ' hi', 'words': []},
             ])
 
-            with patch('transcriber.safe_post', return_value=mock_response), \
+            with patch('transcriber.remote.safe_post', return_value=mock_response), \
                  patch('transcriber.utils.subprocess_registry.tracked_run') as mock_tracked_run:
                 transcriber = Transcriber()
                 transcriber.preprocess_audio = MagicMock(return_value=None)
@@ -704,7 +722,7 @@ class TestSkipFlacCompressionSetting:
             ffmpeg_result = MagicMock()
             ffmpeg_result.returncode = 1  # Force fallback path so no flac file lookup needed.
 
-            with patch('transcriber.safe_post', return_value=mock_response), \
+            with patch('transcriber.remote.safe_post', return_value=mock_response), \
                  patch('transcriber.utils.subprocess_registry.tracked_run', return_value=ffmpeg_result) as mock_tracked_run:
                 transcriber = Transcriber()
                 transcriber.preprocess_audio = MagicMock(return_value=None)
@@ -748,7 +766,7 @@ class TestWhisperServiceUnavailable:
     def test_all_attempts_connection_error_raises(self):
         temp_path = self._make_audio_file()
         try:
-            with patch('transcriber.safe_post',
+            with patch('transcriber.remote.safe_post',
                        side_effect=requests_lib.exceptions.ConnectionError('refused')):
                 transcriber = Transcriber()
                 transcriber.preprocess_audio = MagicMock(return_value=None)
@@ -764,7 +782,7 @@ class TestWhisperServiceUnavailable:
         try:
             mock_response = MagicMock()
             mock_response.status_code = 503
-            with patch('transcriber.safe_post', return_value=mock_response):
+            with patch('transcriber.remote.safe_post', return_value=mock_response):
                 transcriber = Transcriber()
                 transcriber.preprocess_audio = MagicMock(return_value=None)
                 with pytest.raises(ServiceUnavailableError) as exc:
@@ -780,7 +798,7 @@ class TestWhisperServiceUnavailable:
             mock_response = MagicMock()
             mock_response.status_code = 400
             mock_response.text = 'bad request'
-            with patch('transcriber.safe_post', return_value=mock_response):
+            with patch('transcriber.remote.safe_post', return_value=mock_response):
                 transcriber = Transcriber()
                 transcriber.preprocess_audio = MagicMock(return_value=None)
                 result = transcriber._transcribe_via_api(
@@ -790,7 +808,7 @@ class TestWhisperServiceUnavailable:
             os.unlink(temp_path)
 
     def test_missing_base_url_returns_none(self):
-        with patch('transcriber.safe_post') as mock_post:
+        with patch('transcriber.remote.safe_post') as mock_post:
             transcriber = Transcriber()
             result = transcriber._transcribe_via_api(
                 '/tmp/test.wav',
@@ -825,7 +843,7 @@ class TestTranscriptionRejected:
         try:
             mock_response = MagicMock()
             mock_response.status_code = status
-            with patch('transcriber.safe_post', return_value=mock_response):
+            with patch('transcriber.remote.safe_post', return_value=mock_response):
                 transcriber = Transcriber()
                 transcriber.preprocess_audio = MagicMock(return_value=None)
                 with pytest.raises(TranscriptionRejectedError) as exc:
@@ -841,7 +859,7 @@ class TestTranscriptionRejected:
         try:
             mock_response = MagicMock()
             mock_response.status_code = 413
-            with patch('transcriber.safe_post', return_value=mock_response):
+            with patch('transcriber.remote.safe_post', return_value=mock_response):
                 transcriber = Transcriber()
                 transcriber.preprocess_audio = MagicMock(return_value=None)
                 result = transcriber._transcribe_via_api(
@@ -854,7 +872,7 @@ class TestTranscriptionRejected:
         temp_path = self._make_audio_file()
         try:
             post = MagicMock(side_effect=requests_lib.exceptions.ConnectionError('down'))
-            with patch('transcriber.safe_post', post):
+            with patch('transcriber.remote.safe_post', post):
                 transcriber = Transcriber()
                 transcriber.preprocess_audio = MagicMock(return_value=None)
                 with pytest.raises(ServiceUnavailableError):
@@ -1014,8 +1032,8 @@ class TestChunkedSinglePass:
 
         with patch('transcriber.utils.subprocess_registry.tracked_run',
                    side_effect=self._fake_run_factory(ffmpeg_cmds)), \
-             patch('transcriber.safe_post', return_value=self._mock_api_response()), \
-             patch('transcriber._get_chunk_settings', return_value=chunk_settings):
+             patch('transcriber.remote.safe_post', return_value=self._mock_api_response()), \
+             patch('transcriber.settings._get_chunk_settings', return_value=chunk_settings):
             result = transcriber._transcribe_chunked_parallel_api(
                 '/tmp/full.mp3', 180.036, self._make_settings()
             )
@@ -1034,8 +1052,8 @@ class TestChunkedSinglePass:
 
         with patch('transcriber.utils.subprocess_registry.tracked_run',
                    side_effect=self._fake_run_factory(ffmpeg_cmds)), \
-             patch('transcriber.safe_post', return_value=self._mock_api_response()), \
-             patch('transcriber._get_chunk_settings', return_value=self._CHUNK_SETTINGS):
+             patch('transcriber.remote.safe_post', return_value=self._mock_api_response()), \
+             patch('transcriber.settings._get_chunk_settings', return_value=self._CHUNK_SETTINGS):
             result = transcriber._transcribe_chunked_parallel_api(
                 '/tmp/full.mp3', 50.0, self._make_settings()
             )
@@ -1056,8 +1074,8 @@ class TestChunkedSinglePass:
 
         with patch('transcriber.utils.subprocess_registry.tracked_run',
                    side_effect=self._fake_run_factory(ffmpeg_cmds)), \
-             patch('transcriber.safe_post', return_value=self._mock_api_response()), \
-             patch('transcriber._get_chunk_settings', return_value=self._CHUNK_SETTINGS):
+             patch('transcriber.remote.safe_post', return_value=self._mock_api_response()), \
+             patch('transcriber.settings._get_chunk_settings', return_value=self._CHUNK_SETTINGS):
             result = transcriber._transcribe_chunked_parallel_api(
                 '/tmp/full.mp3', 50.0,
                 self._make_settings(skip_flac_compression=True)
@@ -1080,8 +1098,8 @@ class TestChunkedSinglePass:
 
         with patch('transcriber.utils.subprocess_registry.tracked_run',
                    side_effect=self._fake_run_factory(ffmpeg_cmds)), \
-             patch('transcriber.safe_post', return_value=self._mock_api_response()), \
-             patch('transcriber._get_chunk_settings', return_value=self._CHUNK_SETTINGS):
+             patch('transcriber.remote.safe_post', return_value=self._mock_api_response()), \
+             patch('transcriber.settings._get_chunk_settings', return_value=self._CHUNK_SETTINGS):
             transcriber._transcribe_chunked_parallel_api(
                 '/tmp/full.mp3', 50.0, self._make_settings()
             )
@@ -1104,7 +1122,7 @@ class TestChunkedSinglePass:
         transcriber.preprocess_audio = MagicMock(return_value=None)
 
         with patch('transcriber.utils.subprocess_registry.tracked_run', side_effect=failing_run), \
-             patch('transcriber._get_chunk_settings', return_value=self._CHUNK_SETTINGS):
+             patch('transcriber.settings._get_chunk_settings', return_value=self._CHUNK_SETTINGS):
             with pytest.raises(AudioExtractionError):
                 transcriber._transcribe_chunked_parallel_api(
                     '/tmp/full.mp3', 50.0, self._make_settings()
@@ -1119,7 +1137,7 @@ class TestChunkedSinglePass:
         try:
             transcriber = Transcriber()
             transcriber.preprocess_audio = MagicMock(return_value=None)
-            with patch('transcriber.safe_post', return_value=self._mock_api_response()), \
+            with patch('transcriber.remote.safe_post', return_value=self._mock_api_response()), \
                  patch('transcriber.utils.subprocess_registry.tracked_run') as mock_run:
                 result = transcriber._transcribe_via_api(
                     temp_path, self._make_settings(),
@@ -1132,7 +1150,7 @@ class TestChunkedSinglePass:
             if os.path.exists(temp_path):
                 os.unlink(temp_path)
 
-    @patch('transcriber._get_whisper_settings', return_value={
+    @patch('transcriber.settings._get_whisper_settings', return_value={
         'backend': WHISPER_BACKEND_LOCAL,
         'api_base_url': '', 'api_key': '', 'api_model': 'whisper-1',
     })
@@ -1147,7 +1165,7 @@ class TestChunkedSinglePass:
         mock_model = MagicMock()
         mock_model.transcribe.return_value = (iter([]), info)
 
-        with patch('transcriber.WhisperModelSingleton') as mock_singleton:
+        with patch('transcriber.local.WhisperModelSingleton') as mock_singleton:
             mock_singleton.get_batched_pipeline.return_value = mock_model
             mock_singleton.get_current_model_name.return_value = 'small'
             result = transcriber.transcribe('/tmp/chunk.wav', preprocessed=True)
@@ -1185,17 +1203,17 @@ class TestConnectionTestFollowsTheRequestTimeout:
     to cold-load, so the Settings probe must not fail while transcription works."""
 
     def test_a_raised_request_timeout_raises_the_probe(self):
-        from transcriber import _connection_test_timeout
+        from transcriber.settings import _connection_test_timeout
         assert _connection_test_timeout({'api_timeout': 900}) == 120.0
 
     def test_the_probe_never_drops_below_the_shipped_floor(self):
         from config import HTTP_TIMEOUT_CONNECTION_TEST
-        from transcriber import _connection_test_timeout
+        from transcriber.settings import _connection_test_timeout
         assert _connection_test_timeout(
             {'api_timeout': 30}) == HTTP_TIMEOUT_CONNECTION_TEST
 
     def test_a_hung_backend_cannot_hold_the_settings_page_for_the_full_hour(self):
-        from transcriber import _connection_test_timeout
+        from transcriber.settings import _connection_test_timeout
         assert _connection_test_timeout({'api_timeout': 3600}) == 120.0
 
 
@@ -1203,22 +1221,25 @@ class TestChunkExtractionTimeoutFallback:
     """A chunk-extraction timeout halves the chunk once instead of repeating
     the same doomed ffmpeg call four times through the retry ladder (#644)."""
 
+    @pytest.fixture(autouse=True)
+    def _identity_hallucination_filter(self, monkeypatch):
+        monkeypatch.setattr('transcriber.segments.filter_hallucinations', lambda segs: segs)
+
     def _transcriber(self):
         from transcriber import Transcriber
         t = Transcriber.__new__(Transcriber)
         t.get_audio_duration = MagicMock(return_value=3600.0)
         t.transcribe = MagicMock(return_value=[{'start': 0.0, 'end': 1.0, 'text': 'hi'}])
-        t.filter_hallucinations = lambda segs: segs
         return t
 
     def _patches(self, extract):
         # chunk_duration below duration so the single-chunk short circuit
         # does not bypass the chunked loop under test.
         return (
-            patch('transcriber.calculate_optimal_chunk_duration',
+            patch('transcriber.chunking.calculate_optimal_chunk_duration',
                   return_value=(1800.0, 'test')),
-            patch('transcriber.extract_audio_chunk', side_effect=extract),
-            patch('transcriber._get_whisper_settings', return_value={'backend': 'local'}),
+            patch('transcriber.chunking.extract_audio_chunk', side_effect=extract),
+            patch('transcriber.settings._get_whisper_settings', return_value={'backend': 'local'}),
             patch('transcriber.clear_gpu_memory'),
         )
 

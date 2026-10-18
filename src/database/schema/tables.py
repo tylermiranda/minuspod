@@ -71,6 +71,7 @@ TABLE_DDL['podcasts'] = """CREATE TABLE IF NOT EXISTS podcasts (
     feed_user_agent_override TEXT,
     title_override TEXT,
     detection_notes TEXT,
+    chapter_notes TEXT,
     detection_mode TEXT,
     cue_template_score_override REAL,
     cue_create_from_pairs_override INTEGER,
@@ -108,6 +109,9 @@ TABLE_DDL['podcasts'] = """CREATE TABLE IF NOT EXISTS podcasts (
     -- Episode description blacklist (#835): same glob semantics as
     -- title_skip_patterns, matched against the plain-text description.
     description_skip_patterns TEXT,
+    -- Chapter title glob and mode ('to_end'/'to_next') for the description trim.
+    description_trim_pattern TEXT,
+    description_trim_mode TEXT DEFAULT 'to_end',
     -- Served-RSS handling for a blacklisted episode: NULL/'serve_original'
     -- keeps it in the feed untouched, 'hide' drops it from the served feed.
     title_skip_action TEXT,
@@ -312,7 +316,8 @@ TABLE_DDL['pattern_corrections'] = """CREATE TABLE IF NOT EXISTS pattern_correct
     source_hold_reason TEXT,
     fp_suppressed INTEGER DEFAULT 0,
     origin TEXT NOT NULL DEFAULT 'user',
-    hold_id TEXT
+    hold_id TEXT,
+    addressing_mode TEXT
 )"""
 
 TABLE_DDL['processing_runs'] = """CREATE TABLE IF NOT EXISTS processing_runs (
@@ -358,6 +363,42 @@ TABLE_DDL['feed_subscriber_keys'] = """CREATE TABLE IF NOT EXISTS feed_subscribe
     last_used_at TEXT,
     revoked_at TEXT
 )"""
+
+TABLE_DDL['episode_downloads'] = """CREATE TABLE IF NOT EXISTS episode_downloads (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    podcast_id INTEGER NOT NULL REFERENCES podcasts(id) ON DELETE CASCADE,
+    episode_id TEXT NOT NULL,
+    subscriber_key_id TEXT REFERENCES feed_subscriber_keys(id) ON DELETE SET NULL,
+    client_ip TEXT NOT NULL,
+    user_agent TEXT NOT NULL DEFAULT '',
+    first_seen_at TEXT NOT NULL,
+    last_seen_at TEXT NOT NULL,
+    request_count INTEGER NOT NULL DEFAULT 1,
+    last_request_line TEXT,
+    last_request_headers TEXT
+)"""
+
+TABLE_DDL['ip_geo_cache'] = """CREATE TABLE IF NOT EXISTS ip_geo_cache (
+    ip TEXT PRIMARY KEY,
+    country TEXT,
+    region TEXT,
+    city TEXT,
+    looked_up_at TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('ok', 'private', 'failed', 'unresolvable'))
+)"""
+
+DOWNLOAD_INDEX_SQL = (
+    "CREATE INDEX IF NOT EXISTS idx_episode_downloads_seen "
+    "ON episode_downloads(last_seen_at)",
+    "CREATE INDEX IF NOT EXISTS idx_episode_downloads_dedupe "
+    "ON episode_downloads(podcast_id, episode_id, client_ip, user_agent, last_seen_at)",
+    "CREATE INDEX IF NOT EXISTS idx_episode_downloads_client_ip "
+    "ON episode_downloads(client_ip)",
+    "CREATE INDEX IF NOT EXISTS idx_episode_downloads_podcast "
+    "ON episode_downloads(podcast_id, last_seen_at)",
+    "CREATE INDEX IF NOT EXISTS idx_episode_downloads_subscriber "
+    "ON episode_downloads(subscriber_key_id)",
+)
 
 TABLE_DDL['provider_spend_reservations'] = """CREATE TABLE IF NOT EXISTS provider_spend_reservations (
     id TEXT PRIMARY KEY CHECK(length(id) = 32),
@@ -563,7 +604,8 @@ TABLE_DDL['ad_reviewer_log'] = """CREATE TABLE IF NOT EXISTS ad_reviewer_log (
     model_used TEXT NOT NULL,
     latency_ms INTEGER,
     success INTEGER NOT NULL,
-    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    addressing_mode TEXT
 )"""
 
 TABLE_DDL['audio_cue_templates'] = """CREATE TABLE IF NOT EXISTS audio_cue_templates (
@@ -814,6 +856,20 @@ CREATE INDEX IF NOT EXISTS idx_upload_reservations_owner
 """ + TABLE_DDL['feed_subscriber_keys'] + """;
 CREATE INDEX IF NOT EXISTS idx_feed_subscriber_keys_podcast
     ON feed_subscriber_keys(podcast_id, revoked_at);
+
+""" + TABLE_DDL['episode_downloads'] + """;
+CREATE INDEX IF NOT EXISTS idx_episode_downloads_seen
+    ON episode_downloads(last_seen_at);
+CREATE INDEX IF NOT EXISTS idx_episode_downloads_dedupe
+    ON episode_downloads(podcast_id, episode_id, client_ip, user_agent, last_seen_at);
+CREATE INDEX IF NOT EXISTS idx_episode_downloads_client_ip
+    ON episode_downloads(client_ip);
+CREATE INDEX IF NOT EXISTS idx_episode_downloads_podcast
+    ON episode_downloads(podcast_id, last_seen_at);
+CREATE INDEX IF NOT EXISTS idx_episode_downloads_subscriber
+    ON episode_downloads(subscriber_key_id);
+
+""" + TABLE_DDL['ip_geo_cache'] + """;
 
 """ + TABLE_DDL['provider_spend_reservations'] + """;
 CREATE INDEX IF NOT EXISTS idx_provider_spend_provider_day

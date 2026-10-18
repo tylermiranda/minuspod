@@ -1,4 +1,8 @@
+import { pageHeader, pageTitle } from '../components/pageStyles';
 import { useState } from 'react';
+import { useSyncFromQuery } from '../hooks/useSyncFromQuery';
+import { useSearchParams } from 'react-router';
+import QueryError from '../components/QueryError';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { getSponsors, deleteSponsor } from '../api/sponsors';
 import { getTagVocabulary } from '../api/community';
@@ -21,8 +25,8 @@ type SortField = 'name' | 'category' | 'pattern_count' | 'created_at' | 'last_ma
 function SponsorsPage() {
   return (
     <div>
-      <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-4 mb-6">
-        <h1 className="text-2xl font-bold text-foreground">Sponsors</h1>
+      <div className={pageHeader}>
+        <h1 className={pageTitle}>Sponsors</h1>
       </div>
 
       <SponsorsSection />
@@ -32,17 +36,19 @@ function SponsorsPage() {
 
 function SponsorsSection() {
   const queryClient = useQueryClient();
+  const [searchParams] = useSearchParams();
   const [tagFilter, setTagFilter] = useState('all');
-  const [search, setSearch] = useState('');
+  const [search, setSearch] = useState(searchParams.get('q') || '');
   const [showInactive, setShowInactive] = useState(false);
   const [page, setPage] = useState(1);
+  useSyncFromQuery(searchParams.get('q') ?? undefined, setSearch);
   const { sortField, sortDirection, handleSort } =
     useSortState<SortField>('name', 'asc', () => setPage(1));
   const [editing, setEditing] = useState<Sponsor | null | undefined>(undefined); // undefined = closed, null = new
   const [deleteTarget, setDeleteTarget] = useState<Sponsor | null>(null);
   const limit = 20;
 
-  const { data: sponsors, isLoading, error } = useQuery({
+  const { data: sponsors, isLoading, error, refetch, isFetching } = useQuery({
     queryKey: ['sponsors', showInactive],
     queryFn: () => getSponsors(showInactive),
   });
@@ -101,10 +107,11 @@ function SponsorsSection() {
       </div>
     );
   }
-  if (error) return <div className="text-center py-12"><p className="text-destructive">Failed to load sponsors</p></div>;
+  if (error && !sponsors) return <QueryError title="Failed to load sponsors" onRetry={() => void refetch()} retrying={isFetching} />;
 
   return (
     <div>
+      {error && <div className="mb-6"><QueryError title="Sponsors could not be refreshed. Showing the last loaded list." onRetry={() => void refetch()} retrying={isFetching} /></div>}
       {/* Filters + add */}
       <div className="bg-card rounded-lg border border-border p-4 mb-6">
         <div className={`${filterGrid} lg:grid-cols-4 items-end`}>

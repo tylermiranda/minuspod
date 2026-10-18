@@ -1,4 +1,5 @@
-import { useState, useMemo, useRef, useEffect } from 'react';
+import { pageTitle } from '../components/pageStyles';
+import { useState, useMemo, useRef, useEffect, useCallback } from 'react';
 import { Pencil, Trash2 } from 'lucide-react';
 import { useParams, Link, useNavigate, useLocation } from 'react-router';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
@@ -10,6 +11,8 @@ import { isActionBlocked } from '../utils/processingStage';
 import { applyEpisodeJobState } from '../utils/jobStateCache';
 import { PendingRecutsBar } from './patterns/PendingRecutsBar';
 import { useLocalStorageState } from '../hooks/useLocalStorageState';
+import { useUrlParams } from '../hooks/useUrlParams';
+import { SEARCH_DEBOUNCE_MS } from '../hooks/useDebouncedValue';
 import { sortFeeds, FeedSortBy, DASHBOARD_SORT_KEY, DEFAULT_FEED_SORT } from '../utils/feedSort';
 import PrevNextLink from '../components/PrevNextLink';
 import Artwork from '../components/Artwork';
@@ -33,7 +36,7 @@ import { formatDateTime } from '../utils/format';
 import RichText from '../components/RichText';
 import { btnDestructive, btnGhost, btnPrimary, btnSecondary } from '../components/buttonStyles';
 import { cardActionBtn } from '../components/rowActionStyles';
-import { Modal } from '../components/Modal';
+import { Modal, ConfirmModal } from '../components/Modal';
 import { selectBase } from '../components/fieldStyles';
 import { focusRing } from '../components/fieldStyles';
 import { badgeBase, tint } from '../components/badgeStyles';
@@ -77,6 +80,29 @@ function reprocessModeVerb(mode: string): string {
   return 'pattern-assisted';
 }
 
+const EPISODE_PARAM_DEFAULTS = {
+  page: '1', size: '25', status: 'all', sort: 'published_at:desc', q: '',
+};
+const PAGE_SIZES = [25, 50, 100, 500];
+
+type EpisodeParam = keyof typeof EPISODE_PARAM_DEFAULTS;
+
+// Page, filter, sort and search live in the URL so Back from an episode restores them.
+function useEpisodeListParams() {
+  const { read, readPage, write } = useUrlParams(EPISODE_PARAM_DEFAULTS);
+  const size = Number(read('size'));
+  const [sortBy, sortDir] = read('sort').split(':');
+  return {
+    page: readPage('page'),
+    pageSize: PAGE_SIZES.includes(size) ? size : Number(EPISODE_PARAM_DEFAULTS.size),
+    statusFilter: read('status'),
+    episodeSearch: read('q'),
+    sortBy,
+    sortDir,
+    writeParams: write,
+  };
+}
+
 // Bulk actions sit on the tap floor and pair up per line on a phone.
 const bulkActionBtn = `${cardActionBtn} flex-1 sm:flex-none min-w-[8rem]`;
 
@@ -92,13 +118,9 @@ function FeedDetail() {
   const [reprocessResult, setReprocessResult] = useState<ReprocessAllResult | null>(null);
 
   // Pagination state
-  const [page, setPage] = useState(1);
-  const [pageSize, setPageSize] = useState(25);
-  const [statusFilter, setStatusFilter] = useState('all');
-  const [episodeSearch, setEpisodeSearch] = useState('');
+  const { page, pageSize, statusFilter, episodeSearch, sortBy, sortDir, writeParams } = useEpisodeListParams();
+  const [searchInput, setSearchInput] = useState(episodeSearch);
   const selectionScope = JSON.stringify([slug, statusFilter, episodeSearch.trim()]);
-  const [sortBy, setSortBy] = useState('published_at');
-  const [sortDir, setSortDir] = useState('desc');
 
   // Selection state
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
@@ -116,10 +138,9 @@ function FeedDetail() {
   // Anchor row for shift-click range selection; reset wherever selection is.
   const [selectionAnchor, setSelectionAnchor] = useState<string | null>(null);
   const [showBulkDeleteConfirm, setShowBulkDeleteConfirm] = useState(false);
-  // Delete confirms by a second click within 3s, matching the dashboard.
+  // Feed deletion requires an explicit confirmation.
   const [deleteConfirm, setDeleteConfirm] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
-  const deleteTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const [bulkResult, setBulkResult] = useState<BulkActionResult | null>(null);
   const [passthroughResult, setPassthroughResult] = useState<
     { enabled: boolean; updated: number; queued: number } | null
@@ -134,6 +155,7 @@ function FeedDetail() {
     setSelectionRequest(null);
     setSelectionAnchor(null);
     setShowBulkDeleteConfirm(false);
+    setSearchInput(episodeSearch);
   }
 
   // AddFeed's local-feed create flow passes a notice through router state
@@ -206,7 +228,7 @@ function FeedDetail() {
     [selectedIds, selectableIds, selectedScope, selectionScope],
   );
 
-  const clearSelection = () => {
+  const clearSelection = useCallback(() => {
     selectionRequestRef.current += 1;
     setSelectedIds(new Set());
     setSelectedScope(selectionScope);
@@ -214,7 +236,7 @@ function FeedDetail() {
     setSelectionRequest(null);
     setSelectionAnchor(null);
     setShowBulkDeleteConfirm(false);
-  };
+  }, [selectionScope]);
 
   const selectAllMatches = async () => {
     const requestId = ++selectionRequestRef.current;
@@ -262,24 +284,13 @@ function FeedDetail() {
       navigate('/');
     },
     onError: (err) => {
-      setDeleteConfirm(false);
       setActionError(getErrorMessage(err, 'Could not delete this feed.'));
     },
   });
 
-  // The timer outlives the page on a successful delete, which navigates away.
-  useEffect(() => () => {
-    if (deleteTimerRef.current) clearTimeout(deleteTimerRef.current);
-  }, []);
-
   const handleDeleteFeed = () => {
-    if (deleteTimerRef.current) clearTimeout(deleteTimerRef.current);
-    if (deleteConfirm) {
-      deleteMutation.mutate();
-    } else {
-      setDeleteConfirm(true);
-      deleteTimerRef.current = setTimeout(() => setDeleteConfirm(false), 3000);
-    }
+    setActionError(null);
+    setDeleteConfirm(true);
   };
 
   const updateMutation = useMutation({
@@ -419,14 +430,21 @@ function FeedDetail() {
     }
   };
 
-  const handlePageSizeChange = (newSize: number) => {
-    setPageSize(newSize);
-    setPage(1);
+  // Any filter change starts over on page 1 and drops the selection.
+  const changeFilter = useCallback((changes: Partial<Record<EpisodeParam, string>>) => {
     clearSelection();
-  };
+    writeParams({ ...changes, page: '1' });
+  }, [clearSelection, writeParams]);
+
+  // The typed text reaches the URL (and the query) once typing pauses.
+  useEffect(() => {
+    if (searchInput === episodeSearch) return;
+    const timer = setTimeout(() => changeFilter({ q: searchInput }), SEARCH_DEBOUNCE_MS);
+    return () => clearTimeout(timer);
+  }, [searchInput, episodeSearch, changeFilter]);
 
   const handlePageChange = (newPage: number) => {
-    setPage(newPage);
+    writeParams({ page: String(newPage) });
     if (matchedSelection?.scope !== selectionScope) clearSelection();
   };
 
@@ -565,7 +583,7 @@ function FeedDetail() {
               </div>
             ) : (
               <div className="flex items-start gap-2">
-                <h1 className="text-2xl font-bold text-foreground min-w-0 break-words">
+                <h1 className={pageTitle}>
                   {feedDisplayTitle(feed)}
                 </h1>
                 <FeedTypeBadge feedType={feed.feedType} className="mt-1.5" />
@@ -731,7 +749,7 @@ function FeedDetail() {
         <div className="flex items-center gap-2 min-w-0 w-full sm:w-auto">
           <select
             value={statusFilter}
-            onChange={(e) => { clearSelection(); setStatusFilter(e.target.value); setPage(1); }}
+            onChange={(e) => changeFilter({ status: e.target.value })}
             className={`flex-1 min-w-0 sm:flex-none ${selectBase}`}
           >
             <option value="all">All statuses</option>
@@ -745,13 +763,7 @@ function FeedDetail() {
           </select>
           <select
             value={`${sortBy}:${sortDir}`}
-            onChange={(e) => {
-              const [newSort, newDir] = e.target.value.split(':');
-              setSortBy(newSort);
-              setSortDir(newDir);
-              setPage(1);
-              clearSelection();
-            }}
+            onChange={(e) => changeFilter({ sort: e.target.value })}
             className={`flex-1 min-w-0 sm:flex-none ${selectBase}`}
           >
             <option value="published_at:desc">Newest First</option>
@@ -766,12 +778,8 @@ function FeedDetail() {
       <div className="flex flex-wrap items-center gap-2 mb-4">
         <input
           type="search"
-          value={episodeSearch}
-          onChange={(event) => {
-            clearSelection();
-            setEpisodeSearch(event.target.value);
-            setPage(1);
-          }}
+          value={searchInput}
+          onChange={(event) => setSearchInput(event.target.value)}
           placeholder="Search episode titles..."
           aria-label="Search episode titles"
           className="flex-1 min-w-0 min-h-11 px-3 py-2 rounded-lg border border-input bg-background text-foreground focus:outline-hidden focus:ring-2 focus:ring-ring"
@@ -888,10 +896,10 @@ function FeedDetail() {
       {totalPages > 1 && (
         <div className="mt-3 flex items-center justify-end gap-2">
           <span className="text-sm text-muted-foreground">Per page:</span>
-          {[25, 50, 100, 500].map(size => (
+          {PAGE_SIZES.map(size => (
             <button
               key={size}
-              onClick={() => handlePageSizeChange(size)}
+              onClick={() => changeFilter({ size: String(size) })}
               className={`px-2 py-1 text-xs rounded ${
                 pageSize === size
                   ? 'bg-primary text-primary-foreground'
@@ -906,7 +914,7 @@ function FeedDetail() {
 
       {/* Reprocess All Confirmation Modal */}
       {showReprocessConfirm && (
-        <Modal onClose={() => setShowReprocessConfirm(false)} panelClassName="max-w-md w-full">
+        <Modal ariaLabel="Reprocess all episodes" onClose={() => setShowReprocessConfirm(false)} panelClassName="max-w-md w-full">
           <div className="p-6">
             <h2 className="text-xl font-semibold text-foreground mb-4">
               Reprocess All Episodes
@@ -948,7 +956,7 @@ function FeedDetail() {
 
       {/* Reprocess Results Modal */}
       {reprocessResult && (
-        <Modal onClose={closeReprocessModal} panelClassName="max-w-md w-full">
+        <Modal ariaLabel="Reprocess queued" onClose={closeReprocessModal} panelClassName="max-w-md w-full">
           <div className="p-6">
             <h2 className="text-xl font-semibold text-foreground mb-4">Reprocess Queued</h2>
             <p className="text-xs text-muted-foreground mb-4">
@@ -972,7 +980,7 @@ function FeedDetail() {
 
       {/* Reprocess Error Modal */}
       {reprocessAllMutation.error && (
-        <Modal onClose={closeReprocessModal} panelClassName="max-w-md w-full">
+        <Modal ariaLabel="Reprocess failed" onClose={closeReprocessModal} panelClassName="max-w-md w-full">
           <div className="p-6">
             <h2 className="text-xl font-semibold text-destructive mb-4">Reprocess Failed</h2>
             <p className="text-sm text-muted-foreground mb-4">
@@ -990,7 +998,7 @@ function FeedDetail() {
 
       {/* Bulk Delete Confirmation Modal */}
       {showBulkDeleteConfirm && (
-        <Modal onClose={() => setShowBulkDeleteConfirm(false)} panelClassName="max-w-md w-full">
+        <Modal ariaLabel="Delete selected episodes" onClose={() => setShowBulkDeleteConfirm(false)} panelClassName="max-w-md w-full">
           <div className="p-6">
             <h2 className="text-xl font-semibold text-foreground mb-4">
               Delete {effectiveSelectedIds.size} Episode{effectiveSelectedIds.size > 1 ? 's' : ''}
@@ -1019,7 +1027,7 @@ function FeedDetail() {
 
       {/* Bulk Action Result Modal */}
       {bulkResult && (
-        <Modal onClose={() => setBulkResult(null)} panelClassName="max-w-md w-full">
+        <Modal ariaLabel="Bulk action complete" onClose={() => setBulkResult(null)} panelClassName="max-w-md w-full">
           <div className="p-6">
             <h2 className="text-xl font-semibold text-foreground mb-4">Bulk Action Complete</h2>
             <ResultStatsGrid queued={bulkResult.queued} skipped={bulkResult.skipped} queuedLabel="Actioned" />
@@ -1050,7 +1058,7 @@ function FeedDetail() {
 
       {/* Pass-through Result Modal */}
       {passthroughResult && (
-        <Modal onClose={() => setPassthroughResult(null)} panelClassName="max-w-md w-full">
+        <Modal ariaLabel="Pass-through result" onClose={() => setPassthroughResult(null)} panelClassName="max-w-md w-full">
           <div className="p-6">
             <h2 className="text-xl font-semibold text-foreground mb-4">
               {passthroughResult.enabled ? 'Pass-through Set' : 'Pass-through Cleared'}
@@ -1072,7 +1080,7 @@ function FeedDetail() {
       {/* Same bottom-right confirm/error toasts the dashboard uses. */}
       {(deleteConfirm || actionError) && (
         <div className="fixed bottom-4 right-4 flex flex-col items-end gap-2">
-          {actionError && (
+          {actionError && !deleteConfirm && (
             <div className="max-w-sm bg-destructive/10 border border-destructive text-destructive rounded-lg p-4 shadow-lg text-sm flex items-start gap-3">
               <span className="flex-1">{actionError}</span>
               <button
@@ -1087,8 +1095,10 @@ function FeedDetail() {
             </div>
           )}
           {deleteConfirm && (
-            <div className="bg-card border border-border rounded-lg p-4 shadow-lg max-w-sm">
-              <p className="text-sm text-foreground">Click delete again to confirm</p>
+            <ConfirmModal title={`Delete ${feed?.title || slug}?`} confirmLabel="Delete feed" pending={deleteMutation.isPending}
+              onCancel={() => { setDeleteConfirm(false); setActionError(null); }} onConfirm={() => deleteMutation.mutate()}>
+              <p>This removes the feed and its downloaded files.</p>
+              {actionError && <p role="alert" className="text-destructive">{actionError}</p>}
               {stopsProcessingMessage && (
                 <p className="text-sm text-warning mt-1">{stopsProcessingMessage}</p>
               )}
@@ -1102,7 +1112,7 @@ function FeedDetail() {
                   Only the combined feed is removed; the source feeds and episodes stay.
                 </p>
               )}
-            </div>
+            </ConfirmModal>
           )}
         </div>
       )}

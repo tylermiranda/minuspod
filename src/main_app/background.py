@@ -9,11 +9,13 @@ from datetime import datetime, timedelta, timezone
 from typing import Literal
 
 import failover
+import geo_lookup
 import run_context
 import run_log
 from config import (
+    resolve_download_history_retention_days,
     DEFER_SERVICE_LLM, DEFER_SERVICE_WHISPER,
-    FEED_REFRESH_OUTAGE_MIN_FEEDS, MAX_EPISODE_RETRIES,
+    FEED_REFRESH_OUTAGE_MIN_FEEDS, LOCAL_MODEL_IDLE_UNLOAD_SECONDS, MAX_EPISODE_RETRIES,
     PROCESSING_MODE_CUE_ONLY, PROCESSING_MODE_PASSTHROUGH,
     resolve_episode_log_retention_days, resolve_processing_mode,
     resolve_skip_transcription, episode_matches_feed_filters,
@@ -21,16 +23,14 @@ from config import (
 from database.queue import PENDING_QUEUE_LIMIT
 from utils.constants import CANCELED_ERROR_MESSAGE, EpisodeStatus
 from utils.time import parse_iso_utc
-from transcriber import active_whisper_settings, unload_whisper_if_idle
+from transcriber.settings import active_whisper_settings
+from transcriber.local import unload_whisper_if_idle
 from whisper_pool import get_pool
 # Singletons are bound in main_app/__init__.py before this submodule
 # is loaded by the explicit `from main_app.background import ...` at
 # the bottom of that file, so the apparent circular import is safe.
 from main_app import db, storage, shutdown_event
-from main_app.processing import (
-    _active_phases_for_admission, _admission_gates, _required_providers_for_admission,
-    _resolve_route_snapshot,
-)
+from main_app.pipeline.admission import _active_phases_for_admission, _admission_gates, _required_providers_for_admission, _resolve_route_snapshot
 from recents_feed import rebuild_recents_feed
 
 refresh_logger = logging.getLogger('podcast.refresh')
@@ -58,6 +58,13 @@ BLOCKED_SCAN_MAX_ROWS = 1000
 # lock contention that made it fail.
 INDEX_REBUILD_RETRY_SECONDS = 2700
 INDEX_REBUILD_INTERVAL_SECONDS = 21600
+INDEX_FULL_REBUILD_INTERVAL_SECONDS = 7 * 24 * 3600
+DOWNLOAD_PRUNE_INTERVAL_SECONDS = 24 * 3600
+# Epoch-second cadence stamps for the cleanup pass.
+_INDEX_STATE = {'last_refresh': 0, 'last_full': 0}
+_DOWNLOAD_STATE = {'last_prune': 0}
+_GEO_STATE = {'thread': None}
+_GEO_LOCK = threading.Lock()
 # Ceiling on deferring to active runs: an instance that is never idle would
 # otherwise never rebuild at all.
 INDEX_REBUILD_MAX_DEFERRAL_SECONDS = 2 * INDEX_REBUILD_INTERVAL_SECONDS
@@ -158,6 +165,25 @@ def _offline_queue_target_resolver(settings_db):
     return resolve
 
 
+def _run_geo_lookup_safely():
+    try:
+        geo_lookup.run_geo_lookup(db)
+    except Exception as e:
+        refresh_logger.error(f"Download geo lookup failed: {e}")
+
+
+def _start_geo_lookup():
+    """Run the geo lookup off the maintenance thread; skip while one is still running."""
+    # The settings PUT and the maintenance loop can both call this at once.
+    with _GEO_LOCK:
+        running = _GEO_STATE['thread']
+        if running is not None and running.is_alive():
+            return
+        thread = threading.Thread(target=_run_geo_lookup_safely, name='download-geo', daemon=True)
+        _GEO_STATE['thread'] = thread
+        thread.start()
+
+
 def run_cleanup():
     """Run episode cleanup based on retention period."""
     try:
@@ -198,12 +224,20 @@ def run_cleanup():
     except Exception as e:
         refresh_logger.error(f"Run log cleanup failed: {e}")
 
-    # Periodic search index rebuild (every 6 hours). rebuild_search_index
-    # logs "Search index rebuilt with N items" itself, so no duplicate log
-    # line is needed at this caller.
+    # Download history: drop rows past retention (geo lookup runs on the 5-minute tick).
+    if time.time() - _DOWNLOAD_STATE['last_prune'] > DOWNLOAD_PRUNE_INTERVAL_SECONDS:
+        try:
+            db.prune_downloads(resolve_download_history_retention_days(db))
+            _DOWNLOAD_STATE['last_prune'] = time.time()
+        except Exception as e:
+            refresh_logger.error(f"Download history prune failed: {e}")
+
+    # Journal refresh every 6 hours, full rebuild weekly. Both log their own results.
     try:
         from processing_queue import ProcessingQueue
-        overdue_by = time.time() - getattr(run_cleanup, '_last_index_rebuild', 0)
+        now = time.time()
+        overdue_by = now - _INDEX_STATE['last_refresh']
+        full_due = now - _INDEX_STATE['last_full'] > INDEX_FULL_REBUILD_INTERVAL_SECONDS
         if overdue_by > INDEX_REBUILD_INTERVAL_SECONDS:
             # A whole-corpus rewrite alongside a live run is what produces the
             # "database is locked" failures; wait for an idle pass, but only
@@ -213,16 +247,19 @@ def run_cleanup():
                 refresh_logger.debug("Search index rebuild deferred: a run is active")
             else:
                 try:
-                    db.rebuild_search_index()
-                    run_cleanup._last_index_rebuild = time.time()
+                    if full_due:
+                        db.rebuild_search_index()
+                        _INDEX_STATE['last_full'] = now
+                    else:
+                        db.refresh_search_index()
+                    _INDEX_STATE['last_refresh'] = now
                 except Exception as e:
                     refresh_logger.error(f"Search index rebuild failed: {e}")
                     db.clear_leaked_transaction(refresh_logger, 'search index rebuild')
-                    # Back off instead of rebuilding again on the next pass: the
-                    # retry feeds the same contention that made this attempt fail.
-                    run_cleanup._last_index_rebuild = (
-                        time.time() - INDEX_REBUILD_INTERVAL_SECONDS
-                        + INDEX_REBUILD_RETRY_SECONDS)
+                    # Back off instead of retrying on the next pass: the retry
+                    # feeds the same contention that made this attempt fail.
+                    _INDEX_STATE['last_refresh'] = (
+                        now - INDEX_REBUILD_INTERVAL_SECONDS + INDEX_REBUILD_RETRY_SECONDS)
     except Exception as e:
         # The rebuild has its own handler, so this is the slot lookup failing;
         # it touched no index, so the cadence stays as it was.
@@ -542,9 +579,38 @@ def _wait_for_claimed_episode(queue_id: int, slug: str, episode_id: str) -> None
         refresh_logger.error(f"[{slug}:{episode_id}] Auto-process error: {e}")
 
 
+def _run_maintenance_tick(registry):
+    """Queue hygiene, offline-queue drive and geo lookup, every 5 minutes."""
+    from offline_queue import offline_queue_tick
+    # A live slot means the run is still going, whatever the row's
+    # age says: updated_at is only written at a stage change.
+    reset_count, failed_count = db.reset_orphaned_queue_items(
+        stuck_minutes=65, exclude_running=registry.get_current())
+    if reset_count > 0 or failed_count > 0:
+        refresh_logger.info(f"Reset {reset_count} orphaned queue items, {failed_count} exceeded max attempts")
+
+    retry_count = db.reset_failed_queue_items(max_retries=MAX_EPISODE_RETRIES)
+    if retry_count > 0:
+        refresh_logger.info(f"Reset {retry_count} failed queue items for automatic retry")
+
+    # Episode rows orphaned in 'processing' by a killed worker.
+    # This ran at startup only, so a row could sit unprocessable
+    # until the next restart.
+    reset_stuck_processing_episodes()
+
+    # Offline queue (#482): expire deferred episodes past their
+    # TTL and re-queue the rest once their service is reachable.
+    _run_tick(
+        lambda settings_db: offline_queue_tick(
+            settings_db, _offline_queue_target_resolver),
+        'offline_queue_tick')
+
+    db.clear_completed_queue_items(older_than_hours=24)
+
+    _start_geo_lookup()
+
 def background_queue_processor():
     """Dispatcher: keep up to the pool's max_episodes claimed rows running."""
-    from offline_queue import offline_queue_tick
     from processing_queue import ProcessingQueue, is_processing_paused
     from rate_limit_hold import (
         active_held_pairs, get_active_hold, probe_rate_limit, rate_limit_hold_tick,
@@ -568,30 +634,7 @@ def background_queue_processor():
                 # every 5 minutes of wall-clock time (the first pass runs it too).
                 if time.monotonic() - last_maintenance >= MAINTENANCE_INTERVAL_SECONDS:
                     last_maintenance = time.monotonic()
-                    # A live slot means the run is still going, whatever the row's
-                    # age says: updated_at is only written at a stage change.
-                    reset_count, failed_count = db.reset_orphaned_queue_items(
-                        stuck_minutes=65, exclude_running=registry.get_current())
-                    if reset_count > 0 or failed_count > 0:
-                        refresh_logger.info(f"Reset {reset_count} orphaned queue items, {failed_count} exceeded max attempts")
-
-                    retry_count = db.reset_failed_queue_items(max_retries=MAX_EPISODE_RETRIES)
-                    if retry_count > 0:
-                        refresh_logger.info(f"Reset {retry_count} failed queue items for automatic retry")
-
-                    # Episode rows orphaned in 'processing' by a killed worker.
-                    # This ran at startup only, so a row could sit unprocessable
-                    # until the next restart.
-                    reset_stuck_processing_episodes()
-
-                    # Offline queue (#482): expire deferred episodes past their
-                    # TTL and re-queue the rest once their service is reachable.
-                    _run_tick(
-                        lambda settings_db: offline_queue_tick(
-                            settings_db, _offline_queue_target_resolver),
-                        'offline_queue_tick')
-
-                    db.clear_completed_queue_items(older_than_hours=24)
+                    _run_maintenance_tick(registry)
 
                 # Provider health probe (#806): own interval, independent of the
                 # maintenance cadence above.
@@ -684,7 +727,9 @@ def background_queue_processor():
                     # An empty queue with no active run must not keep Whisper on the GPU.
                     if (nothing_to_claim and registry.slot_count() == 0
                             and unload_whisper_if_idle()):
-                        refresh_logger.info("Processing queue idle; unloaded the Whisper model")
+                        refresh_logger.info(
+                            f"Processing queue idle for {LOCAL_MODEL_IDLE_UNLOAD_SECONDS}s; "
+                            "unloaded the local transcription model")
                     # No queued episodes, wait before checking again. Under a hold
                     # an empty claim means the scan just scored every pending row,
                     # so wait longer than the idle tick before repeating it.

@@ -13,7 +13,7 @@ from urllib.parse import urlencode
 
 import requests
 import requests.exceptions
-from flask import Response, send_file, abort, redirect, send_from_directory, request
+from flask import Response, g, send_file, abort, redirect, send_from_directory, request
 from werkzeug.exceptions import NotFound
 from werkzeug.utils import safe_join
 
@@ -28,6 +28,7 @@ from config import (
 )
 from ad_chapters import ID3_CHAPTER_SOURCE_KEY, public_chapters
 from storage import is_chapter_image_filename
+from database.downloads import capture_request
 from database.podcasts import has_upstream, is_local_feed
 from database.queue import compute_queue_priority
 from main_app.feeds import is_served_rss_stale
@@ -319,6 +320,25 @@ def _head_local(slug, episode_id, episode, requested_version=None):
     abort(404)
 
 
+def _record_download(slug, episode_id):
+    """Log a GET download for the history tab; never affects serving."""
+    if request.method != 'GET':
+        return
+    try:
+        if not db.get_setting_bool('download_history_enabled', True):
+            return
+        line, headers = capture_request(
+            request.method, request.path,
+            request.query_string.decode('utf-8', 'replace'), request.headers)
+        db.record_download(
+            slug, episode_id, client_ip(),
+            (request.user_agent.string or '')[:200],
+            subscriber_key_id=getattr(g, 'subscriber_key_id', None),
+            request_line=line, request_headers=headers)
+    except Exception as exc:
+        feed_logger.debug(f"[{slug}:{episode_id}] download not recorded: {exc}")
+
+
 def _local_original_response(slug, episode_id, requested_version=None):
     """200 with the best available audio for a local-feed episode that
     isn't PROCESSED right now, instead of the 503/410 that would otherwise
@@ -344,6 +364,7 @@ def _local_original_response(slug, episode_id, requested_version=None):
         feed_logger.info(
             f"[{slug}:{episode_id}] serving published processed file "
             "during reprocess window")
+        _record_download(slug, episode_id)
         response = send_file(processed_path, mimetype='audio/mpeg', conditional=True)
         response.headers['Accept-Ranges'] = 'bytes'
         return response
@@ -353,6 +374,7 @@ def _local_original_response(slug, episode_id, requested_version=None):
         return None
     feed_logger.info(
         f"[{slug}:{episode_id}] serving retained original (episode not processed)")
+    _record_download(slug, episode_id)
     response = send_file(original_path, mimetype='audio/mpeg', conditional=True)
     response.headers['Accept-Ranges'] = 'bytes'
     return response
@@ -573,6 +595,7 @@ def register_routes(app):
                 feed_logger.info(
                     f"[{slug}:{episode_id}] Cache hit for published audio"
                 )
+                _record_download(slug, episode_id)
                 return send_file(file_path, mimetype='audio/mpeg')
             else:
                 feed_logger.error(

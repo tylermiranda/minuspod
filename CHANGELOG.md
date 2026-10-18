@@ -9,7 +9,185 @@ Alongside the standard sections, a "Breaking" section marks changes
 that require operator action; these are surfaced at the top of stable
 release notes.
 
-## [Unreleased]
+## [2.100.18] - 2026-10-18
+
+### Added
+- Docs: how to install the web UI as an app on iPhone, iPad, Android,
+  macOS and Windows (docs/web-interface.md).
+
+### Fixed
+- Bulk action buttons on a phone (Reprocess, Set pass-through, Delete)
+  collapsed to 44px squares with their labels spilling across each other.
+  The 2.100.17 touch-target rule set a minimum button width outside the
+  Tailwind layers, so it overrode every button's own minimum width. The
+  width floor now sits in the base layer, and the bulk toolbar wraps long
+  labels on phones.
+- More phone layout fixes. The episode card meta line ("4 ads detected")
+  wraps instead of being cut mid-word. The audio cue template buttons
+  size to their labels instead of squeezing their text. A running job's
+  stage label sits under the title instead of shrinking it to a few
+  characters. The prev/next pills and the VTT/Chapters download chips meet
+  the 44px tap-target floor.
+
+## [2.100.17] - 2026-10-17
+
+### Fixed
+- Search ranks a title hit above the same words in a description or transcript. A
+  multi-word query no longer needs its function words, such as "the" or "for", to
+  appear in a description. Episode results show the publish date and status, and a
+  title hit is highlighted in the title rather than shown as a description snippet.
+- The ad editor's playback controls share one row on a phone, and the Selection label sits above its start and end boxes. The Edit and Add buttons above Detected Ads are 36 px squares with centered icons.
+
+## [2.100.16] - 2026-10-16
+
+### Fixed
+- Compose passes transcription backend and API settings from `.env`. The example environment keeps CPU image defaults intact. Installation and deployment guidance now covers Parakeet storage, memory limits, cache paths, and backend-specific troubleshooting.
+- Failed Settings, search, queue, history, and sponsor requests show recovery actions instead of empty or indefinite-loading states. Search filters fit narrow screens and sponsor/pattern results open filtered destinations.
+- Dialogs require accessible names, contain keyboard focus, restore their triggers, and coordinate nested dialogs and popovers. Global search uses Ctrl/Cmd+K; editor shortcuts leave native controls alone.
+- Feed deletion, resets, and replace-mode imports use explicit confirmations. Registered settings drafts block accidental navigation and reload; edited dialogs ask before discarding changes. App updates wait for an explicit reload.
+- Shared touch targets retain 44 CSS px minimums on coarse pointers, including tablets. History summary values and labels align across clickable and static cards. History cards expose sorting, date ranges stay paired, and populated History and episode-cost tables switch to cards at tablet widths.
+- Theme text and filled-control contrast now passes the expanded contrast checks. Status-bar spacing follows its measured height, and shared animations respect reduced-motion preferences.
+- Independently saved settings now protect drafts during navigation and background refreshes. Failed retention saves keep the entered value; notification, key, pricing, and security fields cannot be edited while their saves are pending. UTC remains available in the timezone selector.
+- Form labels, help, and validation messages are associated with their controls. Headers and summary cards share sizing rules. WebKit dialog focus returns to the clicked trigger, and webhook deletion uses an explicit confirmation.
+- The design guide takes its theme values from the application source. CI checks the two match and runs browser checks for dialogs, forms and responsive layouts.
+
+## [2.100.15] - 2026-10-15
+
+### Fixed
+- An MP3 without a Xing, Info or VBRI header no longer gets the duration ffprobe estimates from its bitrate. When ffprobe says it is estimating, the file is decoded once and that length is used. End cues in the last seconds are scanned again and markers and cuts can reach the real end. Reprocessing an episode picks up the exact length. (#860)
+- A feed's episode list keeps its page, status filter, sort, title search and page size in the URL. Opening an episode and pressing Back returns to the same page instead of page 1. The title search updates the URL once typing pauses.
+- The transcript viewer's search box has its own row, with Source, Start and End beneath it in the same labeled fields the other filter bars use. The filters no longer wrap unevenly on a phone. The End box shows the episode's last timestamp until a value is typed.
+
+## [2.100.14] - 2026-10-14
+
+### Fixed
+- MP3 stream copy no longer re-encodes an episode because one edge is word-timed, quote-aligned, reviewer-locked or confirmed, or because a cut touches the start or end of the file. Locked edges snap inward per cut, so kept audio is never shortened. A beep action still skips copy, and that skip is now logged. (#858)
+- The Downloads tab on the History page no longer scrolls sideways on desktop. Long IPv6 addresses wrap, titles truncate, and the extra columns appear as the window widens. Narrow windows get the card layout.
+- The Detection notes and Chapter notes fields in feed settings use the standard text input style instead of a secondary fill.
+
+## [2.100.13] - 2026-10-14
+
+### Added
+- Feeds can trim an episode by a description chapter. When a timestamp line in the description matches a title pattern, the span from that timestamp to the end of the episode (or to the next chapter) is cut like an ad, so a show whose second half is a re-run no longer needs to be skipped. The rule also matches the episode's chapters, including the ones MinusPod generates, and a matching generated chapter queues an automatic recut. Feeds can add chapter notes that are sent with every chapter request.
+- History page gains a Downloads tab: every episode download with time, client IP, location, subscriber label and client app, with sorting and filters. Range requests from the same client within 15 minutes count as one download. Geo lookup (ipwho.is over HTTPS) is off by default and enabled under Settings. It runs within five minutes of a download and starts as soon as the setting is turned on. Rows are kept for 90 days by default and pruned daily. See [Download History](docs/download-history.md).
+- Download history rows have an Actions menu to view the user agent, view the last request, block the client's user agent (adds `^` plus its product token to the JIT blocked user agents list) or revoke the subscriber feed that fetched it; rows fetched with the global feed key offer no revoke.
+- Settings > Authenticated feeds lists every subscriber feed across all podcasts with its label and feed; each feed's settings gain a Security section to create and revoke subscriber feeds for that podcast.
+- Each LLM-detected marker records the addressing mode it was detected under and the model's pre-snap boundaries; the reviewer log and corrections carry the mode, and /stats/reviewer and /stats/addressing report verdicts, correction rates and snap distance per mode.
+
+### Changed
+- A feed's max ad duration cap or its max ad duration (reject) override now also lifts the detector's 7-minute cap on a single LLM detection, so a show whose mid-roll is one continuous 8 to 10 minute block can be detected as one span instead of pieces. The 7-minute default is now the global setting Longest single LLM detection. The verification pass honors the same cap.
+- Detected Ads and Ad Review cards share one layout: the category selector sits above a single equal-width row of Play, Confirm ad, Not an ad, Split and Edit. Pattern merge suggestions put the Merge button below the member list, matching Cleanup. The feed settings Episode filters section uses compact pattern chips and buttons on mobile.
+- The search index is refreshed from its change journal every 6 hours and fully rebuilt weekly; rebuild writes yield between batches so the podping listener and processing queue no longer wait 10 to 20 s on the write lock during a rebuild.
+
+### Fixed
+- Reprocessing or re-detecting an episode on a local feed, or any episode with a retained original, no longer reports a Downloading phase; the status bar shows Preparing until transcription starts.
+- Search results no longer show raw HTML tags from episode and podcast descriptions; the index stores plain text and is rebuilt once on upgrade.
+- A reviewer boundary adjustment can no longer move an ad edge back across an audio cue that is set to be removed with the ad, so break stingers are cut instead of left audible.
+- Changing the category in a held marker's editor now records the new category and keeps the marker held; it no longer confirms the marker with the old category.
+- Confirming the reviewer's trimmed span on a held marker no longer fails with 'Adjusted bounds must lie within the reviewed span' when the hold was carved out of a larger detection. The stale trim is dropped from the remainder, the button is hidden when the trim does not overlap the held span, and the error names the spans when it still applies.
+- The subscriber-feed podcast picker is sorted alphabetically.
+- The evidence gate (#807) now holds LLM spans whose reason restates the audio signals without the word "pair": "DAI transition(s)", "dynamic ad insertion" and "potential ad content" count as audio echoes, so a reason such as "Dynamic ad insertion detected" or "DAI transition with volume anomaly and splice evidence" is no longer read as ad language. Those spans were being cut as ads; they now need ad language in the span transcript or measured audio evidence.
+
+## [2.100.11] - 2026-10-12
+
+Maintenance release with no new functionality. The processing pipeline, API, and UI behave as in 2.100.10. The work is module splits, documentation, dependency updates, OpenAPI corrections, and one settings save fix.
+
+### Added
+- Integration tests validate live API responses against `openapi.yaml` with JSON Schema 2020-12, so a response that drifts from the documented schema fails CI instead of passing a substring check.
+- Design specs behind larger features now live in `docs/specs/`, with an index, and tests that pin a design decision cite the spec by path and heading instead of a bare section number.
+
+### Changed
+- The episode processing module is split into stage modules under `main_app/pipeline/` (transcribe, signals, detect, review, cuts, keep rules, verify, publish, finalize, admission, failure, recut), with `processing.py` keeping the orchestrator and background start path. No behavior change.
+- Installation docs state that a GPU is recommended but not required, lead with the Docker-on-any-host path, and give a 2 CPU core, 8 GB RAM minimum.
+- README lists processing modes, configuration export and restore, podcast search, output audio controls, and queue resilience, and corrects stale statements about auth, backups, verification, and providers.
+- README Documentation table and docs/README.md list the System One, Failover, Pattern Cleanup, Transcript Differential, Glossary, and Container Security pages, ordered from first install through pipeline, tuning, and maintainer topics.
+- Dependency updates: anthropic 1.12.1, openai 3.26.1, tldextract 5.4.0, fsspec 2026.9.0, python-slugify 9.1.3; frontend wavesurfer.js 8.0.2, vite-plugin-pwa 2.0.0, @vitejs/plugin-react 6.1.2, @tanstack/react-query 5.104.1, eslint 10.12.0; GitHub Actions upload-artifact 7.0.2, download-artifact 8.0.2, setup-node 7.1.0.
+- Episode run serialization lives in a top-level `episode_runs` module, so the episode and stats APIs import it directly instead of reaching into a route package.
+- The episodes API module is split into a package (core, runs, chapters, media). No behavior change.
+- The transcriber module is split into a package: the Transcriber class stays at the top; settings, local backend (model singleton, GPU admission, batch-size ceiling), remote backend (health probes and the whole remote transcription attempt policy), segment filters and chunking live in their own modules. No behavior change.
+- The settings API module is split into a package by settings area: core, ad detection (detection-tuning phases), provider phases (provider, failover and whisper), System One phases, notifications, providers and operations. Shared helpers and the post-commit scope live in a common module used by both the settings save and config import. No behavior change.
+
+### Fixed
+- Saving the provider budget with USD as the display currency no longer fails with a database constraint error.
+- The OpenAPI schema for the settings object marks the model and provider routing values as nullable, matching the null the API returns while they are unset.
+- The OpenAPI document describes the response bodies of the unassigned corrections list, the feed tags update, the reviewer settings update, and the community sync settings update.
+
+## [2.100.10] - 2026-10-11
+
+### Fixed
+- Episode processing runs only in the background leader worker. A reprocess or play request that reaches another gunicorn worker is queued instead of started there, so two workers no longer load a transcription model each on the one GPU. The second load was failing Parakeet session creation with an ONNX Runtime allocation error and cost the episode two retries.
+- Chunked transcription on the Parakeet backend no longer loads the Whisper model before decoding. The warm-up that overlaps model loading with chunk extraction loads the selected backend's model.
+- The GPU free-memory check reads device-wide free memory instead of PyTorch's reserved counter, so memory held by ctranslate2 and ONNX Runtime counts.
+- Chunk sizing no longer subtracts the model's base memory again when the model is already resident, since device-wide free memory already excludes it.
+- Parakeet window merging checks every kept word near a seam for a duplicate instead of stopping at the first earlier-timed word. A word whose window-quantized time drifted earlier no longer lets the next duplicate through.
+- The pre-roll heuristic counts a detected ad inside the pre-roll zone as an ad indicator and treats a line that names the podcast as the show intro. A produced pre-roll whose copy carries one URL and a short tagline detection is cut from the episode start instead of rejected as a fragment under the minimum ad length.
+
+## [2.100.9] - 2026-10-11
+
+### Fixed
+- A template ad-break cue that lies inside a text pattern's content match may set the ad edge even when it is farther from the refined edge than the maximum boundary shift, so an outro phrase learned from a shorter read no longer leaves the rest of the read in when the end sting is within the matched text. (#838)
+
+## [2.100.8] - 2026-10-11
+
+### Fixed
+- Text pattern intro and outro refinement keeps an edge when the text it would trim still matches the pattern, so a learned outro phrase that appears mid-read no longer cuts the ad short. (#838)
+- A template ad-break cue that snapped an estimated pattern span's edge counts as a measurement of that edge, so the span up to the cue is cut instead of held for review as an estimated remainder. (#838)
+
+### Changed
+- Documentation presents faster-whisper and Parakeet as the two local transcription backends side by side, with the measured trade-offs and which settings apply to each.
+
+## [2.100.7] - 2026-10-11
+
+### Changed
+- The local transcription model (Whisper or Parakeet) stays loaded while episodes keep processing and unloads 300 seconds after the queue empties, instead of reloading twice per episode.
+
+### Fixed
+- The detection review filter bar keeps Sort beside Reviewer on phones instead of giving it a row of its own.
+
+## [2.100.6] - 2026-10-11
+
+### Fixed
+- A transcript-differential gap that folds into a detected ad only corroborates it; the merged ad keeps the detection's own start and end instead of widening to the gap's alignment-granular edges. (#838)
+
+## [2.100.5] - 2026-10-11
+
+### Fixed
+- Parakeet window merging drops a repeated phrase at a window boundary by comparing words, not only timestamps, so overlapping decodes no longer leave a duplicated phrase about every fifty boundaries.
+
+## [2.100.4] - 2026-10-11
+
+### Fixed
+- Parakeet keeps the word boundary the tokenizer emits before numbers, so "Android 16" no longer comes out as "Android16".
+
+## [2.100.3] - 2026-10-11
+
+### Fixed
+- Parakeet word boundaries follow the space-prefixed tokens onnx-asr returns, so transcripts carry one word per spoken word instead of one word per 30 second window and no window is dropped at the overlap.
+
+## [2.100.2] - 2026-10-11
+
+### Fixed
+- The Parakeet model is downloaded into its cache directory before loading. Pointing onnx-asr at an existing directory puts it in offline mode, so 2.100.1 never fetched the files.
+
+## [2.100.1] - 2026-10-11
+
+### Fixed
+- Parakeet model files download into a plain directory under the data cache instead of the symlinked Hugging Face hub layout, which ONNX Runtime 1.24 rejects when validating the encoder's external weights.
+
+## [2.100.0] - 2026-10-11
+
+### Added
+- Parakeet TDT 0.6B v3 as a built-in transcription backend, selectable under Transcription or with `WHISPER_BACKEND=parakeet`. It runs in-process through ONNX Runtime, on CUDA in the GPU image and on CPU in the CPU image, and can also be the failover transcriber. English transcripts drop words in non-Latin scripts. (#834)
+- LLM calls section on the Stats page, served by `GET /stats/llm`: calls, requests, outcomes, average call and request time, token usage, known cost and a per-phase breakdown, using the same filters as System One calls.
+- System One stats report the average dispatch time per HTTP request (`dispatchLatencyMsAverage`); the Stats card shows that instead of the running total.
+
+### Changed
+- Cost labels on Stats, History, feed stats and System Status drop the "LLM" prefix because the ledger covers LLM and System One spend.
+
+### Fixed
+- Text pattern intro and outro refinement maps a phrase hit to the matching word's timestamp instead of the containing transcript segment's edge, so a 20 to 30 second segment no longer pulls an ad start into show content. Segment edges remain the fallback when word timestamps are missing. (#838)
+- Gap repair logs a zero-segment transcription response at debug instead of warning, since a silent span legitimately returns no speech.
+- The corrections endpoint in `openapi.yaml` documents the flat correction object the server reads, the fields each correction type returns, and the 409 for a kept segment, instead of a `corrections` array the server never accepted.
 
 ## [2.99.6] - 2026-10-11
 

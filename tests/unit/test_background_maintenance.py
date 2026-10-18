@@ -2,6 +2,7 @@
 of re-arming the same short retry, and a failed search-index rebuild waits out
 a bounded cooldown rather than retrying every cleanup pass.
 """
+import time
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch
 
@@ -96,23 +97,21 @@ class TestSharedOutageBackoff:
 class TestSearchIndexRebuildBackoff:
     @pytest.fixture(autouse=True)
     def _restore_rebuild_stamp(self):
-        """run_cleanup keeps its cadence on the function object; leaving a stamp
-        behind would silently suppress a rebuild in another suite."""
-        previous = getattr(background.run_cleanup, '_last_index_rebuild', None)
+        """Leaving a cadence stamp behind would silently suppress a rebuild in another suite."""
+        previous = dict(background._INDEX_STATE)
         yield
-        if previous is None:
-            background.run_cleanup.__dict__.pop('_last_index_rebuild', None)
-        else:
-            background.run_cleanup._last_index_rebuild = previous
+        background._INDEX_STATE.update(previous)
 
-    def _run_cleanup(self, monkeypatch, *, rebuild, slots=0, last=0.0):
+    def _run_cleanup(self, monkeypatch, *, rebuild, slots=0, last=0.0, full_last=0.0, refresh=None):
         db = MagicMock()
         db.cleanup_old_episodes.return_value = (0, 0.0)
         db.get_all_podcasts.return_value = []
         db.rebuild_search_index.side_effect = rebuild
+        db.refresh_search_index.side_effect = refresh
         monkeypatch.setattr(background, 'db', db)
         monkeypatch.setattr(background, 'rebuild_recents_feed', lambda: None)
-        background.run_cleanup._last_index_rebuild = last
+        background._INDEX_STATE['last_refresh'] = last
+        background._INDEX_STATE['last_full'] = full_last
         queue = MagicMock()
         queue.slot_count.return_value = slots
         with patch('processing_queue.ProcessingQueue', return_value=queue):
@@ -124,11 +123,31 @@ class TestSearchIndexRebuildBackoff:
         self._run_cleanup(monkeypatch, rebuild=boom)
         db = self._run_cleanup(
             monkeypatch, rebuild=boom,
-            last=background.run_cleanup._last_index_rebuild)
+            last=background._INDEX_STATE['last_refresh'])
         db.rebuild_search_index.assert_not_called()
 
+    def test_six_hour_tick_refreshes_when_full_rebuild_not_due(self, monkeypatch):
+        db = self._run_cleanup(monkeypatch, rebuild=lambda: None, full_last=time.time())
+        db.refresh_search_index.assert_called_once()
+        db.rebuild_search_index.assert_not_called()
+
+    def test_weekly_tick_runs_the_full_rebuild(self, monkeypatch):
+        full_last = time.time() - background.INDEX_FULL_REBUILD_INTERVAL_SECONDS - 60
+        db = self._run_cleanup(monkeypatch, rebuild=lambda: None, full_last=full_last)
+        db.rebuild_search_index.assert_called_once()
+        db.refresh_search_index.assert_not_called()
+
+    def test_refresh_lock_conflict_backs_off_without_retrying(self, monkeypatch):
+        busy = RuntimeError('Search index rebuild already in progress')
+        fail = MagicMock(side_effect=busy)
+        self._run_cleanup(monkeypatch, rebuild=None, full_last=time.time(), refresh=fail)
+        stamp = background._INDEX_STATE['last_refresh']
+        assert stamp > time.time() - background.INDEX_REBUILD_INTERVAL_SECONDS
+        db = self._run_cleanup(monkeypatch, rebuild=None, full_last=time.time(),
+                               refresh=fail, last=stamp)
+        db.refresh_search_index.assert_not_called()
+
     def test_active_run_defers_the_rebuild(self, monkeypatch):
-        import time
         due = time.time() - background.INDEX_REBUILD_INTERVAL_SECONDS - 60
         db = self._run_cleanup(monkeypatch, rebuild=lambda: None, slots=1, last=due)
         db.rebuild_search_index.assert_not_called()
@@ -136,7 +155,6 @@ class TestSearchIndexRebuildBackoff:
     def test_a_never_idle_instance_rebuilds_past_the_deferral_ceiling(self, monkeypatch):
         """Deferring to active runs forever means an always-busy instance never
         rebuilds its index."""
-        import time
         overdue = time.time() - background.INDEX_REBUILD_MAX_DEFERRAL_SECONDS - 60
         db = self._run_cleanup(monkeypatch, rebuild=lambda: None, slots=1,
                                last=overdue)
@@ -145,27 +163,51 @@ class TestSearchIndexRebuildBackoff:
     def test_a_failed_slot_lookup_keeps_the_cadence(self, monkeypatch):
         """Only a failed rebuild earns the cooldown; a failed queue lookup left
         the index untouched."""
-        import time
         db = MagicMock()
         db.cleanup_old_episodes.return_value = (0, 0.0)
         db.get_all_podcasts.return_value = []
         monkeypatch.setattr(background, 'db', db)
         monkeypatch.setattr(background, 'rebuild_recents_feed', lambda: None)
         last = time.time() - background.INDEX_REBUILD_INTERVAL_SECONDS - 60
-        background.run_cleanup._last_index_rebuild = last
+        background._INDEX_STATE['last_refresh'] = last
         with patch('processing_queue.ProcessingQueue',
                    side_effect=Exception('database is locked')):
             background.run_cleanup()
-        assert background.run_cleanup._last_index_rebuild == last
+        assert background._INDEX_STATE['last_refresh'] == last
         db.rebuild_search_index.assert_not_called()
 
     def test_success_keeps_the_six_hour_cadence(self, monkeypatch):
-        import time
         self._run_cleanup(monkeypatch, rebuild=lambda: None)
-        stamp = background.run_cleanup._last_index_rebuild
+        stamp = background._INDEX_STATE['last_refresh']
         assert stamp == pytest.approx(time.time(), abs=5)
         db = self._run_cleanup(monkeypatch, rebuild=lambda: None, last=stamp)
         db.rebuild_search_index.assert_not_called()
+
+
+class TestDownloadPruneCadence:
+    @pytest.fixture(autouse=True)
+    def _restore_prune_stamp(self):
+        previous = dict(background._DOWNLOAD_STATE)
+        yield
+        background._DOWNLOAD_STATE.update(previous)
+
+    def _run(self, monkeypatch):
+        db = MagicMock()
+        db.cleanup_old_episodes.return_value = (0, 0.0)
+        db.get_all_podcasts.return_value = []
+        db.get_setting_int.return_value = 90
+        monkeypatch.setattr(background, 'db', db)
+        monkeypatch.setattr(background, 'rebuild_recents_feed', lambda: None)
+        queue = MagicMock()
+        queue.slot_count.return_value = 1
+        with patch('processing_queue.ProcessingQueue', return_value=queue):
+            background.run_cleanup()
+        return db
+
+    def test_prune_runs_once_a_day(self, monkeypatch):
+        background._DOWNLOAD_STATE['last_prune'] = 0
+        assert self._run(monkeypatch).prune_downloads.call_count == 1
+        assert self._run(monkeypatch).prune_downloads.call_count == 0
 
 
 @pytest.mark.parametrize('value, expected', [('0', False), ('1', True), (None, False)])
@@ -175,3 +217,48 @@ def test_background_thread_flag_honors_explicit_disable(monkeypatch, value, expe
     else:
         monkeypatch.setenv('MINUSPOD_BACKGROUND_THREADS', value)
     assert main_app._background_threads_enabled() is expected
+
+
+class TestGeoLookupThread:
+    @pytest.fixture(autouse=True)
+    def _reset(self):
+        previous = background._GEO_STATE['thread']
+        background._GEO_STATE['thread'] = None
+        yield
+        background._GEO_STATE['thread'] = previous
+
+    def test_starts_one_thread_and_skips_while_running(self, monkeypatch):
+        import threading
+        release = threading.Event()
+        started = []
+        monkeypatch.setattr(background.geo_lookup, 'run_geo_lookup',
+                            lambda db: (started.append(1), release.wait(5)))
+        background._start_geo_lookup()
+        first = background._GEO_STATE['thread']
+        while not started:
+            time.sleep(0.01)
+        background._start_geo_lookup()
+        assert background._GEO_STATE['thread'] is first
+        assert started == [1]
+        release.set()
+        first.join(5)
+        background._start_geo_lookup()
+        assert background._GEO_STATE['thread'] is not first
+        background._GEO_STATE['thread'].join(5)
+
+    def test_runs_on_the_five_minute_tick_not_the_cleanup_cadence(self, monkeypatch):
+        fake_db = MagicMock()
+        fake_db.reset_orphaned_queue_items.return_value = (0, 0)
+        fake_db.reset_failed_queue_items.return_value = 0
+        monkeypatch.setattr(background, 'db', fake_db)
+        monkeypatch.setattr(background, 'reset_stuck_processing_episodes', lambda: None)
+        monkeypatch.setattr(background, '_run_tick', lambda fn, name: None)
+        started = []
+        monkeypatch.setattr(background, '_start_geo_lookup', lambda: started.append(1))
+        background._run_maintenance_tick(MagicMock())
+        assert started == [1]
+
+    def test_failure_is_logged_not_raised(self, monkeypatch):
+        monkeypatch.setattr(background.geo_lookup, 'run_geo_lookup',
+                            lambda db: (_ for _ in ()).throw(RuntimeError('boom')))
+        background._run_geo_lookup_safely()

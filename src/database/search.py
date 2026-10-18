@@ -9,6 +9,8 @@ import threading
 import time
 from contextlib import contextmanager
 
+from utils.text import escape_like
+
 logger = logging.getLogger(__name__)
 
 # The corpus is already built in the shadow table when the final swap runs, so
@@ -18,6 +20,45 @@ _SWAP_LOCK_RETRIES = 3
 _SWAP_LOCK_BACKOFF_SECONDS = 2.0
 _REBUILD_LOCK_RETRIES = 3
 _REBUILD_LOCK_BACKOFF_SECONDS = 1.0
+
+_TAG_RE = re.compile(r'<[^>]+>')
+_WS_RE = re.compile(r'\s+')
+
+
+def strip_html(text):
+    """Plain text for indexing: tags out, entities decoded, whitespace collapsed."""
+    if not text:
+        return ''
+    return _WS_RE.sub(' ', html.unescape(_TAG_RE.sub(' ', text))).strip()
+
+
+_PODCAST_SQL = "SELECT slug, title, description FROM podcasts"
+_EPISODE_SQL = """SELECT e.episode_id, e.title, e.description, p.slug, ed.transcript_text
+    FROM episodes e JOIN podcasts p ON e.podcast_id = p.id
+    LEFT JOIN episode_details ed ON e.id = ed.episode_id"""
+_PATTERN_SQL = """SELECT ap.id, ap.text_template, ks.name AS sponsor, ap.scope
+    FROM ad_patterns ap LEFT JOIN known_sponsors ks ON ap.sponsor_id = ks.id
+    WHERE ap.is_active = 1"""
+_SPONSOR_SQL = "SELECT id, name, aliases FROM known_sponsors WHERE is_active = 1"
+
+
+def _podcast_row(r):
+    return ('podcast', r['slug'], r['slug'], r['title'], strip_html(r['description']), '')
+
+
+def _episode_row(r):
+    return ('episode', r['episode_id'], r['slug'], r['title'],
+            (r['transcript_text'] or '')[:100000], strip_html(r['description']))
+
+
+def _pattern_row(r):
+    return ('pattern', str(r['id']), r['scope'] or 'global',
+            r['sponsor'] or 'Unknown', r['text_template'] or '', '')
+
+
+def _sponsor_row(r):
+    return ('sponsor', str(r['id']), 'global', r['name'], r['aliases'] or '', '')
+
 
 # Grouped-search snippet delimiters: literal "<mark>" in indexed text must not read as a highlight.
 _HL_OPEN = '\x02'
@@ -33,6 +74,9 @@ _INDEX_CHUNK = 500
 # Rows per write transaction during a rebuild; bounds the lock hold when
 # bodies run to 100k characters.
 _REBUILD_TX_ROWS = 50
+
+# Pause after each rebuild write so a waiting writer wins the next BEGIN IMMEDIATE.
+_REBUILD_YIELD_SECONDS = 0.02
 
 # One definition for the migration and the rebuild's shadow table.
 SEARCH_INDEX_DDL = """CREATE VIRTUAL TABLE IF NOT EXISTS {name} USING fts5(
@@ -170,8 +214,16 @@ END;
 
 # search_index column order: content_type, content_id, podcast_slug, title, body, metadata.
 _SNIPPET_COL = {'title': 3, 'body': 4, 'metadata': 5}
-# Only the three text columns score; weighting content_type would rank by row length.
-_BM25 = 'bm25(search_index, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0)'
+# A title hit outranks the same words buried in a description or transcript.
+_BM25_WEIGHTS = {'title': 10.0, 'body': 1.0, 'metadata': 1.0}
+# Words in nearly every description; the AND branch of a multi-word query drops them.
+_STOPWORDS = frozenset('a an and are as at be by for from in is it of on or the to with'.split())
+
+
+def _bm25(cols):
+    """bm25 over the group's matched columns only; any other column would rank rows by length."""
+    weights = [_BM25_WEIGHTS[c] if c in cols else 0.0 for c in _SNIPPET_COL]
+    return f"bm25(search_index, 0.0, 0.0, 0.0, {', '.join(map(str, weights))})"
 
 
 class SearchMixin:
@@ -232,7 +284,8 @@ class SearchMixin:
         source_chunks = self._search_source_chunks()
         try:
             for rows in source_chunks:
-                self._run_rebuild_write(lambda tx, rows=rows: tx.executemany(insert, rows))
+                self._run_rebuild_write(
+                    lambda tx, rows=rows: tx.executemany(insert, rows), yield_first=True)
             self._swap_in_shadow(shadow, insert, start_seq)
         except Exception:
             conn.rollback()
@@ -244,8 +297,35 @@ class SearchMixin:
         logger.info(f"Search index rebuilt with {count} items")
         return count
 
-    def _run_rebuild_write(self, operation):
+    def refresh_search_index(self) -> int:
+        """Apply the change journal to the live index in short transactions; returns keys applied."""
+        with _search_rebuild_lock(self.db_path):
+            keys = self.get_connection().execute(
+                "SELECT content_type, content_id, podcast_slug, MAX(seq) "
+                "FROM search_index_changes GROUP BY 1, 2, 3 ORDER BY 4").fetchall()
+            insert = ("INSERT INTO search_index (content_type, content_id, podcast_slug, "
+                      "title, body, metadata) VALUES (?, ?, ?, ?, ?, ?)")
+            for start in range(0, len(keys), _REBUILD_TX_ROWS):
+                chunk = keys[start:start + _REBUILD_TX_ROWS]
+
+                def apply(tx, chunk=chunk):
+                    self._delete_indexed_rows(tx, [k[:3] for k in chunk])
+                    for content_type, content_id, slug, _ in chunk:
+                        row = self._current_search_row(tx, content_type, content_id, slug)
+                        if row is not None:
+                            tx.execute(insert, row)
+                    tx.execute("DELETE FROM search_index_changes WHERE seq <= ?",
+                               (max(k[3] for k in chunk),))
+
+                self._run_rebuild_write(apply, yield_first=start > 0)
+        if keys:
+            logger.info(f"Search index refreshed: {len(keys)} change(s)")
+        return len(keys)
+
+    def _run_rebuild_write(self, operation, yield_first=False):
         """Run one rebuild write transaction, retrying transient contention."""
+        if yield_first:
+            time.sleep(_REBUILD_YIELD_SECONDS)
         for attempt in range(_REBUILD_LOCK_RETRIES):
             try:
                 with self.transaction(immediate=True) as tx:
@@ -300,6 +380,7 @@ class SearchMixin:
                     f'(SELECT rowid FROM "{name}" LIMIT {_PURGE_CHUNK_ROWS})')
                 if cur.rowcount <= 0:
                     break
+            time.sleep(_REBUILD_YIELD_SECONDS)
         with self.transaction(immediate=True) as tx:
             tx.execute(f'DROP TABLE IF EXISTS "{name}"')
 
@@ -310,22 +391,10 @@ class SearchMixin:
         read_conn.row_factory = sqlite3.Row
         read_conn.execute('PRAGMA busy_timeout = 60000')
         sources = (
-            ("SELECT slug, title, description FROM podcasts",
-             lambda r: ('podcast', r['slug'], r['slug'], r['title'],
-                        r['description'] or '', '')),
-            ("""SELECT e.episode_id, e.title, e.description, p.slug, ed.transcript_text
-                FROM episodes e JOIN podcasts p ON e.podcast_id = p.id
-                LEFT JOIN episode_details ed ON e.id = ed.episode_id""",
-             lambda r: ('episode', r['episode_id'], r['slug'], r['title'],
-                        (r['transcript_text'] or '')[:100000], r['description'] or '')),
-            ("""SELECT ap.id, ap.text_template, ks.name AS sponsor, ap.scope
-                FROM ad_patterns ap LEFT JOIN known_sponsors ks ON ap.sponsor_id = ks.id
-                WHERE ap.is_active = 1""",
-             lambda r: ('pattern', str(r['id']), r['scope'] or 'global',
-                        r['sponsor'] or 'Unknown', r['text_template'] or '', '')),
-            ("SELECT id, name, aliases FROM known_sponsors WHERE is_active = 1",
-             lambda r: ('sponsor', str(r['id']), 'global', r['name'],
-                        r['aliases'] or '', '')),
+            (_PODCAST_SQL, _podcast_row),
+            (_EPISODE_SQL, _episode_row),
+            (_PATTERN_SQL, _pattern_row),
+            (_SPONSOR_SQL, _sponsor_row),
         )
         try:
             for sql, shape in sources:
@@ -341,10 +410,8 @@ class SearchMixin:
             "SELECT DISTINCT content_type, content_id, podcast_slug "
             "FROM search_index_changes WHERE seq > ?", (start_seq,)
         ).fetchall()
+        SearchMixin._delete_indexed_rows(conn, [tuple(c) for c in changes], shadow)
         for content_type, content_id, podcast_slug in changes:
-            conn.execute(
-                f"DELETE FROM {shadow} WHERE content_type = ? AND content_id = ? "  # noqa: S608
-                "AND podcast_slug = ?", (content_type, content_id, podcast_slug))
             row = SearchMixin._current_search_row(
                 conn, content_type, content_id, podcast_slug)
             if row is not None:
@@ -353,32 +420,24 @@ class SearchMixin:
     @staticmethod
     def _current_search_row(conn, content_type, content_id, podcast_slug):
         if content_type == 'podcast':
-            row = conn.execute(
-                "SELECT 'podcast', slug, slug, title, COALESCE(description, ''), '' "
-                "FROM podcasts WHERE slug = ?", (content_id,)).fetchone()
+            row = conn.execute(f"{_PODCAST_SQL} WHERE slug = ?", (content_id,)).fetchone()
+            build = _podcast_row
         elif content_type == 'episode':
             row = conn.execute(
-                "SELECT 'episode', e.episode_id, p.slug, e.title, "
-                "substr(COALESCE(ed.transcript_text, ''), 1, 100000), "
-                "COALESCE(e.description, '') FROM episodes e "
-                "JOIN podcasts p ON p.id = e.podcast_id "
-                "LEFT JOIN episode_details ed ON ed.episode_id = e.id "
-                "WHERE e.episode_id = ? AND p.slug = ?",
+                f"{_EPISODE_SQL} WHERE e.episode_id = ? AND p.slug = ?",
                 (content_id, podcast_slug)).fetchone()
+            build = _episode_row
         elif content_type == 'pattern':
             row = conn.execute(
-                "SELECT 'pattern', CAST(ap.id AS TEXT), COALESCE(ap.scope, 'global'), "
-                "COALESCE(ks.name, 'Unknown'), COALESCE(ap.text_template, ''), '' "
-                "FROM ad_patterns ap LEFT JOIN known_sponsors ks ON ks.id = ap.sponsor_id "
-                "WHERE ap.id = ? AND ap.is_active = 1 AND COALESCE(ap.scope, 'global') = ?",
+                f"{_PATTERN_SQL} AND ap.id = ? AND COALESCE(ap.scope, 'global') = ?",
                 (content_id, podcast_slug)).fetchone()
+            build = _pattern_row
         elif content_type == 'sponsor':
-            row = conn.execute(
-                "SELECT 'sponsor', CAST(id AS TEXT), 'global', name, COALESCE(aliases, ''), '' "
-                "FROM known_sponsors WHERE id = ? AND is_active = 1", (content_id,)).fetchone()
+            row = conn.execute(f"{_SPONSOR_SQL} AND id = ?", (content_id,)).fetchone()
+            build = _sponsor_row
         else:
             return None
-        return tuple(row) if row is not None else None
+        return build(row) if row is not None else None
 
     def _drop_stale_shadows(self, conn) -> None:
         """Remove shadows while the caller holds the exclusive rebuild lock,
@@ -448,7 +507,7 @@ class SearchMixin:
         ).fetchall()
         insert_values = [
             ('episode', row['episode_id'], row['slug'], row['title'],
-             (row['transcript_text'] or '')[:100000], row['description'] or '')
+             (row['transcript_text'] or '')[:100000], strip_html(row['description']))
             for row in rows
         ]
         if insert_values:
@@ -459,37 +518,40 @@ class SearchMixin:
         return len(insert_values)
 
     def _delete_indexed_episodes(self, conn, pairs: list[tuple[str, str]]) -> None:
-        """Drop these episodes' search_index rows, resolving rowids with one MATCH: FTS5
-        pushes no constraint down for (content_id, podcast_slug) IN (VALUES ...)."""
+        self._delete_indexed_rows(conn, [('episode', eid, slug) for eid, slug in pairs])
+
+    @staticmethod
+    def _delete_indexed_rows(conn, keys, table='search_index') -> None:
+        """Drop rows for (content_type, content_id, podcast_slug) keys, resolving rowids with
+        one MATCH: FTS5 pushes no constraint down for a column comparison, so it scans the table."""
         # unicode61 tokenizes on alphanumerics, so an id without one has no term to MATCH.
         matchable, unmatchable = [], []
-        for pair in pairs:
-            (matchable if any(c.isalnum() for c in pair[0]) else unmatchable).append(pair)
-        if matchable:
-            terms = ' OR '.join('content_id:"' + eid.replace('"', '""') + '"'
-                                for eid, _ in matchable)
+        for key in keys:
+            (matchable if any(c.isalnum() for c in key[1]) else unmatchable).append(key)
+        for start in range(0, len(matchable), _INDEX_CHUNK):
+            part = matchable[start:start + _INDEX_CHUNK]
+            terms = ' OR '.join(
+                f'(content_type:"{ctype}" AND content_id:"' + cid.replace('"', '""') + '")'
+                for ctype, cid, _ in part)
             hits = conn.execute(
-                "SELECT rowid, content_id, podcast_slug FROM search_index "
-                "WHERE search_index MATCH ?",
-                (f'content_type:episode AND ({terms})',)
-            ).fetchall()
-            # A phrase can match a longer id, and two podcasts can share one, so verify both.
-            wanted = set(matchable)
-            rowids = [h['rowid'] for h in hits
-                      if (h['content_id'], h['podcast_slug']) in wanted]
-            # Chunked too: duplicate index rows for one pair would otherwise let the
-            # rowid list outgrow the bound-variable limit a chunk of pairs stays under.
-            for start in range(0, len(rowids), _INDEX_CHUNK):
-                batch = rowids[start:start + _INDEX_CHUNK]
+                f'SELECT rowid, content_type, content_id, podcast_slug FROM "{table}" '  # noqa: S608
+                f'WHERE "{table}" MATCH ?', (terms,)).fetchall()
+            # A phrase can match a longer id, and two podcasts can share one, so verify all three.
+            wanted = set(part)
+            rowids = [h[0] for h in hits if tuple(h[1:]) in wanted]
+            # Chunked too: duplicate index rows for one key would otherwise let the
+            # rowid list outgrow the bound-variable limit a chunk of keys stays under.
+            for rstart in range(0, len(rowids), _INDEX_CHUNK):
+                batch = rowids[rstart:rstart + _INDEX_CHUNK]
                 conn.execute(
-                    "DELETE FROM search_index "  # noqa: S608
-                    f"WHERE rowid IN ({','.join('?' * len(batch))})",
-                    batch)
-        if unmatchable:
+                    f'DELETE FROM "{table}" '  # noqa: S608
+                    f"WHERE rowid IN ({','.join('?' * len(batch))})", batch)
+        for start in range(0, len(unmatchable), _INDEX_CHUNK):
+            part = unmatchable[start:start + _INDEX_CHUNK]
             conn.execute(
-                "DELETE FROM search_index WHERE content_type = 'episode' "  # noqa: S608
-                f"AND (content_id, podcast_slug) IN (VALUES {','.join('(?,?)' for _ in unmatchable)})",
-                [v for pair in unmatchable for v in pair])
+                f'DELETE FROM "{table}" WHERE (content_type, content_id, podcast_slug) '  # noqa: S608
+                f"IN (VALUES {','.join('(?,?,?)' for _ in part)})",
+                [v for key in part for v in key])
 
     def _pick_snippet(self, row, *keys):
         """First of the named snippet columns FTS5 highlighted, escaped before the
@@ -514,7 +576,7 @@ class SearchMixin:
             return empty
         fts_query = self._safe_fts_query(query.replace('"', '""').strip())
         # Escape LIKE metacharacters so user input cannot widen the match
-        escaped = needle.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
+        escaped = escape_like(needle)
         like_pattern = f'%{escaped}%'
         like_prefix = f'{escaped}%'
         wanted = set(SEARCH_GROUP_NAMES) if groups is None else set(groups)
@@ -542,11 +604,13 @@ class SearchMixin:
     def _safe_fts_query(clean_query: str) -> str:
         """Quote every term so punctuation and bare AND/OR/NOT can't be parsed as FTS5 syntax."""
         tokens = clean_query.split()
-        quoted = [f'"{t}"' for t in tokens]
-        quoted[-1] += '*'
         # One token makes the phrase branch identical to the term branch; skip the duplicate OR.
         if len(tokens) == 1:
-            return quoted[0]
+            return f'"{tokens[0]}"*'
+        terms = [t for t in tokens if t.lower() not in _STOPWORDS] or tokens
+        quoted = [f'"{t}"' for t in terms]
+        if terms[-1] == tokens[-1]:
+            quoted[-1] += '*'
         return f'"{clean_query}"* OR {" AND ".join(quoted)}'
 
     @staticmethod
@@ -578,7 +642,7 @@ class SearchMixin:
             f"FROM search_index si {join} "
             f"WHERE si.content_type = '{content_type}' "
             f"AND search_index MATCH 'content_type:{content_type} AND {target}:(' || ? || ')' "
-            f"ORDER BY {_BM25} LIMIT ?",
+            f"ORDER BY {_bm25(cols)} LIMIT ?",
             (fts_query, limit)
         ).fetchall()
 
@@ -602,9 +666,11 @@ class SearchMixin:
         return self._merge_fts_and_like(
             rows, key_fn=lambda r: r['slug'],
             row_builder=lambda r: {'slug': r['slug'], 'title': r['title'],
-                                    'snippet': self._pick_snippet(r, 'body_snippet', 'title_snippet')},
+                                    'titleSnippet': self._pick_snippet(r, 'title_snippet'),
+                                    'snippet': self._pick_snippet(r, 'body_snippet')},
             like_fetch=like_fetch,
-            like_row_builder=lambda r: {'slug': r['slug'], 'title': r['title'], 'snippet': None},
+            like_row_builder=lambda r: {'slug': r['slug'], 'title': r['title'],
+                                         'titleSnippet': None, 'snippet': None},
             limit=limit)
 
     def _search_episodes(self, conn, fts_query, like_pattern, like_prefix, limit):
@@ -632,12 +698,13 @@ class SearchMixin:
         def row_builder(r):
             return {'feedSlug': r['feed_slug'], 'feedTitle': r['feed_title'], 'episodeId': r['episode_id'],
                     'title': r['title'], 'status': r['status'], 'publishDate': r['publish_date'],
-                    'snippet': self._pick_snippet(r, 'metadata_snippet', 'title_snippet')}
+                    'titleSnippet': self._pick_snippet(r, 'title_snippet'),
+                    'snippet': self._pick_snippet(r, 'metadata_snippet')}
 
         def like_row_builder(r):
             return {'feedSlug': r['feed_slug'], 'feedTitle': r['feed_title'], 'episodeId': r['episode_id'],
                     'title': r['title'], 'status': r['status'], 'publishDate': r['publish_date'],
-                    'snippet': None}
+                    'titleSnippet': None, 'snippet': None}
 
         # Episodes is the big table here, so its LIKE pass only runs on a total miss.
         return self._merge_fts_and_like(

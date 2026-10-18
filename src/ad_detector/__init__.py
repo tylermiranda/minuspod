@@ -73,6 +73,7 @@ from config import (
     is_template_cue,
     MIN_OVERLAP_TOLERANCE,
     MAX_AD_DURATION_WINDOW,
+    resolve_window_ad_cap,
     PATTERN_CORRECTION_OVERLAP_THRESHOLD,
     ModelNotConfiguredError,
     AD_DETECTION_PARALLEL_WINDOWS_DEFAULT,
@@ -1075,6 +1076,13 @@ class AdDetector:
             logger.warning(f"Could not check detect_show_segments for {slug}: {e}")
             return False
 
+    def _window_ad_cap(self, slug, override):
+        """Longest single window detection kept: the caller's override, else the feed's resolved cap."""
+        if override is not None or not slug or not self.db:
+            return override
+        row = self.db.get_podcast_by_slug(slug)
+        return resolve_window_ad_cap(self.db, (row or {}).get('id'))
+
     def _resolve_segment_action_map(self, slug: str) -> dict[str, str] | None:
         """Resolve the feed's category->action map once per detection run,
         for the merge seam to gate on.
@@ -1285,7 +1293,8 @@ class AdDetector:
                                 window_label_prefix, validate_timestamps,
                                 recurrence_spans=None,
                                 addressing_mode='timestamps',
-                                episode_sponsors=None):
+                                episode_sponsors=None,
+                                max_window_ad_seconds=None):
         """Run one window through prompt-build + LLM call + parse + filter.
 
         Returns a ``WindowResult``. Thread-safe: writes nothing to shared
@@ -1437,7 +1446,7 @@ class AdDetector:
             # Judged on the raw span: an over-long proposal is refused, not
             # trimmed to the window edge until it fits.
             duration = float(ad['end']) - float(ad['start'])
-            if duration > MAX_AD_DURATION_WINDOW:
+            if duration > (max_window_ad_seconds or MAX_AD_DURATION_WINDOW):
                 dropped_too_long += 1
                 logger.warning(
                     f"[{slug}:{episode_id}] {window_label} rejected ad: "
@@ -1474,6 +1483,10 @@ class AdDetector:
                      else 'claude')
         for ad in valid_window_ads:
             ad.setdefault('detection_stage', llm_stage)
+            # Mode is drawn per pass, so stamp per ad; llm_* are the pre-snap bounds.
+            ad.setdefault('addressing_mode', addressing_mode)
+            ad.setdefault('llm_start', ad['start'])
+            ad.setdefault('llm_end', ad['end'])
 
         logger.info(
             f"[{slug}:{episode_id}] {window_label} found {len(valid_window_ads)} ads"
@@ -1664,7 +1677,7 @@ class AdDetector:
                             pass_name, window_label_prefix, validate_timestamps,
                             action_map=None, category_repair_enabled=False,
                             recurrence_spans=None, addressing_mode='timestamps',
-                            episode_sponsors=None):
+                            episode_sponsors=None, max_window_ad_seconds=None):
         """Shared window orchestration for the detection and verification passes.
 
         Runs every window through ``_run_windows``, merges results in window
@@ -1752,6 +1765,7 @@ class AdDetector:
             recurrence_spans=recurrence_spans,
             addressing_mode=addressing_mode,
             episode_sponsors=episode_sponsors,
+            max_window_ad_seconds=max_window_ad_seconds,
         )
 
         category_repaired = 0
@@ -1835,6 +1849,7 @@ class AdDetector:
                     recurrence_spans=recurrence_spans,
                     addressing_mode=addressing_mode,
                     episode_sponsors=episode_sponsors,
+                    max_window_ad_seconds=max_window_ad_seconds,
                 )
                 recovered_results, sweep_hold_error = self._sweep_lost_windows(
                     windows=windows, lost_results=lost_results,
@@ -1965,7 +1980,8 @@ class AdDetector:
                    positional_prior_hint: str = "",
                    recurrence_spans: list | None = None,
                    episode_sponsors: EpisodeSponsors | None = None,
-                   action_map: dict[str, str] | None = None) -> dict | None:
+                   action_map: dict[str, str] | None = None,
+                   max_window_ad_seconds: float | None = None) -> dict | None:
         """Detect ad segments using Claude API with sliding window approach.
 
         Processes transcript in overlapping windows to ensure ads at chunk
@@ -1981,6 +1997,7 @@ class AdDetector:
             episode_sponsors: Matchers for sponsors already known for this
                               episode; a long window naming one passes the content gate.
             action_map: Caller-resolved category actions; resolved here when None.
+            max_window_ad_seconds: Longest single window detection kept; None resolves the feed cap.
         """
         if not self.api_key:
             logger.warning("Skipping ad detection - no API key")
@@ -2095,6 +2112,7 @@ class AdDetector:
                 recurrence_spans=recurrence_spans,
                 addressing_mode=addressing_mode,
                 episode_sponsors=episode_sponsors,
+                max_window_ad_seconds=self._window_ad_cap(slug, max_window_ad_seconds),
             )
             if failure is not None:
                 return failure
@@ -2322,7 +2340,8 @@ class AdDetector:
                           keep_content: bool | None = None,
                           skip_llm: bool = False,
                           action_map: dict[str, str] | None = None,
-                          transcript_spans: list | None = None) -> dict:
+                          transcript_spans: list | None = None,
+                          max_window_ad_seconds: float | None = None) -> dict:
         """Process transcript for ad detection using three-stage pipeline.
 
         Pipeline stages:
@@ -2611,6 +2630,7 @@ class AdDetector:
                          if ad.get('detection_stage') in _SPONSOR_MATCH_STAGES],
                         episode_description),
                     action_map=action_map,
+                    max_window_ad_seconds=max_window_ad_seconds,
                 )
 
         if result is None:
@@ -2794,6 +2814,7 @@ class AdDetector:
             'span_estimated': span_estimated,
             'text_start': getattr(match, 'text_start', None),
             'text_end': getattr(match, 'text_end', None),
+            'content_end': getattr(match, 'content_end', None),
         }
         if (detection_stage == 'text_pattern' and span_estimated
                 and not getattr(match, 'defined', False)):
@@ -3311,7 +3332,11 @@ class AdDetector:
                         last[_CATEGORY_SPAN] = cur_span
 
                 # Merge - prefer pattern-detected metadata
-                if current['end'] > last['end']:
+                if release_transcript and td_last:
+                    # A gap only corroborates: the detection's edges win.
+                    inherit_edge(last, current, 'start')
+                    inherit_edge(last, current, 'end')
+                elif current['end'] > last['end'] and not release_transcript:
                     inherit_edge(last, current, 'end')
                 invalidate_quote_alignment(last)
                 invalidate_word_timed_edges(last)
@@ -3355,6 +3380,9 @@ class AdDetector:
                     for key in ('text_start', 'text_end'):
                         if key in current:
                             last[key] = current[key]
+                    # A member without a content match must not erase the bound.
+                    if current.get('content_end') is not None:
+                        last['content_end'] = current['content_end']
 
                 # Keep sponsor and reason as a consistent pair from the SAME
                 # member, so a merged marker never shows one ad's sponsor with
@@ -3533,7 +3561,8 @@ class AdDetector:
                                     progress_callback=None,
                                     audio_analysis=None,
                                     pass1_cuts: list[dict] | None = None,
-                                    action_map: dict[str, str] | None = None) -> dict:
+                                    action_map: dict[str, str] | None = None,
+                                    max_window_ad_seconds: float | None = None) -> dict:
         """Run ad detection with the verification prompt on processed audio.
 
         Uses the same sliding window approach as detect_ads() but with the
@@ -3645,6 +3674,7 @@ class AdDetector:
                 category_repair_enabled=segment_categories_configured,
                 addressing_mode=addressing_mode,
                 episode_sponsors=episode_sponsors,
+                max_window_ad_seconds=self._window_ad_cap(slug, max_window_ad_seconds),
             )
             if failure is not None:
                 return failure

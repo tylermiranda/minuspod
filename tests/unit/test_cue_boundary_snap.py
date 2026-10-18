@@ -20,6 +20,7 @@ from audio_processor import AudioProcessor
 from audio_analysis.base import AudioAnalysisResult, AudioSegmentSignal
 from config import AUDIO_CUE_TYPE_CONTENT_TRANSITION
 from main_app import processing
+from main_app.pipeline import detect
 
 
 def _result_with(*signals):
@@ -309,7 +310,7 @@ def test_single_cue_no_ambiguous_key():
 
 
 def test_settings_plumbing_snap_receives_db_values():
-    """processing._detect_ads_first_pass threads DB lead/lag into snap_ad_boundaries_to_cues.
+    """detect._detect_ads_first_pass threads DB lead/lag into snap_ad_boundaries_to_cues.
 
     Patches the DB settings accessor and the snap function itself so that if
     processing.py stops reading or forwarding the DB values the mock assertion
@@ -342,8 +343,8 @@ def test_settings_plumbing_snap_receives_db_values():
          patch.object(processing.status_service, 'update_job_stage'), \
          patch.object(processing.ad_detector, 'process_transcript',
                       return_value=ad_result_stub), \
-         patch.object(processing, 'snap_ad_boundaries_to_cues', mock_snap):
-        processing._detect_ads_first_pass(
+         patch.object(detect, 'snap_ad_boundaries_to_cues', mock_snap):
+        detect._detect_ads_first_pass(
             ctx, [], '/fake/audio.mp3',
             skip_patterns=[], audio_analysis_result=audio_result,
             progress_callback=None,
@@ -566,10 +567,10 @@ def test_allow_transition_plumbing_reaches_snap():
          patch.object(processing.status_service, 'update_job_stage'), \
          patch.object(processing.ad_detector, 'process_transcript',
                       return_value=ad_result_stub), \
-         patch('main_app.processing.resolve_feed_cue_settings', mock_resolve_cue), \
-         patch('main_app.processing.snap_ad_boundaries_to_cues', mock_snap), \
-         patch('main_app.processing.snap_ad_boundaries_to_silence', MagicMock()):
-        processing._detect_ads_first_pass(
+         patch('main_app.pipeline.detect.resolve_feed_cue_settings', mock_resolve_cue), \
+         patch('main_app.pipeline.detect.snap_ad_boundaries_to_cues', mock_snap), \
+         patch('main_app.pipeline.detect.snap_ad_boundaries_to_silence', MagicMock()):
+        detect._detect_ads_first_pass(
             ctx, [], '/fake/audio.mp3',
             skip_patterns=[], audio_analysis_result=audio_result,
             progress_callback=None,
@@ -659,3 +660,79 @@ def test_cue_removal_preserves_user_approved_trim_and_render_barriers():
     cuts = AudioProcessor().compute_applied_cuts(
         validated.ads, 600.0, cut_barriers=user_trimmed_keep_ranges(corrections))
     assert [(cut['start'], cut['end']) for cut in cuts] == [(100.0, 160.0)]
+
+
+# ---------------------------------------------------------------------------
+# Cues inside the pre-refinement content match (#838)
+# ---------------------------------------------------------------------------
+
+def test_end_cue_inside_content_span_snaps_past_cap():
+    # Refinement pulled the end from 1280.5 to 1212.0; the end sting at 1250
+    # sits 38s away, past the 30s cap but inside the content match.
+    ads = [{'start': 1190.5, 'end': 1212.0, 'content_end': 1280.5}]
+    result = _result_with(_typed_cue(1250.0, 1254.0, 'end', conf=0.87))
+    snap_ad_boundaries_to_cues(ads, result, max_boundary_shift_s=30.0)
+    assert ads[0]['end'] == 1249.95
+    assert ads[0]['cue_snap']['end']['within_content_span'] is True
+
+
+def test_end_cue_past_content_span_stays_capped():
+    ads = [{'start': 1190.5, 'end': 1212.0, 'content_end': 1240.0}]
+    result = _result_with(_typed_cue(1250.0, 1254.0, 'end'))
+    snap_ad_boundaries_to_cues(ads, result, max_boundary_shift_s=30.0)
+    assert ads[0]['end'] == 1212.0
+    assert 'cue_snap' not in ads[0]
+
+
+def test_end_cue_without_content_span_stays_capped():
+    ads = [{'start': 1190.5, 'end': 1212.0}]
+    result = _result_with(_typed_cue(1250.0, 1254.0, 'end'))
+    snap_ad_boundaries_to_cues(ads, result, max_boundary_shift_s=30.0)
+    assert ads[0]['end'] == 1212.0
+
+
+def test_end_cue_in_lag_band_but_over_cap_uses_content_span():
+    # A wide lag band finds the cue; the content span, not the cap, lets it move.
+    ads = [{'start': 1190.5, 'end': 1212.0, 'content_end': 1280.5}]
+    result = _result_with(_typed_cue(1250.0, 1254.0, 'end'))
+    snap_ad_boundaries_to_cues(ads, result, max_boundary_shift_s=30.0, snap_lag_s=60.0)
+    assert ads[0]['end'] == 1249.95
+
+
+def test_nearest_end_cue_inside_content_span_wins():
+    ads = [{'start': 1190.5, 'end': 1212.0, 'content_end': 1280.5}]
+    result = _result_with(_typed_cue(1250.0, 1254.0, 'end'), _typed_cue(1275.0, 1279.0, 'end'))
+    snap_ad_boundaries_to_cues(ads, result, max_boundary_shift_s=30.0)
+    assert ads[0]['end'] == 1249.95
+
+
+def test_removed_end_cue_landing_past_content_span_stays_capped():
+    # Removing the cue puts the edge on its far side, past the match bound.
+    ads = [{'start': 1190.5, 'end': 1212.0, 'content_end': 1280.0}]
+    cue = _typed_cue(1279.0, 1283.0, 'end')
+    cue.details['remove_with_ad'] = True
+    snap_ad_boundaries_to_cues(ads, _result_with(cue), max_boundary_shift_s=30.0)
+    assert ads[0]['end'] == 1212.0
+
+
+def test_band_cue_over_cap_does_not_block_content_span_cue():
+    # A wide lag band finds a nearer cue before the end first; the cap rejects
+    # it, and the cue the text match covered still sets the end.
+    ads = [{'start': 1190.5, 'end': 1212.0, 'content_end': 1260.0}]
+    result = _result_with(_typed_cue(1195.0, 1197.0, 'end'), _typed_cue(1250.0, 1254.0, 'end'))
+    snap_ad_boundaries_to_cues(ads, result, max_boundary_shift_s=10.0, snap_lag_s=60.0)
+    assert ads[0]['end'] == 1249.95
+
+
+def test_content_span_cue_rejected_when_band_cue_fits_cap():
+    ads = [{'start': 1190.5, 'end': 1212.0, 'content_end': 1260.0}]
+    result = _result_with(_typed_cue(1214.0, 1216.0, 'end'), _typed_cue(1250.0, 1254.0, 'end'))
+    snap_ad_boundaries_to_cues(ads, result, max_boundary_shift_s=10.0)
+    assert ads[0]['end'] == 1213.95
+
+
+def test_start_edge_ignores_content_span():
+    ads = [{'start': 240.0, 'end': 300.0, 'content_end': 300.0}]
+    result = _result_with(_typed_cue(200.0, 203.0, 'start'))
+    snap_ad_boundaries_to_cues(ads, result, max_boundary_shift_s=30.0)
+    assert ads[0]['start'] == 240.0

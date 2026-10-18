@@ -21,7 +21,7 @@ Failover is a standby account that takes over when a configured provider fails:
 
 - **Provider A** (`llm-a`) - the first LLM provider slot.
 - **Provider B** (`llm-b`) - the second LLM provider slot, when enabled.
-- **Transcriber** (`transcriber`) - the active Whisper backend.
+- **Transcriber** (`transcriber`) - the active transcription backend (faster-whisper, Parakeet, or remote API).
 
 There is one shared LLM failover provider, used by whichever of Provider A or Provider B is in trouble, and one failover transcriber. Each has its own type, endpoint, key, timeout, retries, and (for the LLM side) its own models per pipeline stage.
 
@@ -135,7 +135,7 @@ All settings are under `PUT /api/v1/settings/ad-detection`; database-only, no en
 | Payload key | Kind / range | Default |
 |---|---|---|
 | `failoverWhisperEnabled` | bool | `false` |
-| `failoverWhisperBackend` | `local` or `openai-api` | `openai-api` |
+| `failoverWhisperBackend` | `local`, `parakeet` or `openai-api` | `openai-api` |
 | `failoverWhisperModel` | string (local backend) | - |
 | `failoverWhisperApiBaseUrl` | string (API backend) | - |
 | `failoverWhisperApiKey` | secret; write-only, omit to leave unchanged | - |
@@ -144,7 +144,7 @@ All settings are under `PUT /api/v1/settings/ad-detection`; database-only, no en
 | `failoverWhisperMaxAttempts` | int 1-10 or null; blank inherits `whisperMaxAttempts` | null |
 | `failoverWhisperLanguage` | string, blank matches the active transcriber's language | - |
 
-A local failover transcriber requires its switch enabled and the local Whisper stack available. An API failover transcriber requires its switch enabled and a base URL. Disabling or clearing a failover configuration sends subsequent calls to the original transcriber, even if its failover state remains active.
+A local failover transcriber requires its switch enabled and the local Whisper stack available. A `parakeet` failover transcriber needs no model or endpoint settings. An API failover transcriber requires its switch enabled and a base URL. Disabling or clearing a failover configuration sends subsequent calls to the original transcriber, even if its failover state remains active.
 
 **Policy:**
 

@@ -1,4 +1,6 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useDraftClose } from '../hooks/useDraftClose';
+import { isTopDialog, useEscape, useFocusTrap } from './Modal';
+import { useEffect, useId, useMemo, useRef, useState } from 'react';
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { AlertCircle } from 'lucide-react';
 import WaveSurfer from 'wavesurfer.js';
@@ -26,7 +28,7 @@ import {
 } from '../utils/adReviewHelpers';
 import { btnGhost, btnPrimary } from './buttonStyles';
 import Checkbox from './Checkbox';
-import { focusRing, selectBase } from './fieldStyles';
+import { filterLabel, focusRing, selectBase } from './fieldStyles';
 import {
   SEGMENT_CATEGORIES,
   SEGMENT_CATEGORY_DESCRIPTIONS,
@@ -159,6 +161,8 @@ function AdReviewModal({
   mode = 'review', onCreate, onCreateDone, onAddNew, boundsWindow,
   hideConfirm = false, onSplitSaved,
 }: Props) {
+  const dialogRef = useRef<HTMLDivElement>(null);
+  useFocusTrap(dialogRef, true);
   const containerRef = useRef<HTMLDivElement>(null);   // waveform host
   const overlayRef = useRef<HTMLDivElement>(null);     // relative wrapper around waveform + pins
   const cursorRef = useRef<HTMLDivElement>(null);      // playhead, position-updated from RAF
@@ -172,7 +176,7 @@ function AdReviewModal({
   const selectionStopRef = useRef<(() => void) | null>(null);
   const wsRef = useRef<WaveSurfer | null>(null);
   const regionsRef = useRef<ReturnType<typeof RegionsPlugin.create> | null>(null);
-  const adRegionRef = useRef<ReturnType<RegionsPlugin['addRegion']> | null>(null);
+  const adRegionRef = useRef<ReturnType<InstanceType<typeof RegionsPlugin>['addRegion']> | null>(null);
 
   // Defaults derived from the original detection -- used by Reset.
   // Create mode defaults to the entire episode so the user can pin any
@@ -901,21 +905,19 @@ function AdReviewModal({
 
   // ------------------------------------------------------------------
   // Hotkeys
+  const dirty = adStart !== defaults.adStart || adEnd !== defaults.adEnd || sponsorInput !== (item.sponsor ?? '')
+    || reasonInput !== ''
+    || (mode === 'create' && (textTemplateInput !== '' || categoryInput !== '' || runs.length > 0));
+  const { requestClose, confirmation } = useDraftClose(dirty, onClose, multiSubmitting);
+  const boundaryErrorId = useId();
+  const selectionLabelId = useId();
+  useEscape(requestClose, !showSplit && !multiSubmitting, dialogRef);
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
-      // The split editor is on top; its own handlers own the keyboard.
-      if (showSplit) return;
-      if (multiSubmitting) return;
-      const target = e.target as HTMLElement | null;
-      const inField =
-        target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA');
-      if (inField && e.key !== 'Escape') return;
-
-      if (e.key === 'Escape') {
-        e.preventDefault();
-        onClose();
-        return;
-      }
+      if (showSplit || multiSubmitting || e.defaultPrevented || e.isComposing || e.repeat || e.ctrlKey || e.metaKey || e.altKey) return;
+      const target = document.activeElement as HTMLElement | null;
+      if (!isTopDialog(dialogRef.current) || !dialogRef.current?.contains(target)) return;
+      if (target?.closest('input,textarea,select,button,a,[contenteditable="true"],[role="combobox"],[role="slider"]')) return;
       if (e.key === ' ')      { e.preventDefault(); togglePlay(); return; }
       if (e.key === ',')      { e.preventDefault(); panBack(); return; }
       if (e.key === '.')      { e.preventDefault(); panForward(); return; }
@@ -951,7 +953,7 @@ function AdReviewModal({
 
   return (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-background/95 backdrop-blur-sm p-4"
+      className="modal-backdrop fixed inset-0 z-60 flex items-center justify-center bg-background/95 backdrop-blur-sm p-4"
       onMouseDown={(e) => {
         // Only close when the bare backdrop is the actual mousedown target.
         // Anything inside the modal panel (inputs, buttons, listbox items
@@ -961,13 +963,15 @@ function AdReviewModal({
         // an accidental tap would lose everything.
         if (e.target !== e.currentTarget) return;
         if (mode === 'create') return;
-        onClose();
+        requestClose();
       }}
     >
       <div
+        ref={dialogRef}
+        tabIndex={-1}
         role="dialog"
         aria-modal="true"
-        aria-label="Review ad"
+        aria-label={mode === 'create' ? 'Add new ad' : 'Review ad'}
         className="bg-card rounded-lg border border-border w-full max-w-4xl max-h-[90vh] overflow-y-auto shadow-2xl"
         onClick={(e) => e.stopPropagation()}
       >
@@ -1028,7 +1032,7 @@ function AdReviewModal({
                 </button>
               )}
               <button
-                onClick={onClose}
+                onClick={requestClose}
                 disabled={mode === 'create' && multiSubmitting}
                 className={`p-1 rounded ${btnGhost} transition-colors ${focusRing} max-sm:min-h-11 max-sm:min-w-11`}
                 aria-label="Close"
@@ -1350,44 +1354,49 @@ function AdReviewModal({
               (M:SS, MM:SS, H:MM:SS, or raw seconds) that commit to the
               ad boundaries on blur or Enter. The pin handles still
               update them live during drag. */}
-          <div className="mt-3 flex flex-wrap items-center gap-2 text-sm text-muted-foreground tabular-nums">
-            <span>Selection:</span>
-            <input
-              ref={startInputRef}
-              disabled={lockMultiFields}
-              type="text"
-              inputMode="decimal"
-              value={startInput}
-              aria-label="Selection start time"
-              aria-invalid={boundaryError !== null}
-              onChange={(e) => setStartInput(e.target.value)}
-              onBlur={commitStartInput}
-              onKeyDown={timeInputKeyDown(adStart, setStartInput)}
-              className={`w-20 px-1.5 py-0.5 rounded border bg-background text-success font-medium text-center tabular-nums focus:outline-hidden focus:ring-2 focus:ring-ring max-sm:min-h-11 ${inputBorderClass}`}
-            />
-            <span>-</span>
-            <input
-              ref={endInputRef}
-              disabled={lockMultiFields}
-              type="text"
-              inputMode="decimal"
-              value={endInput}
-              aria-label="Selection end time"
-              aria-invalid={boundaryError !== null}
-              onChange={(e) => setEndInput(e.target.value)}
-              onBlur={commitEndInput}
-              onKeyDown={timeInputKeyDown(adEnd, setEndInput)}
-              className={`w-20 px-1.5 py-0.5 rounded border bg-background text-destructive font-medium text-center tabular-nums focus:outline-hidden focus:ring-2 focus:ring-ring max-sm:min-h-11 ${inputBorderClass}`}
-            />
-            <span className="text-xs">({Math.round((adEnd - adStart) * 10) / 10}s)</span>
+          <div className="mt-3 text-sm text-muted-foreground tabular-nums">
+            <span id={selectionLabelId} className={filterLabel}>Selection</span>
+            <div role="group" aria-labelledby={selectionLabelId} className="flex items-center gap-2">
+              <input
+                ref={startInputRef}
+                disabled={lockMultiFields}
+                type="text"
+                inputMode="decimal"
+                value={startInput}
+                aria-label="Selection start time"
+                aria-invalid={boundaryError !== null}
+                aria-describedby={boundaryError ? boundaryErrorId : undefined}
+                onChange={(e) => setStartInput(e.target.value)}
+                onBlur={commitStartInput}
+                onKeyDown={timeInputKeyDown(adStart, setStartInput)}
+                className={`w-24 max-sm:flex-1 max-sm:min-w-0 px-1.5 py-0.5 rounded border bg-background text-success font-medium text-center tabular-nums focus:outline-hidden focus:ring-2 focus:ring-ring max-sm:min-h-11 ${inputBorderClass}`}
+              />
+              <span>-</span>
+              <input
+                ref={endInputRef}
+                disabled={lockMultiFields}
+                type="text"
+                inputMode="decimal"
+                value={endInput}
+                aria-label="Selection end time"
+                aria-invalid={boundaryError !== null}
+                aria-describedby={boundaryError ? boundaryErrorId : undefined}
+                onChange={(e) => setEndInput(e.target.value)}
+                onBlur={commitEndInput}
+                onKeyDown={timeInputKeyDown(adEnd, setEndInput)}
+                className={`w-24 max-sm:flex-1 max-sm:min-w-0 px-1.5 py-0.5 rounded border bg-background text-destructive font-medium text-center tabular-nums focus:outline-hidden focus:ring-2 focus:ring-ring max-sm:min-h-11 ${inputBorderClass}`}
+              />
+              <span className="text-xs shrink-0">({Math.round((adEnd - adStart) * 10) / 10}s)</span>
+            </div>
             {boundariesMoved && !boundaryError && (
-              <span className="text-xs text-warning">
+              <p className="mt-1 text-xs text-warning">
                 (originally {formatTime(item.start)} - {formatTime(item.end)})
-              </span>
+              </p>
             )}
           </div>
           {boundaryError && (
             <div
+              id={boundaryErrorId}
               role="alert"
               className={`${badgeBase} mt-1.5 inline-flex items-center gap-1.5 ${tint.destructive} font-medium`}
             >
@@ -1613,7 +1622,7 @@ function AdReviewModal({
                 Save creates a manual ad pattern.
               </div>
               <div className="flex items-center gap-2">
-                <button type="button" onClick={onClose} disabled={multiSubmitting}
+                <button type="button" onClick={requestClose} disabled={multiSubmitting}
                   className={`px-4 py-1.5 rounded-lg ${ghostBtn} text-sm ${focusRing} max-sm:min-h-11`}>
                   Cancel
                 </button>
@@ -1712,6 +1721,7 @@ function AdReviewModal({
           )}
         </div>
       </div>
+      {confirmation}
       {showSplit && (
         <SplitMarkerModal
           target={{

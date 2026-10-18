@@ -37,7 +37,7 @@ from config import (
 )
 from audio_enforcer import content_anchors
 from ad_detector.boundaries import timed_line_segments
-from ad_detector.cue_boundary_snap import SNAP_GAP_SECONDS
+from ad_detector.cue_boundary_snap import cue_snap_edge_limit
 from text_pattern_matcher import is_defined_pattern
 from database import DEFAULT_REVIEW_PROMPT, DEFAULT_RESURRECT_PROMPT
 from llm_capabilities import PASS_REVIEWER_1, PASS_REVIEWER_2
@@ -727,24 +727,19 @@ def _cue_snap_limits(ad: dict, original_start: float,
     """Edge limits at the labelled template cues the ad's edges were snapped to."""
     snap = ad.get('cue_snap') if isinstance(ad.get('cue_snap'), dict) else {}
 
-    def cue_edge(edge: str, key: str) -> float | None:
+    def cue_limit(edge: str) -> float | None:
         record = snap.get(edge)
         if not isinstance(record, dict) or not is_template_cue(record):
             return None
-        return finite_number(record.get(key))
+        return cue_snap_edge_limit(record, edge)
 
     starts, ends = [], []
-    # A start edge sits just after the cue ends; an end edge just before the cue starts.
-    cue_end = cue_edge('start', 'cue_end')
-    if cue_end is not None:
-        lim = cue_end + SNAP_GAP_SECONDS
-        if original_start - EDGE_TOLERANCE <= lim < original_end:
-            starts.append((lim, max(lim, original_start)))
-    cue_start = cue_edge('end', 'cue_start')
-    if cue_start is not None:
-        lim = cue_start - SNAP_GAP_SECONDS
-        if original_start < lim <= original_end + EDGE_TOLERANCE:
-            ends.append((lim, min(lim, original_end)))
+    lim = cue_limit('start')
+    if lim is not None and original_start - EDGE_TOLERANCE <= lim < original_end:
+        starts.append((lim, max(lim, original_start)))
+    lim = cue_limit('end')
+    if lim is not None and original_start < lim <= original_end + EDGE_TOLERANCE:
+        ends.append((lim, min(lim, original_end)))
     return starts, ends
 
 
@@ -911,6 +906,7 @@ class ReviewVerdict:
     inconclusive_hold: bool = False
     # Adjust edges the model gave as numbers that survived the clamp; later stages may not widen them.
     locked_edges: tuple = ()
+    addressing_mode: str | None = None
 
 
 @dataclass
@@ -1402,6 +1398,7 @@ class AdReviewer:
                 original_start=float(ad.get("start", 0.0)),
                 original_end=float(ad.get("end", 0.0)),
                 reasoning=_review_failure_reason(error), success=False,
+                addressing_mode=ad.get("addressing_mode"),
             )
             result.verdicts.append(verdict)
             self._settle_abstained(result, verdict, ad, episode_meta, check_support)
@@ -1688,7 +1685,7 @@ class AdReviewer:
             if (pool == "accepted"
                     and (ads[idx].get("validation") or {}).get("user_confirmed")):
                 return None, ads[idx]
-            return self._review_single(
+            verdict, updated = self._review_single(
                 ad=ads[idx],
                 pool=pool,
                 pass_num=pass_num,
@@ -1699,6 +1696,8 @@ class AdReviewer:
                 max_shift=max_shift,
                 transcript_units=transcript_units,
             )
+            verdict.addressing_mode = ads[idx].get("addressing_mode")
+            return verdict, updated
 
         if max_workers <= 1 or len(ads) == 1:
             return [_run_one(i) for i in range(len(ads))]
@@ -2532,7 +2531,7 @@ class AdReviewer:
                 v.original_start, v.original_end, v.verdict,
                 v.adjusted_start, v.adjusted_end,
                 v.reasoning, v.confidence, v.model_used,
-                v.latency_ms, 1 if v.success else 0,
+                v.latency_ms, 1 if v.success else 0, v.addressing_mode,
             )
             for v in verdicts
         ]
@@ -2543,8 +2542,9 @@ class AdReviewer:
                 """INSERT INTO ad_reviewer_log
                    (episode_id, podcast_id, pass, pool, original_start,
                     original_end, verdict, adjusted_start, adjusted_end,
-                    reasoning, confidence, model_used, latency_ms, success)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    reasoning, confidence, model_used, latency_ms, success,
+                    addressing_mode)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 rows,
             )
             conn.commit()

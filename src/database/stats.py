@@ -6,11 +6,35 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 
-from config import normalize_model_key
+from config import SYSTEMONE_PROVIDERS, normalize_model_key
 from utils.app_version import APP_VERSION as __version__
 from utils.time import parse_iso_utc
 
 logger = logging.getLogger(__name__)
+
+_SNAP_WINDOW_DAYS = 90
+_SNAP_MAX_EPISODES = 2000
+_ADDRESSING_MODES = ('timestamps', 'segment_ids')
+_REVIEWER_VERDICT_KEYS = {
+    'confirmed': 'confirmed', 'adjust': 'adjusted', 'reject': 'rejected',
+    'resurrect': 'resurrected', 'inconclusive': 'inconclusive', 'failure': 'failed',
+}
+
+
+def _blank_by_mode(fields: dict) -> dict:
+    """One fresh copy of `fields` per addressing mode."""
+    return {mode: dict(fields) for mode in _ADDRESSING_MODES}
+
+
+def _marker_snap_dist(marker) -> tuple[str, float] | None:
+    """(addressing_mode, distance from the model's raw bounds) for a snappable marker."""
+    if not isinstance(marker, dict) or marker.get('addressing_mode') not in _ADDRESSING_MODES:
+        return None
+    try:
+        return marker['addressing_mode'], (abs(marker['start'] - marker['llm_start'])
+                                           + abs(marker['end'] - marker['llm_end']))
+    except (KeyError, TypeError):
+        return None
 
 # SQL fragment for one episode's saved seconds, NULL unless it actually got
 # shorter. Shared between get_dashboard_stats and get_stats_by_podcast (#727)
@@ -84,6 +108,26 @@ def _utc_day_start(value: str) -> str | None:
     return dt.astimezone(timezone.utc).strftime('%Y-%m-%dT00:00:00Z')
 
 
+def _date_range_clauses(column, from_date, to_date) -> tuple[list, list]:
+    """Half-open UTC-day range clauses and params for a created_at column."""
+    clauses = []
+    params: list = []
+    if from_date:
+        clauses.append(f'{column} >= ?')
+        params.append(_utc_day_start(from_date) or from_date)
+    if to_date:
+        start = _utc_day_start(to_date)
+        if start:
+            next_day = (datetime.strptime(start, '%Y-%m-%dT00:00:00Z')
+                        + timedelta(days=1)).strftime('%Y-%m-%dT00:00:00Z')
+            clauses.append(f'{column} < ?')
+            params.append(next_day)
+        else:
+            clauses.append(f'{column} <= ?')
+            params.append(to_date)
+    return clauses, params
+
+
 def _build_ledger_filters(from_date=None, to_date=None, podcast_slug=None,
                           provider=None, model=None) -> tuple[str, list]:
     """WHERE-clause fragment (leading ' AND ...') and params for the
@@ -95,22 +139,7 @@ def _build_ledger_filters(from_date=None, to_date=None, podcast_slug=None,
     second of the selected day is included regardless of whether the caller
     sends a bare date, a whole-second, or a fractional-second timestamp
     (textual comparison otherwise dropped 'T23:59:59Z' under 'T23:59:59.999Z')."""
-    clauses = []
-    params: list = []
-    if from_date:
-        start = _utc_day_start(from_date)
-        clauses.append("created_at >= ?")
-        params.append(start if start is not None else from_date)
-    if to_date:
-        start = _utc_day_start(to_date)
-        if start is not None:
-            next_day = (datetime.strptime(start, '%Y-%m-%dT00:00:00Z')
-                        + timedelta(days=1)).strftime('%Y-%m-%dT00:00:00Z')
-            clauses.append("created_at < ?")
-            params.append(next_day)
-        else:
-            clauses.append("created_at <= ?")
-            params.append(to_date)
+    clauses, params = _date_range_clauses('created_at', from_date, to_date)
     if podcast_slug:
         clauses.append("podcast_id IN (SELECT id FROM podcasts WHERE slug = ?)")
         params.append(podcast_slug)
@@ -1130,33 +1159,106 @@ class StatsMixin:
         } for row in rows]
         return items, total
 
-    def get_systemone_stats(self, *, from_date=None, to_date=None,
-                            podcast_slug=None, provider=None, model=None) -> dict:
-        """Aggregate logical adapter calls separately from their HTTP rows."""
-        clauses = []
-        params = []
-        if from_date:
-            clauses.append('d.created_at >= ?')
-            params.append(_utc_day_start(from_date) or from_date)
-        if to_date:
-            start = _utc_day_start(to_date)
-            if start:
-                next_day = (datetime.strptime(start, '%Y-%m-%dT00:00:00Z')
-                            + timedelta(days=1)).strftime('%Y-%m-%dT00:00:00Z')
-                clauses.append('d.created_at < ?')
-                params.append(next_day)
-            else:
-                clauses.append('d.created_at <= ?')
-                params.append(to_date)
+    @staticmethod
+    def _ledger_scope_clauses(alias, from_date, to_date, podcast_slug, provider, model):
+        """WHERE clauses and params shared by the ledger stats queries."""
+        clauses, params = _date_range_clauses(f'{alias}.created_at', from_date, to_date)
         if podcast_slug:
             clauses.append('p.slug = ?')
             params.append(podcast_slug)
         if provider:
-            clauses.append('d.provider_key = ?')
+            clauses.append(f'{alias}.provider_key = ?')
             params.append(provider)
         if model:
-            clauses.append('d.configured_model = ?')
+            clauses.append(f'{alias}.configured_model = ?')
             params.append(model)
+        return clauses, params
+
+    def get_llm_stats(self, *, from_date=None, to_date=None,
+                      podcast_slug=None, provider=None, model=None) -> dict:
+        """Aggregate non-System One ledger rows as LLM calls."""
+        clauses, params = self._ledger_scope_clauses(
+            'u', from_date, to_date, podcast_slug, provider, model)
+        clauses.append(f"u.provider_key NOT IN ({','.join('?' * len(SYSTEMONE_PROVIDERS))})")
+        params += list(SYSTEMONE_PROVIDERS)
+        where_sql = ' AND '.join(clauses)
+        conn = self.get_connection()
+        row = conn.execute(
+            f"""SELECT COUNT(*) AS calls,
+                       COALESCE(SUM(u.dispatch_count), 0) AS requests,
+                       COALESCE(SUM(u.dispatch_latency_ms), 0) AS dispatch_latency_ms,
+                       COALESCE(SUM(u.state = 'success'), 0) AS success,
+                       COALESCE(SUM(u.state = 'failure'), 0) AS failure,
+                       COALESCE(SUM(u.state = 'inconclusive'), 0) AS inconclusive,
+                       COALESCE(SUM(u.state = 'in_flight'), 0) AS in_flight,
+                       AVG(u.call_latency_ms) AS call_latency_ms,
+                       COALESCE(SUM(u.input_tokens), 0) AS input_tokens,
+                       COALESCE(SUM(u.output_tokens), 0) AS output_tokens,
+                       COALESCE(SUM(u.cache_read_tokens), 0) AS cache_read_tokens,
+                       COALESCE(SUM(u.cache_write_tokens), 0) AS cache_write_tokens,
+                       COALESCE(SUM(u.reasoning_tokens), 0) AS reasoning_tokens,
+                       COALESCE(SUM(CASE WHEN u.dispatch_count > 0 AND
+                                    (u.input_tokens IS NULL OR u.output_tokens IS NULL)
+                                THEN 1 ELSE 0 END), 0) AS unknown_usage_count,
+                       COALESCE(SUM(CASE WHEN u.dispatch_count > 0 AND u.cost_usd IS NULL
+                                THEN 1 ELSE 0 END), 0) AS unknown_cost_count
+                FROM llm_call_usage u
+                LEFT JOIN podcasts p ON p.id = u.podcast_id
+                WHERE {where_sql}""",  # noqa: S608
+            params,
+        ).fetchone()
+        phase_rows = conn.execute(
+            f"""SELECT u.phase_key, COUNT(*) AS calls
+                FROM llm_call_usage u
+                LEFT JOIN podcasts p ON p.id = u.podcast_id
+                WHERE {where_sql}
+                GROUP BY u.phase_key
+                ORDER BY calls DESC, MIN(u.rowid)""",  # noqa: S608
+            params).fetchall()
+        phases = {item['phase_key']: {'calls': item['calls'], 'cost': Decimal('0')}
+                  for item in phase_rows}
+        cost_rows = conn.execute(
+            f"""SELECT u.phase_key, u.cost_usd FROM llm_call_usage u
+                LEFT JOIN podcasts p ON p.id = u.podcast_id
+                WHERE {where_sql} AND u.cost_usd IS NOT NULL""",  # noqa: S608
+            params).fetchall()
+        total_cost = Decimal('0')
+        for item in cost_rows:
+            amount = Decimal(item['cost_usd'])
+            phases[item['phase_key']]['cost'] += amount
+            total_cost += amount
+        requests = row['requests']
+        return {
+            'calls': row['calls'],
+            'requests': requests,
+            'outcomes': {
+                'success': row['success'], 'failure': row['failure'],
+                'inconclusive': row['inconclusive'], 'inFlight': row['in_flight'],
+            },
+            'callLatencyMsAverage': (
+                round(row['call_latency_ms']) if row['call_latency_ms'] is not None else None),
+            'dispatchLatencyMsAverage': (
+                round(row['dispatch_latency_ms'] / requests) if requests else None),
+            'tokens': {
+                'input': row['input_tokens'], 'output': row['output_tokens'],
+                'cacheRead': row['cache_read_tokens'],
+                'cacheWrite': row['cache_write_tokens'],
+                'reasoning': row['reasoning_tokens'],
+                'unknownRequestCount': row['unknown_usage_count'],
+            },
+            'costUsd': str(total_cost),
+            'unknownCostRequestCount': row['unknown_cost_count'],
+            'byPhase': {
+                key: {'calls': value['calls'], 'costUsd': str(value['cost'])}
+                for key, value in phases.items()
+            },
+        }
+
+    def get_systemone_stats(self, *, from_date=None, to_date=None,
+                            podcast_slug=None, provider=None, model=None) -> dict:
+        """Aggregate logical adapter calls separately from their HTTP rows."""
+        clauses, params = self._ledger_scope_clauses(
+            'd', from_date, to_date, podcast_slug, provider, model)
         where_sql = ' AND '.join(clauses) if clauses else '1 = 1'
         conn = self.get_connection()
         row = conn.execute(
@@ -1219,6 +1321,8 @@ class StatsMixin:
             'calls': row['calls'],
             'requests': row['requests'],
             'dispatchLatencyMsTotal': row['dispatch_latency_ms'],
+            'dispatchLatencyMsAverage': (
+                round(row['dispatch_latency_ms'] / row['requests']) if row['requests'] else None),
             'logicalLatencyMsTotal': sum(logical_latencies),
             'logicalLatencyMsAverage': (
                 sum(logical_latencies) / len(logical_latencies)
@@ -2171,6 +2275,7 @@ class StatsMixin:
         )
 
         return {
+            'byMode': self._reviewer_stats_by_mode(conn, where_clause, params),
             'totalReviews': sum(counts.values()),
             'verdictCounts': counts,
             'pass1AdjustmentCount': pass1_adjust,
@@ -2179,6 +2284,33 @@ class StatsMixin:
             'resurrectionCount': counts.get('resurrect', 0),
             'failureCount': counts.get('failure', 0),
         }
+
+    @staticmethod
+    def _reviewer_stats_by_mode(conn, where_clause: str, params: list) -> dict:
+        """Verdict counts and mean |shift| per addressing mode; NULL-mode rows are excluded."""
+        clause = (where_clause + " AND " if where_clause else "WHERE ") + \
+            "l.addressing_mode IN ('timestamps', 'segment_ids')"
+        rows = conn.execute(
+            f"""
+            SELECT addressing_mode, verdict, COUNT(*) AS n,
+                   AVG((ABS(adjusted_start - original_start) +
+                        ABS(adjusted_end - original_end)) / 2.0) AS avg_shift
+            FROM ad_reviewer_log l
+            {clause}
+            GROUP BY addressing_mode, verdict
+            """,  # noqa: S608
+            params,
+        ).fetchall()
+        modes = _blank_by_mode({'reviews': 0, **dict.fromkeys(_REVIEWER_VERDICT_KEYS.values(), 0),
+                                'avgBoundaryShiftSeconds': None})
+        for r in rows:
+            entry = modes[r['addressing_mode']]
+            entry['reviews'] += r['n']
+            if r['verdict'] in _REVIEWER_VERDICT_KEYS:
+                entry[_REVIEWER_VERDICT_KEYS[r['verdict']]] += r['n']
+            if r['verdict'] == 'adjust' and r['avg_shift'] is not None:
+                entry['avgBoundaryShiftSeconds'] = round(r['avg_shift'], 2)
+        return modes
 
     def record_addressing_log(self, podcast_slug: str, episode_id: str,
                                pass_name: str, configured_mode: str,
@@ -2275,4 +2407,64 @@ class StatsMixin:
                 'adsDroppedTooLong': r['dropped_too_long'] or 0,
                 'keptPct': round(100.0 * kept / proposed, 1) if proposed else 0.0,
             }
-        return {'modes': modes}
+        return {'modes': modes,
+                'byMode': self._addressing_outcomes_by_mode(conn, podcast_slug)}
+
+    @staticmethod
+    def _addressing_outcomes_by_mode(conn, podcast_slug: str | None) -> dict:
+        """Per-mode correction rates and mean snap distance, grouped per marker."""
+        out = _blank_by_mode({'heldRate': None, 'approveRate': None, 'rejectRate': None,
+                              'avgSnapDistance': None})
+        podcast_id = None
+        if podcast_slug:
+            row = conn.execute("SELECT id FROM podcasts WHERE slug = ?", (podcast_slug,)).fetchone()
+            podcast_id = row[0] if row else None
+        feed_params = [podcast_id] if podcast_slug else []
+        for r in conn.execute(
+            f"""
+            SELECT addressing_mode, COUNT(*) AS n,
+                   SUM(correction_type IN ('confirm', 'boundary_adjustment')) AS approved,
+                   SUM(correction_type = 'false_positive') AS rejected,
+                   SUM(source_hold_reason IS NOT NULL OR hold_id IS NOT NULL) AS held
+            FROM pattern_corrections
+            WHERE addressing_mode IN ('timestamps', 'segment_ids') {'AND podcast_id = ?' if podcast_slug else ''}
+            GROUP BY addressing_mode
+            """,  # noqa: S608
+            feed_params,
+        ).fetchall():
+            out[r['addressing_mode']].update(
+                heldRate=round(r['held'] / r['n'], 4),
+                approveRate=round(r['approved'] / r['n'], 4),
+                rejectRate=round(r['rejected'] / r['n'], 4),
+            )
+
+        # Distance from the model's raw bounds to the stored marker, all correction
+        # stages included. The recent window keeps the stats request bounded.
+        snap = dict.fromkeys(out, (0.0, 0))
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=_SNAP_WINDOW_DAYS)
+                  ).strftime('%Y-%m-%dT%H:%M:%SZ')
+        for r in conn.execute(
+            f"""
+            SELECT ed.ad_markers_json FROM episode_details ed
+            JOIN episodes e ON e.id = ed.episode_id
+            WHERE ed.ad_markers_json LIKE '%"llm_start"%'
+              AND COALESCE(e.processed_at, e.updated_at) >= ?
+            {"AND e.podcast_id = ?" if podcast_slug else ""}
+            ORDER BY COALESCE(e.processed_at, e.updated_at) DESC
+            LIMIT {_SNAP_MAX_EPISODES}
+            """,  # noqa: S608
+            [cutoff] + feed_params,
+        ).fetchall():
+            try:
+                markers = json.loads(r['ad_markers_json'])
+            except (TypeError, ValueError):
+                continue
+            for m in markers if isinstance(markers, list) else []:
+                found = _marker_snap_dist(m)
+                if found:
+                    total, n = snap[found[0]]
+                    snap[found[0]] = (total + found[1], n + 1)
+        for mode, (total, n) in snap.items():
+            if n:
+                out[mode]['avgSnapDistance'] = round(total / n, 3)
+        return out

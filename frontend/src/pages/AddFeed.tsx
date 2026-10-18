@@ -1,3 +1,4 @@
+import { pageTitle } from '../components/pageStyles';
 import { useState, useMemo, useRef, useCallback, useEffect } from 'react';
 import { useNavigate, Link } from 'react-router';
 import { useMutation, useQueryClient, useQuery } from '@tanstack/react-query';
@@ -180,12 +181,13 @@ function LocalFeedForm({ onCancel }: LocalFeedFormProps) {
         <input
           type="text"
           id="localSlug"
+          aria-describedby="localSlug-help"
           value={slug}
           onChange={(e) => handleSlugChange(e.target.value)}
           placeholder="my-archive-show"
           className="w-full px-4 py-2 rounded-lg border border-input bg-background text-foreground placeholder:text-muted-foreground focus:outline-hidden focus:ring-2 focus:ring-ring"
         />
-        <p className="mt-1 text-sm text-muted-foreground">
+        <p id="localSlug-help" className="mt-1 text-sm text-muted-foreground">
           Cannot be changed after creation.
         </p>
       </div>
@@ -234,12 +236,13 @@ function LocalFeedForm({ onCancel }: LocalFeedFormProps) {
         <input
           type="text"
           id="localCategories"
+          aria-describedby="localCategories-help"
           value={categoriesInput}
           onChange={(e) => setCategoriesInput(e.target.value)}
           placeholder="Technology, Business"
           className="w-full px-4 py-2 rounded-lg border border-input bg-background text-foreground placeholder:text-muted-foreground focus:outline-hidden focus:ring-2 focus:ring-ring"
         />
-        <p className="mt-1 text-sm text-muted-foreground">
+        <p id="localCategories-help" className="mt-1 text-sm text-muted-foreground">
           Comma-separated, e.g. Technology, Business
         </p>
       </div>
@@ -251,17 +254,18 @@ function LocalFeedForm({ onCancel }: LocalFeedFormProps) {
         <input
           type="file"
           id="localArtwork"
+          aria-describedby="localArtwork-help"
           accept="image/jpeg,image/png"
           onChange={(e) => setArtworkFile(e.target.files?.[0] ?? null)}
           className={fileInputBase}
         />
-        <p className="mt-1 text-sm text-warning">
+        <p id="localArtwork-help" className="mt-1 text-sm text-warning">
           Podcast apps require square artwork, at least 1400x1400.
         </p>
       </div>
 
       {mutation.error && (
-        <div className="p-4 rounded-lg bg-destructive/10 text-destructive">
+        <div id="add-feed-error" role="alert" className="p-4 rounded-lg bg-destructive/10 text-destructive">
           {(mutation.error as Error).message}
         </div>
       )}
@@ -583,7 +587,7 @@ function AddFeed() {
 
   return (
     <div className="max-w-xl mx-auto">
-      <h1 className="text-2xl font-bold text-foreground mb-6">Add New Feed</h1>
+      <h1 className={`${pageTitle} mb-6`}>Add New Feed</h1>
 
       {/* Mode toggle: subscribed feeds pull from an upstream RSS URL; local
           feeds have no upstream source and are seeded entirely from this form. */}
@@ -705,6 +709,11 @@ function AddFeed() {
               <input
                 type="url"
                 id="podcastInput"
+                aria-invalid={touched && !!urlValidation.error}
+                aria-describedby={[
+                  touched && (urlValidation.error || urlValidation.warning) ? 'podcast-url-feedback' : '',
+                  mutation.error ? 'add-feed-error' : '',
+                ].filter(Boolean).join(' ') || undefined}
                 value={inputValue}
                 onChange={(e) => setInputValue(e.target.value)}
                 onBlur={() => setTouched(true)}
@@ -718,10 +727,10 @@ function AddFeed() {
                 }`}
               />
               {touched && urlValidation.error && (
-                <p className="mt-1 text-sm text-destructive">{urlValidation.error}</p>
+                <p id="podcast-url-feedback" role="alert" className="mt-1 text-sm text-destructive">{urlValidation.error}</p>
               )}
               {touched && !urlValidation.error && urlValidation.warning && (
-                <p className="mt-1 text-sm text-warning">{urlValidation.warning}</p>
+                <p id="podcast-url-feedback" className="mt-1 text-sm text-warning">{urlValidation.warning}</p>
               )}
             </>
           )}
@@ -741,12 +750,13 @@ function AddFeed() {
               <input
                 type="text"
                 id="slug"
+          aria-describedby="slug-help"
                 value={customSlug}
                 onChange={(e) => setCustomSlug(e.target.value.toLowerCase().replace(/[^a-z0-9-]/g, ''))}
                 placeholder="my-podcast"
                 className="w-full px-4 py-2 rounded-lg border border-input bg-background text-foreground placeholder:text-muted-foreground focus:outline-hidden focus:ring-2 focus:ring-ring"
               />
-              <p className="mt-1 text-sm text-muted-foreground">
+              <p id="slug-help" className="mt-1 text-sm text-muted-foreground">
                 Custom URL path for this feed. Only lowercase letters, numbers, and hyphens.
               </p>
             </div>
@@ -757,10 +767,11 @@ function AddFeed() {
               </label>
               <TriStateSelect
                 id="autoProcess"
+          ariaDescribedBy="autoProcess-help"
                 value={autoProcessOverride}
                 onChange={setAutoProcessOverride}
               />
-              <p className="mt-1 text-sm text-muted-foreground">
+              <p id="autoProcess-help" className="mt-1 text-sm text-muted-foreground">
                 Automatically process new episodes.
               </p>
             </div>
@@ -771,6 +782,7 @@ function AddFeed() {
               </label>
               <DraftNumberInput
                 id="maxEpisodes"
+          ariaDescribedBy="maxEpisodes-help"
                 value={parseOptionalNumber(maxEpisodes)}
                 fallback={null}
                 parse={parseOptionalNumber}
@@ -781,7 +793,7 @@ function AddFeed() {
                 step={1}
                 className={`w-full px-4 py-2 ${DRAFT_NUMBER_INPUT_CLASS}`}
               />
-              <p className="mt-1 text-sm text-muted-foreground">
+              <p id="maxEpisodes-help" className="mt-1 text-sm text-muted-foreground">
                 Limits how many episodes are served to podcast clients. Max: 500.
               </p>
             </div>
@@ -792,10 +804,11 @@ function AddFeed() {
               </label>
               <TriStateSelect
                 id="onlyExposeProcessedEpisodes"
+          ariaDescribedBy="onlyExposeProcessedEpisodes-help"
                 value={onlyExposeProcessedEpisodes}
                 onChange={setOnlyExposeProcessedEpisodes}
               />
-              <p className="mt-1 text-sm text-muted-foreground">
+              <p id="onlyExposeProcessedEpisodes-help" className="mt-1 text-sm text-muted-foreground">
                 Hide upstream episodes until processing finishes. Global Default uses the site-wide setting.
               </p>
             </div>
@@ -806,7 +819,7 @@ function AddFeed() {
         {(subscribeInputMode === 'url' || !searchEnabled) && (
           <>
             {mutation.error && (
-              <div className="p-4 rounded-lg bg-destructive/10 text-destructive">
+              <div id="add-feed-error" role="alert" className="p-4 rounded-lg bg-destructive/10 text-destructive">
                 {(mutation.error as Error).message}
               </div>
             )}

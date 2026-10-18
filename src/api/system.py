@@ -19,7 +19,9 @@ from api import (
 )
 from api.failover import probes_view, targets_view
 import transcriber
-from config import WHISPER_BACKEND_API, resolve_whisper_device
+from config import (
+    PARAKEET_MODEL_NAME, WHISPER_BACKEND_API, WHISPER_BACKEND_PARAKEET, resolve_whisper_device,
+)
 from database.settings import registry_default
 from podping_listener import (
     get_node_health_summary, DEGRADED_SETTING, DEGRADED_SINCE_SETTING,
@@ -72,7 +74,8 @@ def _effective_whisper_config(db):
         }
     return {
         'whisperBackend': backend,
-        'whisperModel': setting('whisper_model'),
+        'whisperModel': PARAKEET_MODEL_NAME if backend == WHISPER_BACKEND_PARAKEET
+                        else setting('whisper_model'),
         # Effective device, not the raw env value: an unrecognized setting
         # transcribes on CPU, and the UI should say so (#605).
         'whisperDevice': resolve_whisper_device(),
@@ -205,7 +208,7 @@ def get_system_status():
         # transcription, not the process (episodes re-queue as transient).
         # Reports the configured backend, since the local reading says
         # nothing when transcription runs on a remote API.
-        'transcriber': transcriber.get_transcriber_health(),
+        'transcriber': transcriber.remote.get_transcriber_health(),
         'failover': {'targets': targets_view(), 'probes': probes_view()},
     })
 
@@ -513,7 +516,7 @@ def export_config():
     from urllib.parse import urlsplit
 
     from api.feeds import get_feeds_export_list
-    from api.settings import _build_settings_payload
+    from api.settings.core import _build_settings_payload
     from utils.config_export import build_domain_identity, redact_config
     from utils.gpu import get_gpu_device_name
     from webhook_service import load_webhooks

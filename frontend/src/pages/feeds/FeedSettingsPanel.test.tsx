@@ -27,11 +27,17 @@ vi.mock('../../components/CollapsibleSection', async (importOriginal) => {
 
 const mockUpdateFeed = vi.fn();
 const mockRerenderSegments = vi.fn();
+const mockGetSubscriberKeys = vi.fn().mockResolvedValue([]);
 
 vi.mock('../../api/feeds', () => ({
   getNetworks: vi.fn().mockResolvedValue([]),
   updateFeed: (...args: unknown[]) => mockUpdateFeed(...args),
   rerenderSegments: (...args: unknown[]) => mockRerenderSegments(...args),
+  ALL_SUBSCRIBER_KEYS_QUERY_KEY: ['subscriber-keys-all'],
+  getSubscriberKeys: (...args: unknown[]) => mockGetSubscriberKeys(...args),
+  createSubscriberKey: vi.fn(),
+  revokeSubscriberKey: vi.fn(),
+  deleteSubscriberKeyRecord: vi.fn(),
   CUE_SCORE_MIN: 0.30,
   CUE_SCORE_MAX: 0.99,
 }));
@@ -106,6 +112,18 @@ function renderPanel(feed: Feed) {
   );
   return { ...result, client, rerenderWithFeed };
 }
+
+describe('Feed security section', () => {
+  it('renders the subscriber key panel for this feed', async () => {
+    mockGetSubscriberKeys.mockResolvedValue([
+      { id: 'key-1', label: 'Living room', created_at: '2026-09-10T00:00:00Z', last_used_at: null, revoked_at: null },
+    ]);
+    renderPanel(makeFeed());
+    expect(await screen.findByText('Living room')).toBeDefined();
+    expect(mockGetSubscriberKeys).toHaveBeenCalledWith('test-feed');
+    expect(screen.getByLabelText('Subscriber label')).toBeDefined();
+  });
+});
 
 const SELECT_NAME = 'Fetch each episode twice to find inserted ads';
 
@@ -1617,5 +1635,67 @@ describe('Feed RSS User-Agent', () => {
     renderPanel(makeFeed({ feedUserAgentOverride: 'Feed/2.0' }));
     await user.click(screen.getByRole('button', { name: 'Use global RSS User-Agent' }));
     await waitFor(() => expect(mockUpdateFeed).toHaveBeenCalledWith('test-feed', { feedUserAgentOverride: null }));
+  });
+});
+
+describe('FeedSettingsPanel description chapter trim controls', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockGetSettings.mockResolvedValue({});
+    mockUpdateFeed.mockResolvedValue(makeFeed());
+  });
+
+  it('defaults to an empty pattern and the to_end mode', () => {
+    renderPanel(makeFeed());
+    expect((screen.getByLabelText('Chapter title pattern') as HTMLInputElement).value).toBe('');
+    expect((screen.getByRole('combobox', { name: 'Trim mode' }) as HTMLSelectElement).value).toBe('to_end');
+  });
+
+  it('saves the pattern on blur', async () => {
+    renderPanel(makeFeed());
+    await userEvent.type(screen.getByLabelText('Chapter title pattern'), '*Throwback*');
+    await userEvent.tab();
+    expect(mockUpdateFeed).toHaveBeenCalledWith('test-feed', { descriptionTrimPattern: '*Throwback*' });
+  });
+
+  it('clearing the pattern sends null', async () => {
+    renderPanel(makeFeed({ descriptionTrimPattern: '*Throwback*' }));
+    await userEvent.clear(screen.getByLabelText('Chapter title pattern'));
+    await userEvent.tab();
+    expect(mockUpdateFeed).toHaveBeenCalledWith('test-feed', { descriptionTrimPattern: null });
+  });
+
+  it('saves the mode on change', async () => {
+    renderPanel(makeFeed({ descriptionTrimPattern: '*Throwback*' }));
+    await userEvent.selectOptions(screen.getByRole('combobox', { name: 'Trim mode' }), 'to_next');
+    expect(mockUpdateFeed).toHaveBeenCalledWith('test-feed', { descriptionTrimMode: 'to_next' });
+  });
+});
+
+describe('FeedSettingsPanel chapter notes', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockGetSettings.mockResolvedValue({});
+    mockUpdateFeed.mockResolvedValue(makeFeed());
+  });
+
+  it('shows the server value and a character counter', () => {
+    renderPanel(makeFeed({ chapterNotes: 'Donations get a chapter.' }));
+    expect((screen.getByLabelText('Chapter notes') as HTMLTextAreaElement).value).toBe('Donations get a chapter.');
+    expect(screen.getByText('24 / 1000')).toBeDefined();
+  });
+
+  it('saves the typed notes', async () => {
+    renderPanel(makeFeed());
+    await userEvent.type(screen.getByLabelText('Chapter notes'), 'Donations get a chapter.');
+    await userEvent.click(screen.getByRole('button', { name: 'Save chapter notes' }));
+    expect(mockUpdateFeed).toHaveBeenCalledWith('test-feed', { chapterNotes: 'Donations get a chapter.' });
+  });
+
+  it('clearing then saving sends null', async () => {
+    renderPanel(makeFeed({ chapterNotes: 'Donations get a chapter.' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Clear chapter notes' }));
+    await userEvent.click(screen.getByRole('button', { name: 'Save chapter notes' }));
+    expect(mockUpdateFeed).toHaveBeenCalledWith('test-feed', { chapterNotes: null });
   });
 });

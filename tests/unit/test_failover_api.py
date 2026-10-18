@@ -13,7 +13,7 @@ os.environ.setdefault('MINUSPOD_DATA_DIR', tempfile.mkdtemp(prefix='failover-api
 
 import api
 import failover
-from api.episodes import _run_stats_to_api
+from episode_runs import run_stats_to_api
 
 
 @pytest.fixture
@@ -184,16 +184,16 @@ def test_probe_now_requeues_deferred_episode_without_maintenance_tick(app_client
 
 
 def test_models_slot_failover_uses_failover_client(app_client, hdr, configured):
-    with patch('api.settings.create_client_for_provider') as make, \
-            patch('api.settings._models_from_client', return_value=[{'id': 'qwen3:8b'}]):
+    with patch('api.settings.providers.create_client_for_provider') as make, \
+            patch('api.settings.providers._models_from_client', return_value=[{'id': 'qwen3:8b'}]):
         r = app_client.get('/api/v1/settings/models?provider=openai-compatible&slot=failover')
     assert r.status_code == 200
     assert make.call_args.kwargs['credential_slot'] == 'failover'
 
 
 def test_models_slot_alias_b(app_client, hdr):
-    with patch('api.settings.create_client_for_provider'), \
-            patch('api.settings._models_from_client', return_value=[]):
+    with patch('api.settings.providers.create_client_for_provider'), \
+            patch('api.settings.providers._models_from_client', return_value=[]):
         assert app_client.get('/api/v1/settings/models?provider=ollama&slot=b').status_code == 200
 
 
@@ -206,9 +206,9 @@ def test_failover_llm_test_connection(app_client, hdr, configured):
 
 
 def test_failover_whisper_test_connection(app_client, hdr):
-    with patch('api.providers.transcriber.probe_transcription_endpoint',
+    with patch('api.providers.transcriber.remote.probe_transcription_endpoint',
                return_value={'ok': True, 'reachable': True, 'status': 200, 'detail': 'ok'}), \
-            patch('api.providers.transcriber.probe_whisper_health', return_value={'available': False}):
+            patch('api.providers.transcriber.remote.probe_whisper_health', return_value={'available': False}):
         r = app_client.post('/api/v1/settings/providers/failover-whisper/test-connection',
                             json={'baseUrl': 'http://127.0.0.1:8001/v1', 'model': 'whisper-1'}, headers=hdr)
     assert r.status_code == 200 and r.get_json()['ok'] is True
@@ -233,7 +233,7 @@ def test_targets_report_whether_the_original_is_enabled(app_client, hdr, configu
 
 
 def test_run_stats_expose_failover_usage():
-    out = _run_stats_to_api({'mode': 'auto', 'failover': {'llm': ['primary', 'secondary'],
+    out = run_stats_to_api({'mode': 'auto', 'failover': {'llm': ['primary', 'secondary'],
                                                           'whisper': True}})
     assert out['failover'] == {'llm': ['llm-a', 'llm-b'], 'whisper': True}
-    assert 'failover' not in _run_stats_to_api({'mode': 'auto'})
+    assert 'failover' not in run_stats_to_api({'mode': 'auto'})

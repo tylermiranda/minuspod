@@ -1,4 +1,7 @@
+import { pageHeader, pageTitle, pageDescription } from '../components/pageStyles';
 import { useState, useEffect } from 'react';
+import QueryError from '../components/QueryError';
+import { useUnsavedChanges } from '../hooks/useUnsavedChanges';
 import { useSyncFromQuery } from '../hooks/useSyncFromQuery';
 import { useLocation } from 'react-router';
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
@@ -9,7 +12,7 @@ import { useModelsRefresh } from '../hooks/useModelsRefresh';
 import { getReviewerSettings, updateReviewerSettings } from '../api/community';
 import { getErrorMessage } from '../api/client';
 import { useAuth } from '../context/AuthContext';
-import { SkeletonPageHeader, SkeletonRows } from '../components/Skeleton';
+import { SkeletonRows } from '../components/Skeleton';
 import type { AffectedRunsAction, BadgePosition, EpisodeLogLevel, LowAdYieldAction, LlmProvider, ModelPricingOverride, ProviderSlot, SystemStatus, WhisperBackend, WhisperApiConfig, UpdateSettingsPayload, Settings as SettingsShape } from '../api/types';
 import { LLM_PROVIDERS, SAME_AS_PASS, SLOT_PRIMARY, SLOT_SECONDARY } from '../api/types';
 
@@ -247,6 +250,7 @@ function Settings() {
   const [adDetectionExcludeStartSeconds, setAdDetectionExcludeStartSeconds] = useState(0);
   const [maxAdDurationSeconds, setMaxAdDurationSeconds] = useState(300);
   const [maxAdDurationConfirmedSeconds, setMaxAdDurationConfirmedSeconds] = useState(900);
+  const [maxLlmWindowAdSeconds, setMaxLlmWindowAdSeconds] = useState(420);
   const [verificationMissHoldMinConfidence, setVerificationMissHoldMinConfidence] = useState(0.6);
   const [verificationMissAutocutMinConfidence, setVerificationMissAutocutMinConfidence] = useState(0);
   const [learningMinConfidence, setLearningMinConfidence] = useState(0.85);
@@ -405,6 +409,9 @@ function Settings() {
     data: settings,
     isLoading: settingsLoading,
     dataUpdatedAt: settingsUpdatedAt,
+    isError: settingsFailed,
+    refetch: retrySettings,
+    isFetching: settingsFetching,
   } = useQuery({
     queryKey: ['settings'],
     queryFn: getSettings,
@@ -721,18 +728,25 @@ function Settings() {
   // upstream query data identity changes. useSyncFromQuery encapsulates the
   // snapshot+conditional-setState pattern; staying render-phase preserves
   // the May 4 fix that moved these blocks off useEffect.
-  useSyncFromQuery(retention, (r) => {
+  useSyncFromQuery(retention, (r, previous) => {
+    if (previous && (retentionDays !== (previous.retentionDays || 30)
+      || originalRetentionDays !== (previous.originalRetentionDays ?? previous.retentionDays ?? 30)
+      || retentionEnabled !== previous.enabled)) return;
     setRetentionDays(r.retentionDays || 30);
     setOriginalRetentionDays(r.originalRetentionDays ?? r.retentionDays ?? 30);
     setRetentionEnabled(r.enabled);
   });
 
-  useSyncFromQuery(processingTimeouts, (t) => {
+  useSyncFromQuery(processingTimeouts, (t, previous) => {
+    if (previous && (softTimeoutMinutes !== Math.round(previous.softTimeoutSeconds / 60)
+      || hardTimeoutMinutes !== Math.round(previous.hardTimeoutSeconds / 60))) return;
     setSoftTimeoutMinutes(Math.round(t.softTimeoutSeconds / 60));
     setHardTimeoutMinutes(Math.round(t.hardTimeoutSeconds / 60));
   });
 
-  useSyncFromQuery(reviewerSettings, (rs) => {
+  useSyncFromQuery(reviewerSettings, (rs, previous) => {
+    if (previous && (reviewer.updatePatterns !== previous.updatePatternsFromReviewerAdjustments
+      || reviewer.minTrimThreshold !== previous.minTrimThreshold)) return;
     setReviewer((prev) => ({
       ...prev,
       updatePatterns: rs.updatePatternsFromReviewerAdjustments,
@@ -895,6 +909,7 @@ function Settings() {
     { key: 'adDetectionExcludeStartSeconds', kind: 'val', useDefault: true, literal: 0, value: adDetectionExcludeStartSeconds, set: setAdDetectionExcludeStartSeconds },
     { key: 'maxAdDurationSeconds', kind: 'val', useDefault: true, literal: 300, value: maxAdDurationSeconds, set: setMaxAdDurationSeconds },
     { key: 'maxAdDurationConfirmedSeconds', kind: 'val', useDefault: true, literal: 900, value: maxAdDurationConfirmedSeconds, set: setMaxAdDurationConfirmedSeconds },
+    { key: 'maxLlmWindowAdSeconds', kind: 'val', useDefault: true, literal: 420, value: maxLlmWindowAdSeconds, set: setMaxLlmWindowAdSeconds },
     { key: 'positionalPriorEnabled', kind: 'val', useDefault: true, value: positionalPriorEnabled, set: setPositionalPriorEnabled },
     { key: 'verificationMissHoldMinConfidence', kind: 'val', useDefault: true, literal: 0.6, value: verificationMissHoldMinConfidence, set: setVerificationMissHoldMinConfidence },
     { key: 'verificationMissAutocutMinConfidence', kind: 'val', useDefault: true, literal: 0, value: verificationMissAutocutMinConfidence, set: setVerificationMissAutocutMinConfidence },
@@ -1029,6 +1044,12 @@ function Settings() {
   // (which runs before hasChanges is defined) skips re-seeding while dirty.
   // eslint-disable-next-line react-hooks/set-state-in-effect
   useEffect(() => { setFormDirty(hasChanges); }, [hasChanges]);
+  useUnsavedChanges(hasChanges || podcastIndexApiKey !== '' || podcastIndexApiSecret !== ''
+    || (!!retention && (retentionDays !== (retention.retentionDays || 30)
+      || originalRetentionDays !== (retention.originalRetentionDays ?? retention.retentionDays ?? 30)
+      || retentionEnabled !== retention.enabled))
+    || (!!processingTimeouts && (softTimeoutMinutes !== Math.round(processingTimeouts.softTimeoutSeconds / 60)
+      || hardTimeoutMinutes !== Math.round(processingTimeouts.hardTimeoutSeconds / 60))));
 
   // An endpoint or provider-type change moves in-flight work to a different
   // account, so the save carries the operator's decision about that work.
@@ -1208,19 +1229,27 @@ function Settings() {
   if (settingsLoading) {
     return (
       <div className="max-w-3xl mx-auto pb-20">
-        <SkeletonPageHeader />
+        <h1 className={`${pageTitle} mb-6`}>Settings</h1>
         <SkeletonRows count={6} />
       </div>
     );
   }
 
+  if (!settings) {
+    return <div className="max-w-3xl mx-auto space-y-6">
+      <h1 className={pageTitle}>Settings</h1>
+      <QueryError title="Settings are unavailable. Your saved values could not be loaded." onRetry={() => void retrySettings()} retrying={settingsFetching} />
+    </div>;
+  }
+
   return (
     <div className="max-w-3xl mx-auto space-y-4 pb-20">
-      <div className="flex justify-between items-start">
+      {settingsFailed && <QueryError title="Settings could not be refreshed. Showing the last loaded values." onRetry={() => void retrySettings()} retrying={settingsFetching} />}
+      <div className={pageHeader}>
         <div>
-          <h1 className="text-2xl font-bold text-foreground mb-2">Settings</h1>
-          <p className="text-muted-foreground">
-            Configure ad detection prompts and system settings
+          <h1 className={pageTitle}>Settings</h1>
+          <p className={pageDescription}>
+            Configure ad detection prompts and system settings.
           </p>
         </div>
         <div className="flex items-center gap-4 shrink-0">
@@ -1248,6 +1277,8 @@ function Settings() {
           </a>
         </div>
       </div>
+
+      <p className="text-sm text-muted-foreground">Unsaved settings use the Save Changes bar. Sections with their own Save or Apply button save separately. Appearance changes apply immediately.</p>
 
       <SystemStatusSection
         status={status}
@@ -1544,6 +1575,8 @@ function Settings() {
         onMaxAdDurationSecondsChange={setMaxAdDurationSeconds}
         maxAdDurationConfirmedSeconds={maxAdDurationConfirmedSeconds}
         onMaxAdDurationConfirmedSecondsChange={setMaxAdDurationConfirmedSeconds}
+        maxLlmWindowAdSeconds={maxLlmWindowAdSeconds}
+        onMaxLlmWindowAdSecondsChange={setMaxLlmWindowAdSeconds}
         verificationMissHoldMinConfidence={verificationMissHoldMinConfidence}
         onVerificationMissHoldMinConfidenceChange={setVerificationMissHoldMinConfidence}
         verificationMissAutocutMinConfidence={verificationMissAutocutMinConfidence}
@@ -1778,7 +1811,7 @@ function Settings() {
       {hasChanges && (
         <div
           data-viewport-inset="bottom"
-          className="fixed bottom-0 left-0 right-0 z-50 border-t border-border bg-background/80 backdrop-blur-md"
+          className="safe-bottom fixed bottom-0 left-0 right-0 z-40 border-t border-border bg-background/80 backdrop-blur-md"
         >
           <div className="max-w-3xl mx-auto flex items-center justify-between gap-4 px-4 py-3">
             <ConfirmResetButton

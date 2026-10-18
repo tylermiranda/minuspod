@@ -12,9 +12,9 @@ from flask import request
 import failover
 import transcriber
 from api import api, error_response, json_response, limiter
-from api.settings import (
-    SLOT_ALIASES, _clear_models_for_identity_changes,
-    _model_identity_snapshot, calibration_revision,
+from api.settings.common import SLOT_ALIASES
+from api.settings.ad_detection import (
+    _clear_models_for_identity_changes, _model_identity_snapshot, calibration_revision,
     finish_settings_payload_after_commit,
 )
 from config import (
@@ -95,7 +95,7 @@ def _affected_runs(account_id: str | None, credential_slot: str) -> list[dict]:
     """Active runs whose frozen routes still name this account."""
     if not account_id:
         return []
-    from main_app.processing import runs_for_account
+    from main_app.pipeline.admission import runs_for_account
     return runs_for_account(account_id, credential_slot)
 
 
@@ -106,7 +106,7 @@ def _apply_affected_runs_action(runs: list[dict], action: str) -> None:
     asks the owner to stop now rather than at its next provider call.
     """
     from cancel import request_cancellation
-    from main_app.processing import clear_route_snapshot
+    from main_app.pipeline.admission import clear_route_snapshot
     for run in runs:
         clear_route_snapshot(run['runId'])
         if action == 'cancel':
@@ -435,13 +435,13 @@ def _whisper_connection_test(saved: dict, body: dict):
     skip_flac = body.get('skipFlacCompression', saved['skip_flac_compression'])
     if not isinstance(skip_flac, bool):
         return error_response('skipFlacCompression must be a boolean', 400)
-    result = transcriber.probe_transcription_endpoint(
+    result = transcriber.remote.probe_transcription_endpoint(
         base, api_key=api_key, model=model, skip_flac_compression=skip_flac)
     if result.get('ok'):
         # refresh=True: re-probe rather than report a cached result. If a
         # probe for this backend is already running, that one's result is
         # reused instead.
-        health = transcriber.probe_whisper_health(
+        health = transcriber.remote.probe_whisper_health(
             base_url=base, api_key=api_key, refresh=True)
         result['health'] = health
         summary = _health_detail(health)
@@ -481,7 +481,7 @@ def test_provider_connection(provider):
         # path uses, so the probe cannot drift from what an episode upload
         # would do. Its base URL is empty when unconfigured, so the key
         # gate inside the helper fails closed.
-        return _whisper_connection_test(transcriber._get_whisper_settings(), body)
+        return _whisper_connection_test(transcriber.settings._get_whisper_settings(), body)
 
     if provider == PROVIDER_SYSTEMONE_COMPATIBLE:
         db = Database()
@@ -539,7 +539,7 @@ def test_provider_connection(provider):
 
 
 # Provider types the secondary slot accepts, matching VALID_LLM_PROVIDERS
-# in api/settings.py (not importable here without a circular import).
+# in api/settings/common.py (not importable here without a circular import).
 _SECONDARY_PROVIDER_TYPES = (
     PROVIDER_ANTHROPIC, PROVIDER_OPENROUTER, PROVIDER_OPENAI_COMPATIBLE,
     PROVIDER_OLLAMA, PROVIDER_TYPESAFE, PROVIDER_SYSTEMONE_COMPATIBLE)
@@ -656,4 +656,4 @@ def test_failover_whisper_connection():
     """End-to-end probe of the whisper failover slot (#806); same contract as the
     primary whisper route, reading saved values via _get_failover_whisper_settings."""
     body = request.get_json(silent=True) or {}
-    return _whisper_connection_test(transcriber._get_failover_whisper_settings(), body)
+    return _whisper_connection_test(transcriber.settings._get_failover_whisper_settings(), body)

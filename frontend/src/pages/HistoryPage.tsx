@@ -1,6 +1,10 @@
-import { useState } from 'react';
+import { pageHeader, pageTitle, summaryCard, summaryValue, summaryLabel } from '../components/pageStyles';
+import { useState, type ReactNode } from 'react';
+import PageTabs from '../components/PageTabs';
+import SortControls from '../components/SortControls';
+import QueryError from '../components/QueryError';
 import { useQuery } from '@tanstack/react-query';
-import { Link } from 'react-router';
+import { Link, useSearchParams } from 'react-router';
 import {
   getProcessingHistory,
   getProcessingHistoryStats,
@@ -12,29 +16,29 @@ import { feedsQueryOptions } from '../api/feeds';
 import { feedDisplayTitle } from '../utils/feedTitle';
 import { formatDateTime, formatDurationPrecise } from '../utils/format';
 import { ProcessingHistoryEntry } from '../api/types';
-import { SkeletonPageHeader, SkeletonRows } from '../components/Skeleton';
+import { SkeletonRows } from '../components/Skeleton';
 import { Pagination } from '../components/Pagination';
 import { SortHeader, useSortState } from '../components/SortHeader';
 import { btnSecondary } from '../components/buttonStyles';
 import { selectBase, focusRing, filterGrid, filterLabel, filterControl } from '../components/fieldStyles';
 import { badgeBase, tint } from '../components/badgeStyles';
+import DownloadsTab from './history/DownloadsTab';
 
 type StatusFilter = 'all' | 'completed' | 'failed';
 type SortField = 'processedAt' | 'processingDurationSeconds' | 'adsDetected' | 'reprocessNumber' | 'llmCost' | 'appVersion';
 
-// Shared shell for the clickable Completed/Failed filter cards. Background is set
-// per-state below (bg-card / bg-primary/5) so only one bg utility ever applies.
 const FILTER_CARD_CLASS =
-  'border rounded-lg p-4 text-left cursor-pointer transition-colors ' +
+  `${summaryCard} cursor-pointer transition-colors ` +
   'hover:border-primary/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring';
 
-function HistoryPage() {
+function ProcessingTab({ tabs }: { tabs: ReactNode }) {
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('all');
   const [podcastFilter, setPodcastFilter] = useState<string>('');
   const [page, setPage] = useState(1);
   const { sortField, sortDirection, handleSort } =
     useSortState<SortField>('processedAt', 'desc', () => setPage(1));
   const [exporting, setExporting] = useState<'csv' | 'json' | null>(null);
+  const [exportError, setExportError] = useState('');
   const limit = 20;
 
   // Build query params
@@ -56,7 +60,7 @@ function HistoryPage() {
     queryParams.podcastSlug = podcastFilter;
   }
 
-  const { data: historyData, isLoading, error } = useQuery({
+  const { data: historyData, isLoading, error, refetch, isFetching } = useQuery({
     queryKey: ['history', queryParams],
     queryFn: () => getProcessingHistory(queryParams),
   });
@@ -70,28 +74,29 @@ function HistoryPage() {
 
   const handleExport = async (format: 'csv' | 'json') => {
     setExporting(format);
+    setExportError('');
     try {
       const blob = await exportProcessingHistory(format);
       const timestamp = new Date().toISOString().split('T')[0];
       downloadBlob(blob, `processing-history-${timestamp}.${format}`);
     } catch (err) {
-      console.error('Export failed:', err);
+      setExportError(err instanceof Error ? err.message : 'Could not export history. Try again.');
     } finally {
       setExporting(null);
     }
   };
 
   if (isLoading) {
-    return <div><SkeletonPageHeader /><SkeletonRows count={8} /></div>;
+    return <div><h1 className={`${pageTitle} mb-6`}>History</h1>{tabs}<div role="tabpanel" id="history-panel-processing" aria-labelledby="history-tab-processing"><SkeletonRows count={8} /></div></div>;
   }
 
-  if (error) {
-    return (
-      <div className="text-center py-12">
-        <p className="text-destructive">Failed to load processing history</p>
-        <p className="text-sm text-muted-foreground mt-2">{(error as Error).message}</p>
+  if (error && !historyData) {
+    return <div>
+      <h1 className={`${pageTitle} mb-6`}>History</h1>{tabs}
+      <div role="tabpanel" id="history-panel-processing" aria-labelledby="history-tab-processing">
+        <QueryError title="Failed to load processing history" onRetry={() => void refetch()} retrying={isFetching} />
       </div>
-    );
+    </div>;
   }
 
   const history = historyData?.history || [];
@@ -99,8 +104,8 @@ function HistoryPage() {
 
   return (
     <div>
-      <div className="flex flex-col sm:flex-row sm:justify-between sm:items-center gap-4 mb-6">
-        <h1 className="text-2xl font-bold text-foreground">Processing History</h1>
+      <div className={pageHeader}>
+        <h1 className={pageTitle}>History</h1>
         <div className="flex gap-2">
           <button
             onClick={() => handleExport('csv')}
@@ -119,12 +124,17 @@ function HistoryPage() {
         </div>
       </div>
 
+      {tabs}
+      <div role="tabpanel" id="history-panel-processing" aria-labelledby="history-tab-processing" tabIndex={0}>
+      {error && <div className="mb-4"><QueryError title="History could not be refreshed. Showing the last loaded rows." onRetry={() => void refetch()} retrying={isFetching} /></div>}
+      {exportError && <p role="alert" className="text-destructive mb-4">{exportError}</p>}
+
       {/* Stats Summary */}
       {stats && (
         <div className="grid grid-cols-2 sm:grid-cols-5 gap-4 mb-6">
-          <div className="bg-card border border-border rounded-lg p-4">
-            <div className="text-2xl font-bold text-foreground">{stats.totalProcessed}</div>
-            <div className="text-sm text-muted-foreground">Total Processed</div>
+          <div className={`${summaryCard} bg-card border-border`}>
+            <div className={`${summaryValue} text-foreground`}>{stats.totalProcessed}</div>
+            <div className={summaryLabel}>Total Processed</div>
           </div>
           <button
             type="button"
@@ -133,8 +143,8 @@ function HistoryPage() {
             title="Filter the list below by completed runs"
             className={`${FILTER_CARD_CLASS} ${statusFilter === 'completed' ? 'border-primary bg-primary/5' : 'border-border bg-card'} ${focusRing}`}
           >
-            <div className="text-2xl font-bold text-success">{stats.completedCount}</div>
-            <div className="text-sm text-muted-foreground">Completed</div>
+            <div className={`${summaryValue} text-success`}>{stats.completedCount}</div>
+            <div className={summaryLabel}>Completed</div>
           </button>
           <button
             type="button"
@@ -143,18 +153,18 @@ function HistoryPage() {
             title="Filter the list below by failed runs"
             className={`${FILTER_CARD_CLASS} ${statusFilter === 'failed' ? 'border-primary bg-primary/5' : 'border-border bg-card'} ${focusRing}`}
           >
-            <div className="text-2xl font-bold text-destructive">{stats.failedCount}</div>
-            <div className="text-sm text-muted-foreground">Failed</div>
+            <div className={`${summaryValue} text-destructive`}>{stats.failedCount}</div>
+            <div className={summaryLabel}>Failed</div>
           </button>
-          <div className="bg-card border border-border rounded-lg p-4">
-            <div className="text-2xl font-bold text-foreground">{stats.totalAdsDetected}</div>
-            <div className="text-sm text-muted-foreground">Total Ads Detected</div>
+          <div className={`${summaryCard} bg-card border-border`}>
+            <div className={`${summaryValue} text-foreground`}>{stats.totalAdsDetected}</div>
+            <div className={summaryLabel}>Total Ads Detected</div>
           </div>
-          <div className="bg-card border border-border rounded-lg p-4">
-            <div className="text-2xl font-bold text-foreground">
+          <div className={`${summaryCard} bg-card border-border`}>
+            <div className={`${summaryValue} text-foreground`}>
               {stats.totalLlmCost != null ? `$${stats.totalLlmCost.toFixed(2)}` : '-'}
             </div>
-            <div className="text-sm text-muted-foreground">Total LLM Cost</div>
+            <div className={summaryLabel}>Total Cost</div>
           </div>
         </div>
       )}
@@ -207,8 +217,13 @@ function HistoryPage() {
         )}
       </div>
 
+      <SortControls className="xl:hidden" field={sortField} direction={sortDirection} onSort={handleSort} options={[
+        { value: 'processedAt', label: 'Processed' }, { value: 'processingDurationSeconds', label: 'Duration' },
+        { value: 'adsDetected', label: 'Ads' }, { value: 'llmCost', label: 'Cost' },
+        { value: 'reprocessNumber', label: 'Reprocess number' }, { value: 'appVersion', label: 'Version' },
+      ]} />
       {/* Mobile Card Layout */}
-      <div className="sm:hidden space-y-3 mb-4">
+      <div className="xl:hidden space-y-3 mb-4">
         {history.length === 0 ? (
           <div className="bg-card rounded-lg border border-border p-8 text-center text-muted-foreground">
             No processing history found
@@ -250,7 +265,7 @@ function HistoryPage() {
                 )}
                 {entry.status !== 'completed' && entry.errorMessage && (
                   <p
-                    className="text-xs text-destructive truncate cursor-help mt-1"
+                    className="text-xs text-destructive break-words mt-1"
                     title={entry.errorMessage}
                   >
                     {entry.errorMessage}
@@ -275,8 +290,8 @@ function HistoryPage() {
       </div>
 
       {/* Desktop Table Layout */}
-      <div className="hidden sm:block bg-card border border-border rounded-lg overflow-hidden">
-        <div className="overflow-x-auto">
+      <div className="hidden xl:block bg-card border border-border rounded-lg overflow-hidden">
+        <div className="overflow-x-auto" role="region" aria-label="Processing history table" tabIndex={0}>
           <table className="w-full">
             <thead className="bg-muted/50">
               <tr>
@@ -287,16 +302,16 @@ function HistoryPage() {
                   Episode
                 </th>
                 <SortHeader field="processedAt" label="Processed" sortField={sortField} sortDirection={sortDirection} onSort={handleSort} />
-                <SortHeader field="processingDurationSeconds" label="Duration" className="px-4 hidden md:table-cell" sortField={sortField} sortDirection={sortDirection} onSort={handleSort} />
+                <SortHeader align="right" field="processingDurationSeconds" label="Duration" className="px-4 hidden md:table-cell" sortField={sortField} sortDirection={sortDirection} onSort={handleSort} />
                 <th
                   className="px-4 py-3 text-left text-xs font-medium text-muted-foreground uppercase tracking-wider hidden lg:table-cell"
                   title="Length of the downloaded copy each run processed"
                 >
                   Audio
                 </th>
-                <SortHeader field="adsDetected" label="Ads" sortField={sortField} sortDirection={sortDirection} onSort={handleSort} />
-                <SortHeader field="llmCost" label="Cost" className="px-4 hidden md:table-cell" sortField={sortField} sortDirection={sortDirection} onSort={handleSort} />
-                <SortHeader field="reprocessNumber" label="Reprocess #" className="px-4 hidden md:table-cell" sortField={sortField} sortDirection={sortDirection} onSort={handleSort} />
+                <SortHeader align="right" field="adsDetected" label="Ads" sortField={sortField} sortDirection={sortDirection} onSort={handleSort} />
+                <SortHeader align="right" field="llmCost" label="Cost" className="px-4 hidden md:table-cell" sortField={sortField} sortDirection={sortDirection} onSort={handleSort} />
+                <SortHeader align="right" field="reprocessNumber" label="Reprocess #" className="px-4 hidden md:table-cell" sortField={sortField} sortDirection={sortDirection} onSort={handleSort} />
                 <SortHeader field="appVersion" label="Version" className="px-4 hidden md:table-cell" sortField={sortField} sortDirection={sortDirection} onSort={handleSort} />
                 <th className="px-4 py-3 text-left text-xs font-medium text-muted-foreground uppercase tracking-wider">
                   Status
@@ -335,7 +350,7 @@ function HistoryPage() {
                       )}
                       {entry.status !== 'completed' && entry.errorMessage && (
                         <span
-                          className="block text-xs text-destructive truncate max-w-[200px] cursor-help mt-1"
+                          className="block text-xs text-destructive break-words max-w-[200px] cursor-help mt-1"
                           title={entry.errorMessage}
                         >
                           {entry.errorMessage}
@@ -390,8 +405,25 @@ function HistoryPage() {
 
       {/* Pagination - outside desktop/mobile divs for visibility on all screens */}
       <Pagination page={page} totalPages={totalPages} total={historyData?.total || 0} onPage={setPage} />
+      </div>
     </div>
   );
+}
+
+const TABS = [
+  ['processing', 'Processing'],
+  ['downloads', 'Downloads'],
+] as const;
+
+function HistoryPage() {
+  const [searchParams, setSearchParams] = useSearchParams();
+  const activeTab = searchParams.get('tab') === 'downloads' ? 'downloads' : 'processing';
+
+  const tabs = <PageTabs id="history" label="History sections" active={activeTab}
+    tabs={TABS.map(([value, label]) => ({ value, label }))}
+    onChange={key => setSearchParams(key === 'processing' ? {} : { tab: key })} />;
+
+  return activeTab === 'downloads' ? <DownloadsTab tabs={tabs} /> : <ProcessingTab tabs={tabs} />;
 }
 
 export default HistoryPage;

@@ -980,6 +980,7 @@ def _submit_correction_split(db, pattern_service, slug, episode_id,
             corrected_bounds={'start': piece['start'], 'end': piece['end']},
             text_snippet=piece['text'][:500],
             podcast_id=db.get_podcast_by_slug(slug)['id'],
+            addressing_mode=marker.get('addressing_mode'),
         )
 
     kept = [m for m in markers
@@ -1094,15 +1095,19 @@ def _resolve_or_create_pattern_from_text(
     )
 
 
+def _proposal_overlaps(p_start, p_end, start, end):
+    """True when a numeric proposal span overlaps [start, end]."""
+    return (isinstance(p_start, (int, float)) and isinstance(p_end, (int, float))
+            and p_end > p_start and p_end > start and p_start < end)
+
+
 def _usable_reviewer_proposal(db, marker, start, end):
     """A held marker's reviewer proposal, when it is valid, overlaps the
     detected span, and stays within the reviewer's per-edge shift cap."""
     # A hold stamps the raw proposal, which never passed the reviewer's clamp.
     p_start = marker.get('reviewer_proposed_start')
     p_end = marker.get('reviewer_proposed_end')
-    if not isinstance(p_start, (int, float)) or not isinstance(p_end, (int, float)):
-        return None
-    if p_end <= p_start or p_end <= start or p_start >= end:
+    if not _proposal_overlaps(p_start, p_end, start, end):
         return None
     cap = resolve_max_boundary_shift(db)
     if abs(p_start - start) > cap or abs(p_end - end) > cap:
@@ -1111,7 +1116,7 @@ def _usable_reviewer_proposal(db, marker, start, end):
 
 
 def _handle_confirm_correction(
-    db, pattern_service, slug, episode_id, original_ad, data
+    db, pattern_service, slug, episode_id, original_ad, data, addressing_mode=None
 ):
     """Handle correction_type='confirm'.
 
@@ -1154,6 +1159,16 @@ def _handle_confirm_correction(
             if proposal is not None:
                 env_start = min(original_start, proposal[0])
                 env_end = max(original_end, proposal[1])
+            else:
+                p_start = held_marker.get('reviewer_proposed_start')
+                p_end = held_marker.get('reviewer_proposed_end')
+                if (isinstance(p_start, (int, float)) and isinstance(p_end, (int, float))
+                        and (p_end <= original_start or p_start >= original_end)
+                        and (adjusted_start < env_start - 0.5 or adjusted_end > env_end + 0.5)):
+                    return error_response(
+                        f'Reviewer trim {p_start:.1f}-{p_end:.1f} does not overlap this '
+                        f'held span {original_start:.1f}-{original_end:.1f}; '
+                        'confirm or reject the whole span', 400)
         if adjusted_start < env_start - 0.5 or adjusted_end > env_end + 0.5:
             return error_response('Adjusted bounds must lie within the reviewed span', 400)
     # The span actually confirmed as ad content.
@@ -1205,6 +1220,7 @@ def _handle_confirm_correction(
         corrected_bounds={'start': eff_start, 'end': eff_end} if has_trim else None,
         text_snippet=data.get('notes'),
         podcast_id=db.get_podcast_by_slug(slug)['id'],
+        addressing_mode=addressing_mode,
     )
 
     # adjusted_* are None exactly when there is no trim; the helper only
@@ -1217,7 +1233,7 @@ def _handle_confirm_correction(
     return json_response({'message': 'Correction recorded', 'pattern_id': pattern_id})
 
 
-def _handle_reject_correction(db, slug, episode_id, original_ad):
+def _handle_reject_correction(db, slug, episode_id, original_ad, addressing_mode=None):
     """Handle correction_type='reject' (stored as 'false_positive')."""
     original_start = original_ad.get('start')
     original_end = original_ad.get('end')
@@ -1275,6 +1291,7 @@ def _handle_reject_correction(db, slug, episode_id, original_ad):
         text_snippet=text_snippet,
         source_hold_reason=source_hold_reason,
         podcast_id=db.get_podcast_by_slug(slug)['id'],
+        addressing_mode=addressing_mode,
     )
 
     _clear_held_marker_on_reject(db, slug, episode_id, original_start, original_end,
@@ -1484,7 +1501,8 @@ def _maybe_rewrite_pattern_from_adjustment(
         logger.warning(f"Reviewer-trim auto-update failed for pattern {pattern_id}: {e}")
 
 
-def _handle_adjust_correction(db, pattern_service, slug, episode_id, original_ad, data):
+def _handle_adjust_correction(db, pattern_service, slug, episode_id, original_ad, data,
+                              addressing_mode=None):
     """Handle correction_type='adjust' (stored as 'boundary_adjustment')."""
     original_start = original_ad.get('start')
     original_end = original_ad.get('end')
@@ -1539,6 +1557,7 @@ def _handle_adjust_correction(db, pattern_service, slug, episode_id, original_ad
         corrected_bounds={'start': adjusted_start, 'end': adjusted_end},
         text_snippet=adjusted_text,
         podcast_id=db.get_podcast_by_slug(slug)['id'],
+        addressing_mode=addressing_mode,
     )
 
     return json_response({'message': 'Adjustment recorded', 'pattern_id': pattern_id})
@@ -1604,15 +1623,19 @@ def submit_correction(slug, episode_id):
             409
         )
 
+    mode = (target_marker or {}).get('addressing_mode')
     if correction_type == 'confirm':
         response = _handle_confirm_correction(
-            db, pattern_service, slug, episode_id, original_ad, data
+            db, pattern_service, slug, episode_id, original_ad, data,
+            addressing_mode=mode
         )
     elif correction_type == 'reject':
-        response = _handle_reject_correction(db, slug, episode_id, original_ad)
+        response = _handle_reject_correction(
+            db, slug, episode_id, original_ad, addressing_mode=mode)
     elif correction_type == 'adjust':
         response = _handle_adjust_correction(
-            db, pattern_service, slug, episode_id, original_ad, data
+            db, pattern_service, slug, episode_id, original_ad, data,
+            addressing_mode=mode
         )
     elif correction_type == 'split':
         response = _submit_correction_split(

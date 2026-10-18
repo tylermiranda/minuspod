@@ -28,6 +28,7 @@ from unittest.mock import MagicMock, patch  # noqa: E402
 import pytest  # noqa: E402
 
 import main_app.processing as processing  # noqa: E402
+from main_app.pipeline import keep_rules
 from ad_detector import AdDetector
 from config import normalize_segment_category  # noqa: E402
 from audio_fingerprinter import AudioFingerprinter, FingerprintMatch  # noqa: E402
@@ -158,7 +159,7 @@ class TestKeepMarkerCorrectionGuard:
         assert len(temp_db.get_episode_corrections(_podcast_id(temp_db), EPISODE_ID)) == 1
 
     def test_reject_on_mark_marker_is_non_actionable(self, client, temp_db):
-        """The 'This segment is kept' guard must fire for mark too (spec 1.2:
+        """The 'This segment is kept' guard must fire for mark too (docs/specs/2026-07-24-segment-categories-design.md#actions-and-resolution:
         mark is keep-like in marker state, not just in the audio)."""
         _seed_episode(temp_db, markers=[_mark_marker()])
         with patch('api.patterns.get_database', return_value=temp_db):
@@ -455,7 +456,7 @@ class TestKeptMarkersStillLearn:
         segments = [{'start': 0, 'end': 60, 'text': 'x'}]
         with patch.object(processing, 'ad_detector') as mock_detector:
             mock_detector.learn_from_detections.return_value = 1
-            result = processing._learn_from_kept_ads(
+            result = keep_rules._learn_from_kept_ads(
                 SLUG, EPISODE_ID, keep_ads, segments, '/tmp/fake.mp3'
             )
         assert result == 1
@@ -465,7 +466,7 @@ class TestKeptMarkersStillLearn:
 
     def test_learn_from_kept_ads_is_noop_without_keep_ads(self):
         with patch.object(processing, 'ad_detector') as mock_detector:
-            result = processing._learn_from_kept_ads(
+            result = keep_rules._learn_from_kept_ads(
                 SLUG, EPISODE_ID, [], [], '/tmp/fake.mp3'
             )
         assert result == 0
@@ -473,7 +474,7 @@ class TestKeptMarkersStillLearn:
 
     def test_learn_from_kept_ads_is_noop_without_slug(self):
         with patch.object(processing, 'ad_detector') as mock_detector:
-            result = processing._learn_from_kept_ads(
+            result = keep_rules._learn_from_kept_ads(
                 None, EPISODE_ID, [{'start': 0.0, 'end': 60.0}], [], '/tmp/fake.mp3'
             )
         assert result == 0
@@ -618,7 +619,7 @@ class TestKeepPartitionFromCategorizedDetection:
         ad = {'start': 0.0, 'end': 30.0, 'category': 'cross_promo',
               'confidence': 0.9, 'detection_stage': 'text_pattern'}
         actions_map = {'cross_promo': 'keep'}
-        keep_ads, remove_ads = processing._partition_keep_ads([ad], actions_map)
+        keep_ads, remove_ads = keep_rules._partition_keep_ads([ad], actions_map)
         assert keep_ads == [ad]
         assert remove_ads == []
         assert ad['action_applied'] == 'keep'
@@ -631,7 +632,7 @@ class TestKeepPartitionFromCategorizedDetection:
         ad = {'start': 0.0, 'end': 30.0, 'category': 'sponsor',
               'confidence': 0.9, 'detection_stage': 'text_pattern'}
         actions_map = {'cross_promo': 'keep'}
-        keep_ads, remove_ads = processing._partition_keep_ads([ad], actions_map)
+        keep_ads, remove_ads = keep_rules._partition_keep_ads([ad], actions_map)
         assert keep_ads == []
         assert remove_ads == [ad]
 

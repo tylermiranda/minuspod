@@ -1,9 +1,9 @@
 import { Fragment } from 'react';
 import type { SearchEpisodeResult, SearchShowResult, SearchTranscriptResult } from '../api/search';
-import { EPISODE_STATUS_COLORS, EPISODE_STATUS_LABELS } from '../utils/episodeStatus';
+import { displayStatusColor, displayStatusLabel } from '../utils/episodeStatus';
 import { formatDate, formatTimestamp } from '../utils/format';
 import { renderSnippet } from '../utils/searchSnippet';
-import { badgeBase, tint } from './badgeStyles';
+import { badgeBase } from './badgeStyles';
 
 export type SearchResultGroup = 'shows' | 'episodes' | 'transcripts';
 
@@ -21,6 +21,7 @@ export interface SearchResultRow {
   title: string;
   subtitle?: string;
   status?: string;
+  titleSnippet?: string | null;
   snippet?: string | null;
   timestamp?: number | null;
   to: string;
@@ -35,13 +36,15 @@ const GROUP_LABELS: Record<SearchResultGroup, string> = {
 export function buildSearchResultRows(results: UnifiedSearchGroups): SearchResultRow[] {
   return [
     ...results.shows.map((r) => ({
-      key: `show-${r.slug}`, group: 'shows' as const, title: r.title, snippet: r.snippet,
+      key: `show-${r.slug}`, group: 'shows' as const, title: r.title, titleSnippet: r.titleSnippet,
+      snippet: r.snippet,
       to: `/feeds/${r.slug}`,
     })),
     ...results.episodes.map((r) => ({
       key: `episode-${r.feedSlug}-${r.episodeId}`, group: 'episodes' as const, title: r.title,
       subtitle: r.publishDate ? `${r.feedTitle}, ${formatDate(r.publishDate)}` : r.feedTitle,
-      status: r.status, snippet: r.snippet, to: `/feeds/${r.feedSlug}/episodes/${r.episodeId}`,
+      status: r.status, titleSnippet: r.titleSnippet, snippet: r.snippet,
+      to: `/feeds/${r.feedSlug}/episodes/${r.episodeId}`,
     })),
     ...results.transcripts.map((r, i) => ({
       key: `transcript-${r.feedSlug}-${r.episodeId}-${i}`, group: 'transcripts' as const, title: r.title,
@@ -59,6 +62,8 @@ interface SearchResultsProps {
   onSelect: (row: SearchResultRow) => void;
   // Whether the query is long enough to have searched; drives the two empty-state messages.
   ready?: boolean;
+  loading?: boolean;
+  failed?: boolean;
 }
 
 const HINT_MESSAGE = 'Type two or more characters to search shows, episodes and transcripts.';
@@ -67,9 +72,12 @@ const NO_MATCHES_MESSAGE = 'No shows, episodes or transcripts match.';
 // Renders Shows/Episodes/In transcripts as <li role="option"> rows (plus
 // role="presentation" group headers and the two shared empty-state messages),
 // meant to sit inside a caller-supplied role="listbox". No layout container of its own.
-function SearchResults({ rows, activeIndex, onHover, onSelect, ready = true }: SearchResultsProps) {
+function SearchResults({ rows, activeIndex, onHover, onSelect, ready = true, loading, failed }: SearchResultsProps) {
   if (!ready) {
     return <li role="presentation" className="px-4 py-3 text-sm text-muted-foreground">{HINT_MESSAGE}</li>;
+  }
+  if (loading || failed) {
+    return <li role="presentation" className="px-4 py-3 text-sm text-muted-foreground"><span role="status">{loading ? 'Searching...' : 'Search is unavailable. Try again.'}</span></li>;
   }
   if (rows.length === 0) {
     return <li role="presentation" className="px-4 py-3 text-sm text-muted-foreground">{NO_MATCHES_MESSAGE}</li>;
@@ -103,10 +111,12 @@ function SearchResults({ rows, activeIndex, onHover, onSelect, ready = true }: S
                 )}
                 <div className="min-w-0 flex-1">
                   <div className="flex items-center gap-2">
-                    <span className="min-w-0 flex-1 truncate text-sm">{row.title}</span>
+                    <span className="min-w-0 flex-1 truncate text-sm">
+                      {row.titleSnippet ? renderSnippet(row.titleSnippet) : row.title}
+                    </span>
                     {row.status && (
-                      <span className={`${badgeBase} whitespace-nowrap font-normal ${EPISODE_STATUS_COLORS[row.status] || tint.neutral}`}>
-                        {EPISODE_STATUS_LABELS[row.status] || row.status}
+                      <span className={`${badgeBase} whitespace-nowrap font-normal ${displayStatusColor(row.status)}`}>
+                        {displayStatusLabel(row.status)}
                       </span>
                     )}
                   </div>
