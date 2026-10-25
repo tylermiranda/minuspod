@@ -1,6 +1,6 @@
 # UI behavior and review contract
 
-Reviewed: 2026-10-16. Applies to desktop, phone, and tablet interfaces.
+Reviewed: 2026-10-23. Applies to desktop, phone, and tablet interfaces.
 
 The HTML guide contains visual examples. Production components own behavior. Change a shared component when a rule applies across screens; do not patch each caller with a different recipe.
 
@@ -10,7 +10,7 @@ The HTML guide contains visual examples. Production components own behavior. Cha
 | --- | --- | --- |
 | Theme values | `frontend/src/index.css`, `frontend/src/themes/themes.ts` | `npm run design:sync`; `npm run design:check`; theme contrast tests |
 | Page headers and summary cards | `pageStyles.ts`, Stats `StatCard` | Compare title, action placement, label/value alignment at every supported width |
-| Buttons and fields | `buttonStyles.ts`, `fieldStyles.ts`, `rowActionStyles.ts`, global coarse-pointer CSS | Measure the clickable element in a browser |
+| Buttons and fields | `buttonStyles.ts`, `fieldStyles.ts`, `rowActionStyles.ts`, `Modal.tsx` footer recipes, global coarse-pointer CSS | Measure the clickable element in a browser |
 | Dialogs | `Modal.tsx`, `useDraftClose.tsx` | Name, Tab cycle, Escape ownership, focus restoration, discard flow |
 | Page tabs | `PageTabs.tsx` | Arrows, Home/End, selected state, panel relationship |
 | Async failures | `QueryError.tsx` and query consumers | Failed requests cannot render an empty-success claim |
@@ -27,7 +27,67 @@ Run these commands from `frontend`. The guide's theme catalog and default tokens
 - Choose table breakpoints from populated content. Check long titles, large counts, IPv4 and IPv6 values, and error messages. Routine lists must fit their containers. Detailed comparison tables may scroll within a named, keyboard-focusable region.
 - Keep Since and Until together in a two-column group at 320 CSS px. Each field has a label and reciprocal date limit. Date-only filters must retain their date-only semantics.
 - Navigation collapses below 1280 CSS px. Keep the active route marked with `aria-current="page"` in both navigation layouts.
-- Verify 320, 390, 768, 1024, 1280, and 1440 CSS px for changed layouts. Include a short viewport when changing dialogs or fixed bars.
+- Verify 320, 390, 466, 626, 768, 890, 1024, 1280, and 1440 CSS px for changed layouts. Include a short viewport when changing dialogs or fixed bars. 466 and 626 (portrait) and 890 (landscape) match a folded and an unfolded foldable phone.
+- The Feeds grid has two columns from 600 CSS px. Stat and tile grids use even column counts between 640 and 1023 CSS px.
+- The page shell, fixed bars, and floating buttons pad for `env(safe-area-inset-left/right)` through the `.safe-x` and `.safe-x-wide` utilities in `index.css`.
+- Under `@media (horizontal-viewport-segments: 2)` dialogs stay in the right-hand viewport segment.
+- Overlapping cut markers on the episode page render as one block card with a segments toggle. Member cards keep their own actions.
+
+## Buttons
+
+There is no `<Button>` component. Recipes are class strings composed at the call site as `${btnBase} ${btnPrimary}`. The base carries size, radius, gap, disabled state, and focus ring, so call sites add only layout classes such as `w-full`.
+
+| Recipe | Use | Notes |
+| --- | --- | --- |
+| `btnBase` | Size and shape for every standard button (12 px by 6 px padding, 4 px radius) | Always paired with one colour variant |
+| `btnLg` | Page-level form actions (Save settings, Add feed, Create feed, dialog primary on wide forms) | Same as `btnBase` with 16 px by 8 px padding |
+| `btnPrimary` | The one main action in a card, row, or dialog | One per group |
+| `btnSecondary` | Default action beside a primary one | Fill, no border |
+| `btnOutline` | Same as secondary | Alias kept for call-site intent |
+| `btnGhost` | Low-emphasis action, icon toggles | Muted text, accent hover |
+| `btnDestructive` | The primary action is destructive (confirm delete) | Solid fill |
+| `btnDestructiveOutline` | Destructive action beside a primary one (Delete beside Edit) | Tinted border and hover |
+| `touchTarget` | Standalone control that needs a 44 px box on a phone | `min-h-11 min-w-11` below sm |
+| `touchCompact` | Icon-only header action beside a heading | 36 px square below sm, text button from sm |
+| `touchTargetRow` | Row that must stay on one line on a phone | Full height, shared width below sm |
+| `rowActionBtn`, `rowActionIcon` | Marker and detection row actions and the icon beside them | Icon derives its box from the same source. 44 px tall on phones, labels never wrap. Four controls share one line; the five-control Ad review card moves Split and Edit to a second line below 430 px |
+| `tableActionBtn` | Desktop detection table rows | 30 px tall; carries `focusRing` |
+| `cardActionBtn` | Review and detection card actions | 44 px floor; labels wrap on a phone; carries `focusRing` |
+| `dialogFooterBtn` | Dialog footer action | Text label at every width. Derives from `btnBase` as `${btnBase} border border-transparent` |
+| `dialogFooterGrid` | Dialog footer with 3 or more actions | Two columns below 360 px, one row of equal columns from 360 to 639 px, flex row from sm |
+| `iconTarget` + `iconVisual` | Icon button with a smaller filled square (AuditionPlayButton, OpenEditorButton) | 44 px hit box on coarse pointers; visual fills the 44 px target below sm, 28 px from sm |
+
+- Every button recipe carries `focusRing` and the disabled state through `btnBase` (or `btnLg`). `rowActionBtn`, `cardActionBtn`, and `tableActionBtn` carry `focusRing` too.
+- Pair `iconTarget` with `iconVisual`. The focus ring sits on the visual through `group-focus-visible`. `AuditionPlayButton` is the reference and is one size everywhere; `OpenEditorButton` is the second.
+- An icon-only control centers its icon with inline-flex items-center justify-center or the iconTarget and iconVisual pair. Padding alone places the icon top-left once the coarse-pointer floor stretches the box.
+- Dialog footers with 3 or more actions keep their text labels at every width. Below 360 CSS px they become two equal columns in two rows, and from 360 to 639 px one row of equal-width columns (dialogFooterGrid), so nothing is icon-only. PatternDetailModal is the reference.
+- Inline link-style actions (`text-primary hover:underline`, "Show full match") and selected-state toggles (`PageTabs`, `SegmentedToggle`, pagination numbers) are intentionally not button recipes.
+
+### Shared field, badge, and component recipes
+
+- Fields: `inputBase`, `selectBase`, and `textareaBase` share one chrome (4 px radius, `bg-background`, `border-input`, `text-foreground`) and inputs and selects share one 40 px minimum height. Textareas size by rows. `labelBase` is the form label; `filterLabel` stays the muted label in filter rows.
+- Badges: `badgeBase` is the one badge shape (12 px, medium weight, no wrap) and takes a `tint`. `countPill` is the round count pill and also takes a tint.
+- `StatusBadge` renders an episode status with its shared color and label. Use it instead of composing `badgeBase` with `displayStatusColor` by hand. `short` drops qualifiers such as "permanently" and "(offline)".
+- `StatTile` is the metric card: label above value, optional hint below, `h-full` so tiles in a grid row stretch to equal height. `tone` colors the value only.
+- `CloseButton` is the one close X. It uses the `iconTarget` and `iconVisual` pair, so it has a 44 px hit box on phones.
+- Numbers: `formatPercent` prints a whole-number percent with no decimals, and the same quantity uses the same label text in every place. Use the clock form `m:ss` (`formatTimestamp`) for positions, `Xm Ys` (`formatElapsed`) for elapsed or summed durations, and tenths of a second only in the editor scrub readout.
+
+## Copy
+
+- Use sentence case for headings, buttons, tabs, menu items, labels, and dialog titles. Product nouns keep their capitals (Podping, LLM, OPML, RSS, API, URL, DAI, Whisper).
+- Error text is "Could not <verb> <noun>." with a period. Add "Try again." only when a retry control sits beside it.
+- Empty states are "No <things> yet." for lists the user fills, "No <things> match these filters.", and "No results for "<query>"." Always end with a period and put the primary action beneath where one exists.
+- A held marker is "Needs review" (badge, filter option, row label). The episode page section is "Held for review (n)". Cleanup suggestions keep "Pending".
+- "Confirm" and "Not ad" are the only marker decisions. "Approve" and "Reject" apply only to cleanup suggestions.
+- Re-running detection is "Re-detect ads". The full pipeline is "Full reprocess".
+- A nav label equals the page `h1`: "Feeds", "Add feed", "Patterns". Back links read "Back to feeds".
+- A destructive confirm button repeats the verb and noun ("Delete pattern", "Delete 3 episodes") under a sentence-case question title ("Delete 3 episodes?"), not "Yes, delete".
+- Adding is "Add <noun>" with the lucide Plus icon and no typed "+"; the pending state keeps the verb ("Adding feed..."). "Create" is only for objects the app generates.
+- Cancel discards edits. Close is for a dialog with nothing pending; there is no "Done". Cue candidates use "Hide". "Dismiss" is only for a notice removed for good.
+- Show confidence and scores through `formatPercent` with no decimals and the label after the number ("99% confidence", "87% match"). Positions use `m:ss` (`formatTimestamp`); elapsed or summed time uses `formatElapsed` ("2m 5s").
+- Show timestamps through `formatDateTime`, with "-" for a missing value. Run logs keep UTC and label it.
+- An accessible name contains the visible label. Use one title or `aria-label` per control, not two with different text.
+- Use "and", not "&", in headings, labels, and sentences. The only exception is the editor footer's "Confirm & next".
 
 ## Data and feedback states
 
@@ -50,6 +110,9 @@ Use a polite status announcement for successful saves and copies. Use an alert f
 
 `Modal` requires `ariaLabel` or `ariaLabelledBy`. Prefer a visible heading. Custom waveform editors use the same focus and Escape hooks.
 
+- `Modal` takes `header` and `footer` props. The panel is a flex column and only the body scrolls. The header and footer stay pinned and inside the viewport at 320 to 390 CSS px. `dialogFooterBtn` derives from `btnBase`.
+- The three dialogs that do not use `Modal` (ad editor, cue mark, cross-episode scan) apply the same `data-split` layout: pinned header and footer, scrolling body.
+
 - Move focus inside on open; contain forward and reverse Tab, including any owned portaled controls.
 - Make background content inert and lock background scrolling. Restore both when the dialog closes.
 - Only the top dialog owns Escape. A popover inside it closes first. Return focus to the trigger if it still exists. Capture activation as well as focused elements: WebKit may leave a clicked button unfocused.
@@ -57,6 +120,7 @@ Use a polite status announcement for successful saves and copies. Use an alert f
 - Do not close data-entry dialogs on backdrop clicks. Dirty editors use `useDraftClose`; successful saves close without a discard prompt.
 - Use Ctrl/Cmd+K for global quick search. Ordinary printable keys remain available to native controls, browser search, and assistive technology.
 - Editor shortcuts run only when focus belongs to the editor. Ignore editable content, buttons, selects, sliders, composition, repeated keys, modifiers, and already-handled events.
+- Use `PageTabs` for page sections with exclusive panels. The `wrap` prop keeps a short tab set inside the viewport on phones (Search, six tabs). In-page section links (Stats) are anchors styled with `tabStrip` and `tabItem`, not `role="tab"`. The Add feed mode toggle is a `SegmentedToggle` that stacks below 560 px.
 - Page tabs use one Tab stop, Left/Right, Home/End, `aria-selected`, and a named `tabpanel`. Navigation links and filter buttons retain their own semantics.
 
 ## Saves, resets, and destructive actions
@@ -83,6 +147,7 @@ Feed deletion, resets, and replace-mode imports use `ConfirmModal`. Name the obj
 
 - Normal text requires at least 4.5:1 contrast against its rendered surface. Test ordinary text, muted text, status text, links, solid controls, hover states, and tinted badges across every theme and mode.
 - Use the appropriate paired foreground token. Being token-based does not prove sufficient contrast. Disabled controls and decorative marks require separate interpretation; do not dilute active text with opacity.
+- Card and section titles use `cardTitle` (18 CSS px, 600) and sub-headings use `subHeading` (14 CSS px, 600), always `text-foreground`. Data cards pad with `cardPad` (16 CSS px) and section cards with `sectionPad` (24 CSS px).
 - Use one visible page `h1` at 24 CSS px, section headings at 18 CSS px, and consistent summary-card labels/values. Keep numeric column headings aligned with their values.
 - Use `pageHeader`, `pageTitle`, and `pageDescription`: 24 CSS px titles, 16 CSS px header gaps, 24 CSS px bottom spacing, and actions below the title on phones.
 - Counter cards place the value above the label, left aligned. Metric cards place the label above the value and may add details. Both use 20 CSS px bold tabular values, 12 CSS px labels, and 16 CSS px outer padding. Metrics nested within a larger card may share its surface.

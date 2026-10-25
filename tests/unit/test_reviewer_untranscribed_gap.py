@@ -73,27 +73,23 @@ def _dai_marker(**extra):
     return marker
 
 
-def _clamp(marker, start, end, barriers=None):
+def _clamp(marker, start, end, barriers=None, original=(728.8, 939.9), segments=HOLE_SEGMENTS):
     return _reviewer()._clamp_proposed_bounds(
-        marker, start, end, 728.8, 939.9, 60, 'show', 'ep1',
-        segments=HOLE_SEGMENTS, hard_barriers=barriers)
+        marker, start, end, *original, 60, 'show', 'ep1',
+        segments=segments, hard_barriers=barriers)
 
 
-def test_eight_second_rule_floors_a_trim_past_the_dai_core_start(monkeypatch):
+def test_gap_rule_floors_a_trim_past_the_dai_core_start():
     assert _clamp(_dai_marker(), 752.55, 939.9) == (728.8, 939.9)
-    # Without the rule the edge is transcript-supported and crosses the unmeasured region.
-    monkeypatch.setattr(ad_reviewer, 'UNREVIEWABLE_GAP_SECONDS', 1000.0)
-    assert _clamp(_dai_marker(), 752.55, 939.9) == (752.55, 939.9)
 
 
 def test_gap_and_dai_clamp_log_one_consistent_line(caplog):
     marker = _dai_marker()
     with caplog.at_level('INFO', logger='ad_reviewer'):
-        assert _clamp(marker, 752.55, 937.8) == (728.8, 937.8)
+        assert _clamp(marker, 752.55, 939.9) == (728.8, 939.9)
     lines = [r.getMessage() for r in caplog.records if 'Reviewer trim' in r.getMessage()]
     assert len(lines) == 1
-    assert '752.5-937.8 -> 728.8-937.8' in lines[0]
-    assert 'start floored by untranscribed audio' in lines[0]
+    assert 'stopped at untranscribed audio: 752.5-939.9 -> 728.8-939.9' in lines[0]
 
 
 BARRIER_SEGMENTS = [
@@ -167,6 +163,39 @@ def test_end_cannot_be_trimmed_into_an_untranscribed_tail():
     assert got == (900.0, 1000.0)
 
 
+@pytest.mark.parametrize('words, original, proposal', [
+    # A 4.74 s wordless tail, under the 8 s rule, still holds the end at the file end.
+    ((3733.5, 3789.52), (3733.5, 3794.26), (3733.5, 3789.52)),
+    # A 4 s wordless head holds the start at 0.
+    ((4.0, 30.0), (0.0, 30.0), (4.0, 30.0)),
+])
+def test_short_wordless_head_or_tail_still_stops_the_trim(words, original, proposal):
+    segments = [_worded(*words, 'Try Acme free at acme.example today.')]
+    marker = dict(_marker(), start=original[0], end=original[1])
+    assert _clamp(marker, *proposal, original=original, segments=segments) == original
+
+
+PREROLL_SEGMENTS = [
+    _worded(0.0, 57.68, 'Try Acme free at acme.example today and save big.'),
+    _worded(62.40, 120.0, 'Welcome back to the show everybody.'),
+]
+
+
+def _preroll_clamp(marker):
+    return _clamp(marker, 0.0, 57.7, original=(0.0, 60.38), segments=PREROLL_SEGMENTS)
+
+
+def test_short_gap_at_a_measured_core_edge_stops_the_end_trim():
+    marker = _dai_marker(start=0.0, end=60.38, dai_core_spans=[{'start': 0.0, 'end': 60.38}])
+    marker[DAI_PROBE_SPANS] = [{'start': 0.5, 'end': 4.5}]
+    assert _preroll_clamp(marker) == (0.0, 60.38)
+
+
+def test_short_gap_at_an_unmeasured_edge_still_trims():
+    got = _preroll_clamp(dict(_marker(), start=0.0, end=60.38))
+    assert got == (0.0, 57.7)
+
+
 def test_word_gap_inside_one_segment_is_shown_in_the_prompt():
     words = [{'word': 'Acme', 'start': 100.0, 'end': 100.5},
              {'word': 'deal', 'start': 110.5, 'end': 111.0}]
@@ -174,7 +203,7 @@ def test_word_gap_inside_one_segment_is_shown_in_the_prompt():
     prompt = _reviewer()._build_user_prompt(
         ad={'start': 100.0, 'end': 111.0}, segments=segments,
         episode_meta=_mock_episode_meta(), pool='accepted')
-    assert '[100.50s-110.50s] (10.0 s of audio with no transcript)' in prompt
+    assert '[100.5-110.5] (gap of 10.0s - no transcript, likely silence, jingle, or unintelligible speech)' in prompt
 
 
 @pytest.mark.parametrize('proposal, barriers, expected', [
@@ -198,7 +227,7 @@ def test_gap_notes_tolerate_a_line_without_an_end():
              {'start': 120.0, 'end': 125.0, 'text': 'two'}]
     text = ad_reviewer._timestamped_with_gaps(lines, [(105.0, 120.0)], 100.0, 130.0)
     assert text.split('\n') == [
-        '[100.0s-105.0s] one',
-        '[105.00s-120.00s] (15.0 s of audio with no transcript)',
-        '[120.0s-125.0s] two',
+        '[100.0-105.0] one',
+        '[105.0-120.0] (gap of 15.0s - no transcript, likely silence, jingle, or unintelligible speech)',
+        '[120.0-125.0] two',
     ]

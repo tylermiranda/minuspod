@@ -1,0 +1,84 @@
+{
+ "output": "minuspod-audio-cues",
+ "beats": [
+  {
+   "card": true,
+   "dur": 3.8,
+   "head": "",
+   "sub": "Some shows ring a bell before every ad break. MinusPod can listen for it.",
+   "logo": "logo-dark.png"
+  },
+  {
+   "clip": "candidates",
+   "dev": "laptop",
+   "start": 0.4,
+   "dur": 10.0,
+   "crop": [
+    48,
+    150,
+    1904,
+    1650
+   ],
+   "head": "Find the cue on an episode.",
+   "sub": "One scan surfaces sounds that repeat within the episode and counts how many sit at known ad breaks. Make a template from one."
+  },
+  {
+   "clip": "templates",
+   "dev": "laptop",
+   "start": 0.3,
+   "dur": 5.5,
+   "crop": [
+    48,
+    180,
+    1904,
+    1420
+   ],
+   "head": "Templates live on the feed.",
+   "sub": "Intro, outro and ad-break cues, with a last-match date and health stats across processed episodes."
+  },
+  {
+   "clip": "crossscan",
+   "dev": "laptop",
+   "start": 0.3,
+   "dur": 6.0,
+   "crop": [
+    300,
+    32,
+    1400,
+    1760
+   ],
+   "head": "Or scan several episodes at once.",
+   "sub": "Candidates that recur across the episodes you pick, with a count of how many share each."
+  },
+  {
+   "clip": "snapped",
+   "dev": "laptop",
+   "start": 0.3,
+   "dur": 9.0,
+   "crop": [
+    48,
+    100,
+    1904,
+    1700
+   ],
+   "head": "Cuts snap to the cue.",
+   "sub": "A Cue snapped badge marks each edge the cue sharpened. Confirm or reject matches to tune the feed."
+  },
+  {
+   "clip": "cuesettings",
+   "dev": "phone",
+   "start": 0.4,
+   "dur": 6.5,
+   "head": "Tune it globally or per feed.",
+   "sub": "Global detection knobs, per-feed threshold and snap overrides. Cue-only mode skips the detection model on shows that always chime."
+  },
+  {
+   "card": true,
+   "dur": 4.2,
+   "head": "Audio cues",
+   "sub": "Mark it once. Matching episodes after it snap their cuts to the chime.",
+   "small": "github.com/ttlequals0/MinusPod",
+   "logo": "logo-dark.png"
+  }
+ ]
+}

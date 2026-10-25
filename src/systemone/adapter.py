@@ -32,11 +32,16 @@ from systemone.protocol import (
 logger = logging.getLogger(__name__)
 
 
-# timestamps mode: [123.4s - 130.0s] some text
-_TS_LINE = re.compile(r"^\s*\[(\d+(?:\.\d+)?)s\s*-\s*(\d+(?:\.\d+)?)s\]\s?(.*)$")
+# timestamps mode: "[123.4s - 130.0s] some text" or "[123.4-130.0] some text"
+_TS_LINE = re.compile(r"^\s*\[(\d+(?:\.\d+)?)s?\s*-\s*(\d+(?:\.\d+)?)s?\]\s?(.*)$")
 # segment_ids mode: [12] some text
 _ID_LINE = re.compile(r"^\s*\[(\d+)\]\s?(.*)$")
-_TRANSCRIPT_HEADING = re.compile(r"(?m)^Transcript:[ \t\r]*$")
+# Gap cue rows that segment-ID prompts insert between transcript rows (#884).
+_GAP_LINE = re.compile(r"^\s*\[gap\b[^\]]*\]\s*$")
+# Transcript heading: "Transcript:" // old style
+#                  or "Transcript (with [{start}-{end}] timestamp, in seconds):"
+#                  or "Transcript (with [{id}] prefix):"
+_TRANSCRIPT_HEADING = re.compile(r"(?m)^Transcript(?: \(with [^\)\n]+?\))?:[ \t\r]*$")
 
 # Candidate markers: ad_reviewer._build_user_prompt wraps every review candidate in
 # these; detection never emits them, so they tell a review request from detection.
@@ -48,15 +53,15 @@ _REVIEW_END_RE = re.compile(r"<<< CANDIDATE AD END \[(\d+(?:\.\d+)?)s\] <<<")
 _REVIEW_BOUNDS_RE = re.compile(
     r"Original boundaries:\s*(\d+(?:\.\d+)?)s\s*-\s*(\d+(?:\.\d+)?)s"
 )
+# Transcript heading: "Transcript (60s before, the candidate ad, 60s after; all lines carry [{start}-{end}] timestamp, in seconds):"
 _REVIEW_TRANSCRIPT_HEADING_RE = re.compile(
-    r"(?m)^[ \t]*Transcript \(60s before, the candidate ad, 60s after; "
-    r"all lines carry \[start-end\] second timestamps\):[ \t]*$"
+    r"(?m)^[ \t]*Transcript \([^\)\n]*?the candidate ad[^\)\n]+?\):[ \t]*$"
 )
 _CATEGORY_ACTIONS_RE = re.compile(
-    r"(?m)^[ \t]*Effective category actions:[ \t]*([^\r\n]*)[ \t]*$"
+    r"(?m)^[ \t]*Effective category actions:[ \t]*([^\r\n]*?)[ \t]*$"
 )
-_PODCAST_RE = re.compile(r"(?m)^[ \t]*Podcast:[ \t]*([^\r\n]+)[ \t]*$")
-_EPISODE_RE = re.compile(r"(?m)^[ \t]*Episode:[ \t]*([^\r\n]+)[ \t]*$")
+_PODCAST_RE = re.compile(r"(?m)^[ \t]*Podcast:[ \t]*([^\r\n]+?)[ \t]*$")
+_EPISODE_RE = re.compile(r"(?m)^[ \t]*Episode:[ \t]*([^\r\n]+?)[ \t]*$")
 # resurrection-pool framing (ad_reviewer._build_user_prompt). Its degrade path
 # must keep the segment rejected, not confirm a cut.
 _REVIEW_RESURRECT_MARK = "rejected for low confidence"
@@ -448,6 +453,8 @@ def parse_transcript(text: str) -> tuple[list[dict[str, Any]], str]:
             if not line.strip():
                 if rows:
                     break
+                continue
+            if _GAP_LINE.match(line):
                 continue
             if not (_TS_LINE.match(line) or _ID_LINE.match(line)):
                 break
@@ -854,7 +861,7 @@ def parse_review_context(text: str) -> tuple[list[dict[str, Any]], dict[str, lis
     words: dict[str, list[dict[str, Any]]] = {"start": [], "end": []}
     section: str | None = None
     for line in text.splitlines():
-        if line.strip() == "Boundary word timing, use these timestamps for corrections:":
+        if line.strip() == "Boundary word timing, use these timestamps (in seconds) for corrections:":
             section = "words"
             continue
         if section == "words" and line.strip() == "Start edge:":

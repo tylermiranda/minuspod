@@ -12,6 +12,7 @@ from typing import Literal
 from collections.abc import Callable
 
 from config import (
+    CUE_MATCH_STAGE,
     resolve_stage_tunables,
     UNREVIEWABLE_GAP_SECONDS,
     AD_REVIEWER_PARALLEL_ADS_DEFAULT,
@@ -23,10 +24,11 @@ from config import (
     HOLD_REASON_REVIEWER_FAILED,
     HOLD_REASON_REVIEWER_INCONCLUSIVE_BOUNDS,
     HOLD_REASON_REVIEWER_REJECT_CONFLICT,
-    AUDIO_CUE_ROLE_DEFAULT,
     AUDIO_CUE_ROLE_NON_AD,
     AUDIO_CUE_TYPE_CONTENT_TRANSITION,
     AUDIO_CUE_SOURCE_TEMPLATE,
+    AUDIO_CUE_START_EDGE_ROLES,
+    AUDIO_CUE_END_EDGE_ROLES,
     is_edge_cue_snapped,
     is_template_cue,
     measured_evidence,
@@ -37,7 +39,10 @@ from config import (
 )
 from audio_enforcer import content_anchors
 from ad_detector.boundaries import timed_line_segments
-from ad_detector.cue_boundary_snap import cue_snap_edge_limit
+from ad_detector.cue_boundary_snap import (
+    MIN_CUE_CONFIDENCE_FOR_SNAP, _cue_role, cue_removal_enabled,
+    cue_snap_edge_limit,
+)
 from text_pattern_matcher import is_defined_pattern
 from database import DEFAULT_REVIEW_PROMPT, DEFAULT_RESURRECT_PROMPT
 from llm_capabilities import PASS_REVIEWER_1, PASS_REVIEWER_2
@@ -64,7 +69,7 @@ from utils.markers import (
 )
 from utils.prompt import (
     format_sponsor_block, render_prompt, apply_override,
-    scrub_description, strip_comments_from_prompt
+    format_detection_notes_block, scrub_description, strip_comments_from_prompt
 )
 from utils.text import (
     BOUNDARY_SNAP_TOLERANCE_S,
@@ -121,6 +126,12 @@ _INCONCLUSIVE_STAGES = frozenset({
     'context', 'evidence', 'choice_rank', 'focused_validation',
     'boundary_coverage',
 })
+
+
+def _skips_reviewer(ad) -> bool:
+    """Human-confirmed ads and cue_match markers (a measured cue, no spoken ad) skip the LLM."""
+    return (bool((ad.get("validation") or {}).get("user_confirmed"))
+            or ad.get("detection_stage") == CUE_MATCH_STAGE)
 
 
 def _review_inconclusive_reason(error: Exception) -> str:
@@ -580,8 +591,10 @@ class TranscriptIndex:
         self.end = _EdgeIndex(units, words)
         # Start edges are end edges on the negated timeline.
         self.start = _EdgeIndex(_negated(units), _negated(words))
-        self.gaps = transcript_gaps([{'start': lo, 'end': hi} for lo, hi in self.end.units],
-                                    UNREVIEWABLE_GAP_SECONDS)
+        # Every wordless stretch; gaps keeps the unreviewable ones for prompts and the gap rule.
+        self.short_gaps = transcript_gaps(
+            [{'start': lo, 'end': hi} for lo, hi in self.end.units], EDGE_TOLERANCE)
+        self.gaps = [(lo, hi) for lo, hi in self.short_gaps if hi - lo >= UNREVIEWABLE_GAP_SECONDS]
 
 
 def _edge_transcript_supported(index: TranscriptIndex, edge: str, new: float, old: float) -> bool:
@@ -676,7 +689,11 @@ def _timestamped_with_gaps(lines: list[dict], gaps, lo: float, hi: float,
     for g_lo, g_hi in mine:
         at = bisect_right(starts, g_lo)
         parts.append(get_timestamped_transcript_for_range(in_range[cut:at], lo, hi))
-        parts.append(f"[{g_lo:.2f}s-{g_hi:.2f}s] ({g_hi - g_lo:.1f} s of audio with no transcript)")
+        parts.append(
+            f"[{g_lo:.1f}-{g_hi:.1f}] (gap of {g_hi - g_lo:.1f}s - no transcript, likely silence, jingle, or unintelligible speech)"
+            if cut == 0
+            else f"[{g_lo:.1f}-{g_hi:.1f}] (gap {g_hi - g_lo:.1f}s)"
+        )
         cut = at
     parts.append(get_timestamped_transcript_for_range(in_range[cut:], lo, hi))
     return '\n'.join(part for part in parts if part)
@@ -699,16 +716,40 @@ def _hold_inward_edges(start: float, end: float, start_limits, end_limits,
     return start, end
 
 
+def _template_cue_record(ad: dict, edge: str) -> dict | None:
+    """The labelled template cue this edge was snapped to, if any."""
+    snap = ad.get('cue_snap')
+    record = snap.get(edge) if isinstance(snap, dict) else None
+    return record if isinstance(record, dict) and is_template_cue(record) else None
+
+
+def _measured_edges(ad: dict, original_start: float, original_end: float) -> tuple[bool, bool]:
+    """Which edges sit on a DAI core bound; a template cue snap is the more precise edge and opts out."""
+    core_start, core_end = dai_core_bounds(ad)
+    return (core_start is not None and abs(core_start - original_start) <= EDGE_TOLERANCE
+            and _template_cue_record(ad, 'start') is None,
+            core_end is not None and abs(core_end - original_end) <= EDGE_TOLERANCE
+            and _template_cue_record(ad, 'end') is None)
+
+
 def _untranscribed_limits(index: TranscriptIndex, original_start: float,
-                          original_end: float) -> tuple[list, list]:
-    """Edge limits from untranscribed stretches of UNREVIEWABLE_GAP_SECONDS or more inside the span."""
-    gaps = list(index.gaps)
+                          original_end: float, ad: dict) -> tuple[list, list]:
+    """Edge limits from wordless stretches: interior gaps from UNREVIEWABLE_GAP_SECONDS, any length
+    when the gap touches a measured edge or lies before the first or after the last speech unit."""
     units = index.end.units
+    start_measured, end_measured = _measured_edges(ad, original_start, original_end)
+    # (stretch, minimum length) before clipping to the span.
+    candidates = [((lo, hi), UNREVIEWABLE_GAP_SECONDS) for lo, hi in index.short_gaps]
     if any(lo < original_end and hi > original_start for lo, hi in units):
-        # Audio before the first and after the last speech unit is untranscribed too.
-        gaps += [(original_start, units[0][0]), (index.end.max_his[-1], original_end)]
-    inside = [(max(lo, original_start), min(hi, original_end)) for lo, hi in gaps]
-    inside = [(lo, hi) for lo, hi in inside if hi - lo >= UNREVIEWABLE_GAP_SECONDS]
+        candidates += [((original_start, units[0][0]), EDGE_TOLERANCE),
+                       ((index.end.max_his[-1], original_end), EDGE_TOLERANCE)]
+    inside = []
+    for (lo, hi), min_len in candidates:
+        lo, hi = max(lo, original_start), min(hi, original_end)
+        if (start_measured and lo == original_start) or (end_measured and hi == original_end):
+            min_len = EDGE_TOLERANCE
+        if hi - lo >= min_len:
+            inside.append((lo, hi))
     return [(lo, lo) for lo, _hi in inside], [(hi, hi) for _lo, hi in inside]
 
 
@@ -722,16 +763,18 @@ def _silence_limits(ad: dict, original_start: float,
              if hi >= original_end - EDGE_TOLERANCE])
 
 
-def _cue_snap_limits(ad: dict, original_start: float,
-                     original_end: float) -> tuple[list, list]:
-    """Edge limits at the labelled template cues the ad's edges were snapped to."""
-    snap = ad.get('cue_snap') if isinstance(ad.get('cue_snap'), dict) else {}
+def _audio_cues(audio_analysis) -> list:
+    """Template and spectral cue signals, or [] when the analysis has none."""
+    by_type = getattr(audio_analysis, 'get_signals_by_type', None)
+    return by_type('audio_cue') if by_type else []
 
+
+def _cue_snap_limits(ad: dict, original_start: float, original_end: float,
+                     audio_analysis=None) -> tuple[list, list]:
+    """Edge limits at snapped template cues, plus removable cues inside the span."""
     def cue_limit(edge: str) -> float | None:
-        record = snap.get(edge)
-        if not isinstance(record, dict) or not is_template_cue(record):
-            return None
-        return cue_snap_edge_limit(record, edge)
+        record = _template_cue_record(ad, edge)
+        return None if record is None else cue_snap_edge_limit(record, edge)
 
     starts, ends = [], []
     lim = cue_limit('start')
@@ -740,15 +783,29 @@ def _cue_snap_limits(ad: dict, original_start: float,
     lim = cue_limit('end')
     if lim is not None and original_start < lim <= original_end + EDGE_TOLERANCE:
         ends.append((lim, min(lim, original_end)))
+
+    for cue in _audio_cues(audio_analysis):
+        details = cue.details or {}
+        if (not is_template_cue(details) or not cue_removal_enabled(details)
+                or cue.confidence < MIN_CUE_CONFIDENCE_FOR_SNAP):
+            continue
+        role = _cue_role(cue)
+        record = {'remove_with_ad': True, 'cue_start': cue.start, 'cue_end': cue.end}
+        if (role in AUDIO_CUE_START_EDGE_ROLES
+                and original_start - EDGE_TOLERANCE <= cue.start < original_end):
+            starts.append((cue.start, max(cue_snap_edge_limit(record, 'start'), original_start)))
+        if (role in AUDIO_CUE_END_EDGE_ROLES
+                and original_start < cue.end <= original_end + EDGE_TOLERANCE):
+            ends.append((cue.end, min(cue_snap_edge_limit(record, 'end'), original_end)))
     return starts, ends
 
 
 def _hold_inward_limits(ad: dict, start: float, end: float, original_start: float,
                         original_end: float, index: TranscriptIndex,
-                        barriers) -> tuple[float, float]:
+                        barriers, audio_analysis=None) -> tuple[float, float]:
     """Apply the transcript-gap, boundary-cue and absorbed-silence no-cross rules in one call."""
-    limits = (_untranscribed_limits(index, original_start, original_end),
-              _cue_snap_limits(ad, original_start, original_end),
+    limits = (_untranscribed_limits(index, original_start, original_end, ad),
+              _cue_snap_limits(ad, original_start, original_end, audio_analysis),
               _silence_limits(ad, original_start, original_end))
     return _hold_inward_edges(start, end, [lim for st, _ in limits for lim in st],
                               [lim for _, en in limits for lim in en], barriers)
@@ -947,10 +1004,7 @@ def _format_cue_section(*, audio_analysis, ad_start: float, ad_end: float,
     """
     lines = []
     if audio_analysis is not None:
-        try:
-            cues = audio_analysis.get_signals_by_type('audio_cue')
-        except AttributeError:
-            cues = []
+        cues = _audio_cues(audio_analysis)
         # Template cues: precise matches, treated as ground-truth markers.
         near_start_tmpl = []
         near_end_tmpl = []
@@ -964,7 +1018,7 @@ def _format_cue_section(*, audio_analysis, ad_start: float, ad_end: float,
                 continue
             details = cue.details or {}
             label = details.get('label') or 'audio cue'
-            role = details.get('role', AUDIO_CUE_ROLE_DEFAULT)
+            role = _cue_role(cue)
             near_start_edge = (
                 abs(cue.start - ad_start) <= bucket_radius
                 or abs(cue.end - ad_start) <= bucket_radius
@@ -1390,7 +1444,7 @@ class AdReviewer:
         """Apply the per-ad failure rule to every accepted ad after a batch failure."""
         result = ReviewResult()
         for ad in accepted_ads:
-            if (ad.get("validation") or {}).get("user_confirmed"):
+            if _skips_reviewer(ad):
                 result.accepted_after_review.append(ad)
                 continue
             verdict = ReviewVerdict(
@@ -1551,7 +1605,8 @@ class AdReviewer:
                         verdict.adjusted_start, verdict.adjusted_end = _hold_inward_limits(
                             updated_ad, *recovered, verdict.original_start,
                             verdict.original_end, transcript_units,
-                            episode_meta.get('hard_barriers') or [])
+                            episode_meta.get('hard_barriers') or [],
+                            episode_meta.get('audio_analysis'))
                 if (verdict.adjusted_start is not None
                         and verdict.adjusted_end is not None):
                     held["reviewer_proposed_start"] = verdict.adjusted_start
@@ -1612,7 +1667,8 @@ class AdReviewer:
                         episode_meta.get('episode_id'),
                         segments=segments, transcript_units=transcript_units,
                         hard_barriers=episode_meta.get('hard_barriers'),
-                        min_conf=min_conf)
+                        min_conf=min_conf,
+                        audio_analysis=episode_meta.get('audio_analysis'))
                     if _bounds_unchanged(new_start, new_end,
                                          verdict.original_start,
                                          verdict.original_end):
@@ -1682,8 +1738,7 @@ class AdReviewer:
             return []
 
         def _run_one(idx):
-            if (pool == "accepted"
-                    and (ads[idx].get("validation") or {}).get("user_confirmed")):
+            if pool == "accepted" and _skips_reviewer(ads[idx]):
                 return None, ads[idx]
             verdict, updated = self._review_single(
                 ad=ads[idx],
@@ -1893,7 +1948,7 @@ class AdReviewer:
             max_shift, slug, episode_id, segments=segments,
             transcript_units=transcript_units,
             hard_barriers=episode_meta.get('hard_barriers'), min_conf=min_conf,
-            members=members)
+            members=members, audio_analysis=episode_meta.get('audio_analysis'))
 
         proposal_clamped = _clamp_overrode(
             new_start, new_end, original_start, original_end,
@@ -1984,7 +2039,7 @@ class AdReviewer:
                                original_start, original_end, max_shift,
                                slug, episode_id, segments=None, transcript_units=None,
                                hard_barriers=None, min_conf=MIN_CUT_CONFIDENCE,
-                               members=None):
+                               members=None, audio_analysis=None):
         """Clamp reviewer-proposed bounds: inverted-bounds fallback, per-edge
         shift cap, merged-span floor, final validity fallback. Single seam for
         every path that turns reviewer prose or deltas into marker bounds."""
@@ -2034,11 +2089,12 @@ class AdReviewer:
         proposed = (clamped_start, clamped_end)
         clamped_start, clamped_end = _hold_inward_edges(
             clamped_start, clamped_end,
-            *_untranscribed_limits(index, original_start, original_end), barriers)
+            *_untranscribed_limits(index, original_start, original_end, ad), barriers)
         gap_start, gap_end = clamped_start, clamped_end
         clamped_start, clamped_end = _hold_inward_edges(
             clamped_start, clamped_end,
-            *_cue_snap_limits(ad, original_start, original_end), barriers)
+            *_cue_snap_limits(ad, original_start, original_end, audio_analysis),
+            barriers)
         start_held_by = ('boundary cue' if clamped_start != gap_start
                          else 'untranscribed audio' if gap_start != proposed[0] else None)
         end_held_by = ('boundary cue' if clamped_end != gap_end
@@ -2304,7 +2360,7 @@ class AdReviewer:
         ad_text = _timestamped_with_gaps(context_segments, gaps, start, end, closed=True)
         if not ad_text:
             fallback = ad.get("end_text", "") or ""
-            ad_text = f"[{start:.1f}s-{end:.1f}s] {fallback}" if fallback else ""
+            ad_text = f"[{start:.1f}-{end:.1f}] {fallback}" if fallback else ""
         after_text = _timestamped_with_gaps(context_segments, gaps, end, context_end)
         start_words = get_timestamped_words_for_range(
             segments, max(0.0, start - max_shift), start + max_shift)
@@ -2313,7 +2369,7 @@ class AdReviewer:
         word_context = ''
         if start_words or end_words:
             word_context = (
-                'Boundary word timing, use these timestamps for corrections:\n'
+                'Boundary word timing, use these timestamps (in seconds) for corrections:\n'
                 f'Start edge:\n{start_words}\n'
                 f'End edge:\n{end_words}\n'
             )
@@ -2334,10 +2390,12 @@ class AdReviewer:
             except Exception as e:
                 logger.warning(f"sponsor history provider failed: {e}")
 
-        description_section = ""
+        notes_block = format_detection_notes_block(episode_meta.get("detection_notes"))
+        description_section = notes_block
         if podcast_description or episode_description:
             description_section = (
                 f"Podcast description: {podcast_description}\n"
+                f"{notes_block}"
                 f"Episode description: {episode_description}\n"
             )
 
@@ -2372,8 +2430,8 @@ class AdReviewer:
             f"{framing}\n"
             f"{cue_section}"
             f"{policy_section}"
-            f"Transcript (60s before, the candidate ad, 60s after; all lines "
-            f"carry [start-end] second timestamps):\n"
+            "Transcript (60s before, the candidate ad, 60s after; all lines "
+            "carry [{start}-{end}] timestamp, in seconds):\n"
             f"{before_text}\n"
             f">>> CANDIDATE AD START [{start:.1f}s] >>>\n"
             f"{ad_text}\n"

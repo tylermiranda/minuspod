@@ -34,6 +34,10 @@ with cue templates configured.** See
 [Cross-Fetch Differential](how-it-works.md#cross-fetch-differential) for how
 the two stages combine.
 
+Finding a cue on one episode, templates and their health on the feed, the cross-episode scan, cuts that snapped to a cue, and the settings. Portrait cut and the file itself in [Videos](videos/README.md).
+
+https://github.com/user-attachments/assets/4903dbab-597c-45d4-82a7-5f91298d3a6c
+
 ## How it finds the cue
 
 There are two ways to find a cue, both gated by the master toggle.
@@ -61,7 +65,7 @@ episode page.
 
 ### Remove cue with ad
 
-Ad-break templates have **Remove cue with ad** enabled by default, including templates saved before this option was added. Turn it off in the capture dialog or template list to keep that cue with the programme.
+Ad-break templates have **Remove cue with ad** enabled by default. Turn it off in the capture dialog or template list to keep that cue with the programme.
 
 When enabled, an ad starts 0.05 seconds before its opening cue and ends 0.05 seconds after its closing cue. The reviewer's maximum boundary shift applies to the edge actually used, including the cue's full length. A cue beyond that cap leaves the edge unchanged.
 
@@ -323,6 +327,25 @@ Uses accepted cues to snap ad edges or build ads from cue pairs.
   "cue is supporting evidence only" rule, so leave it off until you trust the
   matcher on a feed. The UI labels this and the cue-only preset as experimental,
   since both can cut audio on cue evidence the LLM never reviewed.
+- **Cut matched cue audio** - off by default. Cuts every match of a cue
+  template on its own, with no ad next to it. See Cut matched audio below.
+
+### Cut matched audio
+
+A matched cue becomes its own marker, so a show intro, outro or ad-break stinger
+can be cut without any ad beside it. A match that overlaps an existing ad is skipped.
+
+- **Layering:** a template value wins over the feed override, and the feed
+  override wins over the global setting. Inherit on a template defers to the feed.
+- **Category:** show intro and show outro matches get the intro and outro categories.
+  Ad-break cue types get the sponsor category.
+- **Outcome:** the feed's category action for that category decides whether the
+  marker is removed, beeped, kept or only marked.
+- **Not eligible:** content transition templates never show the option and are never cut this way.
+- **Safety:** cue-only safety still applies. A template that has not proven itself
+  is held for review, or held below the auto-cut floor.
+- **Where to set it:** the Cut matched audio selector on each template (Inherit,
+  On, Off), the per-feed override, and the global Cut matched cue audio setting.
 
 ## Cue-only preset
 
@@ -378,7 +401,7 @@ chapters stop, and those episodes lose transcript search and VTT subtitles.
 Publisher chapters still work: both embedded ID3 chapters and linked
 Podcasting 2.0 JSON chapters are remapped onto the cut audio using the cue
 timestamps, with no transcript needed. Runs are labeled "(cue-only)" in the
-episode's run list, and additionally "(no transcript)" when transcription is
+episode's run list, and also "(no transcript)" when transcription is
 skipped.
 
 ## Per-feed overrides
@@ -389,9 +412,11 @@ Per-feed controls sit on the feed detail page under Feed settings:
   0.30 to 0.99. Empty means use the global Template match score. A per-template
   value takes precedence over this. The `Suggest threshold` action in Test on
   episode can write this override for you via its Apply to this feed button.
-- **Cue tuning overrides** (collapsible) - per-feed overrides for seven advanced
+- **Cue tuning overrides** (collapsible) - per-feed overrides for eight advanced
   knobs. Empty for any field means inherit the global value:
-  - **Pair synthesis** (`cueCreateFromPairsOverride`) - tri-state: on, off, or
+  - **Create ads from cue pairs** (`cueCreateFromPairsOverride`) - tri-state: on, off, or
+    inherit global.
+  - **Cut matched cue audio** (`cueCutMatchesOverride`) - tri-state: on, off, or
     inherit global.
   - **Pair min break** (`cuePairMinBreakOverride`) - seconds.
   - **Pair max break** (`cuePairMaxBreakOverride`) - seconds.
@@ -399,9 +424,8 @@ Per-feed controls sit on the feed detail page under Feed settings:
   - **Snap confidence** (`cueSnapConfidenceOverride`) - 0-1.
   - **Snap lead** (`cueSnapLeadOverride`) - seconds.
   - **Snap lag** (`cueSnapLagOverride`) - seconds.
-- **Snap cuts to silence** (`silenceSnapEnabled`) - off by default. Edges not
-  already moved by cue snap are moved to the midpoint of the nearest qualifying
-  silence. See Silence snap above.
+- **Snap cuts to silence** (`silenceSnapEnabled`) - off by default. See
+  [Silence snap](#silence-snap).
 - **Snap to content transitions** (`transitionSnapEnabled`) - off by default.
   Content-transition cues may snap ad edges the same way boundary cues do.
 - **Cue-only safety** (`cueOnlySafety`) - `cue_only` feeds only. `hold_new`

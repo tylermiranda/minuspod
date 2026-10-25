@@ -1014,7 +1014,7 @@ def _modal_sponsor(data):
 
 def _resolve_or_create_pattern_from_text(
     db, pattern_service, slug, episode_id, ad_text, original_ad, *, label,
-    sponsor_override=None,
+    sponsor_override=None, category=None,
 ):
     """Shared dedup + create-or-link path used by confirm and adjust when
     no pattern_id is provided. Returns (primary_id, all_ids): primary_id is
@@ -1030,7 +1030,9 @@ def _resolve_or_create_pattern_from_text(
     to skip them, which is how a confirmed 176s span whose first 87s were
     show content became a pattern keyed on that content.
 
-    `label` is 'confirmed' or 'adjusted', for log messages.
+    `label` is 'confirmed' or 'adjusted', for log messages. `category` is the
+    reviewed marker's segment category (#565), so a confirmed interaction or
+    self-promo span is not learned as a sponsor pattern.
     """
     podcast = db.get_podcast_by_slug(slug)
     podcast_id_str = slug if podcast else None
@@ -1074,6 +1076,7 @@ def _resolve_or_create_pattern_from_text(
             scope='podcast',
             podcast_id=podcast_id_str,
             episode_id=episode_id,
+            category=category,
             ad_text=ad_text,
         )
         if not new_pattern_id:
@@ -1090,7 +1093,7 @@ def _resolve_or_create_pattern_from_text(
     return _create_patterns_from_segments(
         db, segments, scope='podcast', podcast_id_str=podcast_id_str,
         network_id=None, episode_id=episode_id, primary_sponsor=sponsor,
-        pattern_service=pattern_service,
+        category=category, pattern_service=pattern_service,
         log_context=f"{label} ad in {slug}/{episode_id}",
     )
 
@@ -1206,6 +1209,8 @@ def _handle_confirm_correction(
                     db, pattern_service, slug, episode_id, ad_text,
                     original_ad, label='confirmed',
                     sponsor_override=sponsor_override,
+                    category=_reviewed_marker_category(
+                        db, slug, episode_id, original_start, original_end),
                 )
 
     deleted = db.delete_conflicting_corrections(db.get_podcast_by_slug(slug)['id'], episode_id, 'confirm', original_start, original_end)
@@ -1319,6 +1324,15 @@ def _load_episode_markers(db, slug, episode_id):
 
 def _load_markers(db, slug, episode_id):
     return _load_episode_markers(db, slug, episode_id)[1]
+
+
+def _reviewed_marker_category(db, slug, episode_id, start, end):
+    """Segment category of the marker a confirm or adjust was made on, or
+    None when no stored marker matches (None stores NULL, read as sponsor)."""
+    markers = _load_markers(db, slug, episode_id)
+    marker = find_marker_in_list(markers, start, end) if markers else None
+    category = (marker or {}).get('category')
+    return category if category in SEGMENT_CATEGORIES else None
 
 
 def _handle_recategorize_correction(db, slug, episode_id, original_ad, data):
@@ -1537,6 +1551,8 @@ def _handle_adjust_correction(db, pattern_service, slug, episode_id, original_ad
             db, pattern_service, slug, episode_id, adjusted_text,
             original_ad, label='adjusted',
             sponsor_override=sponsor_override,
+            category=_reviewed_marker_category(
+                db, slug, episode_id, original_start, original_end),
         )
 
     # Judge conflicts against the adjusted bounds: they are the span the
