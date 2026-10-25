@@ -152,7 +152,7 @@ describe('AddFeed: podcast search gating', () => {
 
   it('falls back to the URL-only label until settings report a provider', async () => {
     renderAddFeed(new Promise(() => {}));
-    expect(screen.getByLabelText('Podcast RSS feed URL')).toBeDefined();
+    expect(screen.getByLabelText('Podcast RSS Feed URL')).toBeDefined();
     expect(screen.queryByText('Configure PodcastIndex API credentials')).toBeNull();
   });
 
@@ -167,7 +167,7 @@ describe('AddFeed: podcast search gating', () => {
       expect(screen.getByText(/Configure PodcastIndex API credentials/)).toBeDefined();
     });
 
-    await user.type(screen.getByLabelText('Podcast RSS feed URL'), 'daily');
+    await user.type(screen.getByLabelText('Podcast RSS Feed URL'), 'daily');
     await new Promise((r) => setTimeout(r, 500));
     expect(mockSearchPodcasts).not.toHaveBeenCalled();
   });

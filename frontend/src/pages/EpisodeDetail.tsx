@@ -50,7 +50,7 @@ import { StageBadge } from '../components/StageBadge';
 import ProcessingRunsTable from '../components/ProcessingRunsTable';
 import CostAmount from '../components/CostAmount';
 import EpisodeLogsCard from '../components/EpisodeLogsCard';
-import { btnBase, btnDestructive, btnLg, btnPrimary, btnSecondary } from '../components/buttonStyles';
+import { btnBase, btnDestructive, btnLg, btnPrimary, btnSecondary, touchCompact } from '../components/buttonStyles';
 import DropdownMenu, { type DropdownMenuItem } from '../components/DropdownMenu';
 import { fileInputBase, focusRing, inputBase, labelBase, textareaBase } from '../components/fieldStyles';
 import { badgeBase, tint } from '../components/badgeStyles';
