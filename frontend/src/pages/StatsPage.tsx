@@ -16,8 +16,7 @@ import ProcessingRunsTable from '../components/ProcessingRunsTable';
 import { getCueAggregateStats } from '../api/cueDetections';
 import { feedsQueryOptions } from '../api/feeds';
 import { feedDisplayTitle } from '../utils/feedTitle';
-import { formatTokenCount } from './settings/settingsUtils';
-import { formatCost, formatDateTime, formatElapsed } from '../utils/format';
+import { cacheHit, formatCost, formatDateTime, formatElapsed, formatTokenCount } from '../utils/format';
 import { SkeletonStatCards, SkeletonChart, SkeletonRows } from '../components/Skeleton';
 import { useThemeColors } from '../hooks/useThemeColors';
 import { Pagination } from '../components/Pagination';
@@ -123,20 +122,23 @@ function QueryErrorPanel({ message, onRetry, retryLabel = 'Retry' }: { message: 
 }
 
 function ModelUsageDetail({ stat }: { stat: ModelUsageStat }) {
+  // Row-major order that fills two columns: episodes/input/output left, cache right.
+  const entries: [string, string | number][] = [
+    ['Distinct episodes', stat.distinctEpisodes],
+    ['Cache read', formatTokenCount(stat.cacheReadTokens)],
+    ['Input tokens', formatTokenCount(stat.inputTokens)],
+    ['Cache write', formatTokenCount(stat.cacheWriteTokens)],
+    ['Output tokens', formatTokenCount(stat.outputTokens)],
+    ['Cache hit rate', cacheHit(stat.cacheReadTokens, stat.cacheWriteTokens, stat.inputTokens).text || '-'],
+  ];
   return (
     <dl className="grid grid-cols-2 gap-3 text-xs">
-      <div>
-        <dt className="text-muted-foreground">Distinct episodes</dt>
-        <dd className="text-foreground">{stat.distinctEpisodes}</dd>
-      </div>
-      <div>
-        <dt className="text-muted-foreground">Input tokens</dt>
-        <dd className="text-foreground">{formatTokenCount(stat.inputTokens)}</dd>
-      </div>
-      <div>
-        <dt className="text-muted-foreground">Output tokens</dt>
-        <dd className="text-foreground">{formatTokenCount(stat.outputTokens)}</dd>
-      </div>
+      {entries.map(([label, value]) => (
+        <div key={label}>
+          <dt className="text-muted-foreground">{label}</dt>
+          <dd className="text-foreground">{value}</dd>
+        </div>
+      ))}
     </dl>
   );
 }
@@ -162,6 +164,7 @@ function ModelUsageTable({
                 <SortHeader field="provider" label="Provider" sortField={sortField} sortDirection={sortDir} onSort={onSort} />
                 <SortHeader field="model" label="Model" sortField={sortField} sortDirection={sortDir} onSort={onSort} />
                 <SortHeader field="calls" label="Calls" align="right" sortField={sortField} sortDirection={sortDir} onSort={onSort} />
+                <SortHeader field="cacheHitRate" label="Cache hit" align="right" className="px-4 whitespace-nowrap" sortField={sortField} sortDirection={sortDir} onSort={onSort} />
                 <SortHeader field="knownCostUsd" label="Known cost" align="right" sortField={sortField} sortDirection={sortDir} onSort={onSort} />
                 <SortHeader field="unknownCostCount" label="Coverage" align="right" sortField={sortField} sortDirection={sortDir} onSort={onSort} />
               </tr>
@@ -169,13 +172,14 @@ function ModelUsageTable({
             <tbody className="divide-y divide-border">
               {items.length === 0 ? (
                 <tr>
-                  <td colSpan={6} className="px-4 py-8 text-center text-muted-foreground">
+                  <td colSpan={7} className="px-4 py-8 text-center text-muted-foreground">
                     No model usage matches these filters.
                   </td>
                 </tr>
               ) : items.map((stat) => {
                 const key = modelUsageKey(stat);
                 const isOpen = expanded.has(key);
+                const hit = cacheHit(stat.cacheReadTokens, stat.cacheWriteTokens, stat.inputTokens);
                 const label = isOpen
                   ? `Hide usage detail for ${stat.provider} ${stat.model}`
                   : `Show usage detail for ${stat.provider} ${stat.model}`;
@@ -188,6 +192,10 @@ function ModelUsageTable({
                       <td className="px-4 py-3 text-sm text-foreground">{stat.provider}</td>
                       <td className="px-4 py-3 text-sm text-foreground">{stat.model}</td>
                       <td className="px-4 py-3 text-sm text-muted-foreground text-right tabular-nums">{stat.calls}</td>
+                      <td className="px-4 py-3 text-sm text-muted-foreground text-right tabular-nums"
+                          title={hit.title}>
+                        {hit.text || '-'}
+                      </td>
                       <td className="px-4 py-3 text-sm text-muted-foreground text-right tabular-nums">
                         <CostAmount amount={parseFloat(stat.knownCostUsd)} unpricedCount={stat.unknownCostCount} />
                       </td>
@@ -195,7 +203,7 @@ function ModelUsageTable({
                     </tr>
                     {isOpen && (
                       <tr className="bg-muted/20">
-                        <td colSpan={6} className="px-4 py-3">
+                        <td colSpan={7} className="px-4 py-3">
                           <ModelUsageDetail stat={stat} />
                         </td>
                       </tr>
@@ -219,6 +227,7 @@ function ModelUsageTable({
             <option value="provider">Provider</option>
             <option value="model">Model</option>
             <option value="calls">Calls</option>
+            <option value="cacheHitRate">Cache hit</option>
             <option value="knownCostUsd">Known spend</option>
             <option value="unknownCostCount">Unpriced calls</option>
           </select>
@@ -239,6 +248,7 @@ function ModelUsageTable({
           const key = modelUsageKey(stat);
           const isOpen = expanded.has(key);
           const label = isOpen ? 'Hide usage detail' : 'Show usage detail';
+          const hit = cacheHit(stat.cacheReadTokens, stat.cacheWriteTokens, stat.inputTokens);
           return (
             <div key={key} className="bg-card rounded-lg border border-border p-4">
               <div className="mb-2">
@@ -247,9 +257,12 @@ function ModelUsageTable({
                   <CostAmount amount={parseFloat(stat.knownCostUsd)} unpricedCount={stat.unknownCostCount} />
                 </p>
               </div>
-              <div className="flex items-center justify-between text-xs text-muted-foreground">
+              <div className="grid grid-cols-3 text-xs text-muted-foreground">
                 <span>{stat.calls} calls</span>
-                <span>{formatCoverage(stat.calls, stat.unknownCostCount)}</span>
+                <span className="text-center" title={hit.title}>
+                  Cache hit {hit.text || '-'}
+                </span>
+                <span className="text-right">{formatCoverage(stat.calls, stat.unknownCostCount)}</span>
               </div>
               <div className="mt-2">
                 <DisclosureButton expanded={isOpen} onToggle={() => onToggle(key)} label={label} showLabel />
@@ -271,17 +284,22 @@ function ModelUsageTable({
 // table and the stacked rows so the two layouts cannot drift.
 const ATTEMPT_COLUMNS: {
   label: string; align: 'left' | 'right'; render: (a: SpendAttempt) => ReactNode;
+  breakable?: boolean;
+  title?: (a: SpendAttempt) => string | undefined;
 }[] = [
-  { label: 'Phase', align: 'left',
+  { label: 'Phase', align: 'left', breakable: true,
     render: (a) => `${a.phase}${a.invokingPass ? ` (pass ${a.invokingPass})` : ''}` },
-  { label: 'Provider', align: 'left',
+  { label: 'Provider', align: 'left', breakable: true,
     render: (a) => `${a.provider} / ${SLOT_LABELS[a.credentialSlot as keyof typeof SLOT_LABELS] ?? a.credentialSlot}` },
-  { label: 'Model', align: 'left', render: (a) => a.returnedModel ?? a.model },
+  { label: 'Model', align: 'left', breakable: true, render: (a) => a.returnedModel ?? a.model },
   { label: 'Status', align: 'left', render: (a) => a.status === 'inconclusive'
     ? <span className={`${badgeBase} ${tint.neutral}`}>Abstained</span>
     : a.status },
   { label: 'Tokens', align: 'right',
     render: (a) => formatTokenCount((a.inputTokens ?? 0) + (a.outputTokens ?? 0)) },
+  { label: 'Cache hit', align: 'right',
+    render: (a) => cacheHit(a.cacheReadTokens ?? 0, a.cacheWriteTokens ?? 0, a.inputTokens ?? 0).text || '-',
+    title: (a) => cacheHit(a.cacheReadTokens ?? 0, a.cacheWriteTokens ?? 0, a.inputTokens ?? 0).title },
   { label: 'Cost', align: 'right',
     render: (a) => (a.costUsd == null ? 'Unknown' : formatCost(parseFloat(a.costUsd))) },
   { label: 'When', align: 'left', render: (a) => formatDateTime(a.finalizedAt ?? a.createdAt) },
@@ -310,12 +328,12 @@ function SpendAttemptsPanel({ slug, episodeId }: { slug: string; episodeId: stri
         {formatCost(parseFloat(data.knownCostUsd))}.
         {data.truncated && ' Only the first 200 calls are listed; the totals cover them all.'}
       </p>
-      <div className="hidden sm:block overflow-x-auto">
+      <div role="region" aria-label="Contributing calls; scroll for more columns" tabIndex={0} className="hidden sm:block overflow-x-auto">
         <table aria-label="Contributing calls" className="w-full">
           <thead>
             <tr className="text-muted-foreground">
               {ATTEMPT_COLUMNS.map((c) => (
-                <th key={c.label} className={`font-medium ${cell(c.align)}`}>{c.label}</th>
+                <th key={c.label} className={`font-medium whitespace-nowrap ${cell(c.align)}`}>{c.label}</th>
               ))}
             </tr>
           </thead>
@@ -323,7 +341,7 @@ function SpendAttemptsPanel({ slug, episodeId }: { slug: string; episodeId: stri
             {data.attempts.map((a) => (
               <tr key={a.attemptId} className="border-t border-border/40">
                 {ATTEMPT_COLUMNS.map((c) => (
-                  <td key={c.label} className={`${cell(c.align)} break-all`}>{c.render(a)}</td>
+                  <td key={c.label} title={c.title?.(a)} className={`${cell(c.align)} ${c.breakable ? 'break-all' : 'whitespace-nowrap'}`}>{c.render(a)}</td>
                 ))}
               </tr>
             ))}
@@ -336,7 +354,7 @@ function SpendAttemptsPanel({ slug, episodeId }: { slug: string; episodeId: stri
             {ATTEMPT_COLUMNS.map((c) => (
               <div key={c.label} className="flex justify-between gap-2">
                 <dt className="text-muted-foreground shrink-0">{c.label}</dt>
-                <dd className={`break-all ${c.align === 'right' ? 'tabular-nums' : ''}`}>{c.render(a)}</dd>
+                <dd title={c.title?.(a)} className={`break-all ${c.align === 'right' ? 'tabular-nums' : ''}`}>{c.render(a) || '-'}</dd>
               </div>
             ))}
           </dl>
@@ -760,9 +778,13 @@ export default function StatsPage() {
     queryKey: ['stats-llm', systemOneParams],
     queryFn: () => getLlmStats(systemOneParams),
   });
+  const llmHit = llmStats
+    ? cacheHit(llmStats.tokens.cacheRead, llmStats.tokens.cacheWrite, llmStats.tokens.input)
+    : { text: '' };
   const llmTokenDetails = !llmStats ? undefined : !llmStats.requests
     ? 'No recorded requests'
     : [
+      llmHit.text ? `${llmHit.text} cache hit` : null,
       llmStats.tokens.cacheRead > 0 ? `${formatTokenCount(llmStats.tokens.cacheRead)} cache read` : null,
       llmStats.tokens.cacheWrite > 0 ? `${formatTokenCount(llmStats.tokens.cacheWrite)} cache write` : null,
       llmStats.tokens.reasoning > 0 ? `${formatTokenCount(llmStats.tokens.reasoning)} reasoning` : null,

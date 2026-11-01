@@ -34,6 +34,7 @@ def run_stats_to_api(stats):
         'cueOnly': stats.get('cue_only'),
         'transcriptionSkipped': stats.get('transcription_skipped'),
         'normalizationSkipped': stats.get('normalization_skipped'),
+        'audioAnalysisSkipped': stats.get('audio_analysis_skipped'),
         'downloadedDuration': stats.get('downloaded_duration'),
         'transcriptSegments': stats.get('transcript_segments'),
         'windows': stats.get('windows'),
@@ -57,6 +58,7 @@ def run_stats_to_api(stats):
         'replacementSecondsAdded': stats.get('replacement_seconds_added'),
         'timings': {
             'downloadSeconds': timings.get('download'),
+            'sponsorblockSeconds': timings.get('sponsorblock'),
             'transcriptionSeconds': timings.get('transcription'),
             'transcriptDiffSeconds': timings.get('transcript_diff'),
             'differentialSeconds': timings.get('differential'),
@@ -146,10 +148,13 @@ def processing_runs(db, episode, run_totals=None):
         if phases and totals:
             input_tokens = totals['input_tokens']
             output_tokens = totals['output_tokens']
+            cache_read = totals['cache_read_tokens']
+            cache_write = totals['cache_write_tokens']
             llm_cost = round(float(totals['cost_usd']), 6)
         else:
             input_tokens = row.get('input_tokens') or 0
             output_tokens = row.get('output_tokens') or 0
+            cache_read = cache_write = 0
             llm_cost = round(row.get('llm_cost') or 0.0, 6)
         runs.append({
             'runNumber': row.get('reprocess_number'),
@@ -161,6 +166,8 @@ def processing_runs(db, episode, run_totals=None):
             'errorMessage': row.get('error_message'),
             'inputTokens': input_tokens,
             'outputTokens': output_tokens,
+            'cacheReadTokens': cache_read,
+            'cacheWriteTokens': cache_write,
             'llmCost': llm_cost,
             'hasLog': bool(row.get('log_file')),
             'stats': run_stats_to_api(stats),

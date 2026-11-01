@@ -9,15 +9,19 @@ import { cardTitle, subHeading } from '../../components/pageStyles';
 import Checkbox from '../../components/Checkbox';
 import LoadingSpinner from '../../components/LoadingSpinner';
 import ImportPreviewTable from '../../components/ImportPreviewTable';
-import { getErrorMessage } from '../../api/client';
+import { ApiError, getErrorMessage } from '../../api/client';
+import { formatStorage } from '../settings/settingsUtils';
+import { getSettings } from '../../api/settings';
 import {
-  updateFeed, uploadFeedArtwork, uploadLocalEpisode,
+  updateFeed, uploadLocalEpisode,
   importUpload, importScan, importCommit, importStatus, clearImportStaging,
 } from '../../api/feeds';
 import type { UpdateFeedPayload, ImportPlan, ImportSource, ImportRejectedFile } from '../../api/feeds';
 import type { Feed } from '../../api/types';
 import { btnBase, btnGhost, btnLg, btnPrimary, btnSecondary, btnOutline } from '../../components/buttonStyles';
 import { fileInputBase, inputBase, labelBase, selectBase, textareaBase } from '../../components/fieldStyles';
+import FeedArtworkUpload from './FeedArtworkUpload';
+import { FeedMetadataFields, parseCategories } from './FeedMetadataForm';
 import { useSyncFromQuery } from '../../hooks/useSyncFromQuery';
 import { fromDatetimeLocalInput } from '../../utils/format';
 
@@ -196,6 +200,29 @@ function cleanP20Rows(rows: P20Row[]): P20Row[] {
     .filter((row) => Object.keys(row).length > 0);
 }
 
+const DEFAULT_UPLOAD_MAX_MB = 1024;
+
+// Shares the Settings page cache key so the limit is not fetched twice.
+function useUploadMaxMb(): number {
+  const { data } = useQuery({ queryKey: ['settings'], queryFn: getSettings });
+  return data?.localUploadMaxMb?.value ?? DEFAULT_UPLOAD_MAX_MB;
+}
+
+// A 413 without our maxUploadMb body came from a proxy, not MinusPod.
+function uploadErrorMessage(err: unknown): string {
+  const msg = getErrorMessage(err, 'Could not upload files.');
+  const body = err instanceof ApiError ? (err.body as { maxUploadMb?: unknown } | null) : null;
+  if (err instanceof ApiError && err.status === 413 && body?.maxUploadMb === undefined) {
+    return `${msg} Cloudflare caps uploads at 100 MB on most plans.`;
+  }
+  return msg;
+}
+
+function oversizeMessage(label: string, bytes: number, uploadMaxMb: number): string | null {
+  if (bytes <= uploadMaxMb * 1024 * 1024) return null;
+  return `${label} is ${formatStorage(bytes / (1024 * 1024))}. This server accepts up to ${formatStorage(uploadMaxMb)} per upload.`;
+}
+
 // Counts only entries that will actually overwrite an existing episode on
 // commit (replacesExisting AND no errors -- a collision that errored out
 // instead, because overwrite was off when this was scanned, never commits
@@ -218,6 +245,7 @@ interface Props {
 
 function LocalFeedPanel({ feed, slug }: Props) {
   const queryClient = useQueryClient();
+  const uploadMaxMb = useUploadMaxMb();
   // Open by default: for a local feed this panel is the primary management
   // UI (there's no source RSS to fall back on), unlike the drill-down panels
   // below it that default closed.
@@ -298,16 +326,9 @@ function LocalFeedPanel({ feed, slug }: Props) {
     },
   });
 
-  const artworkMutation = useMutation({
-    mutationFn: (file: File) => uploadFeedArtwork(slug, file),
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['feed', slug] });
-    },
-  });
-
   const handleSaveMetadata = (e: React.FormEvent) => {
     e.preventDefault();
-    const categories = categoriesInput.split(',').map((c) => c.trim()).filter(Boolean);
+    const categories = parseCategories(categoriesInput);
 
     // Clean every tag's rows and check each def's client-side requirements
     // (presence, shape, row count) before this ever reaches the API --
@@ -398,11 +419,16 @@ function LocalFeedPanel({ feed, slug }: Props) {
     for (let i = 0; i < files.length; i++) {
       setUploadProgress({ current: i + 1, total: files.length });
       const file = files[i];
+      const tooLarge = oversizeMessage(file.name, file.size, uploadMaxMb);
+      if (tooLarge) {
+        rejected.push({ file: file.name, reason: tooLarge });
+        continue;
+      }
       try {
         const result = await importUpload(slug, [file]);
         rejected.push(...result.rejected);
       } catch (e) {
-        rejected.push({ file: file.name, reason: getErrorMessage(e, 'Could not upload files.') });
+        rejected.push({ file: file.name, reason: uploadErrorMessage(e) });
       }
     }
     return rejected;
@@ -438,7 +464,7 @@ function LocalFeedPanel({ feed, slug }: Props) {
       setPlan(scanned);
       setImportSource('staging');
     },
-    onError: (e) => setImportError(getErrorMessage(e, 'Could not upload files.')),
+    onError: (e) => setImportError(uploadErrorMessage(e)),
     onSettled: () => setUploadProgress(null),
   });
 
@@ -574,55 +600,19 @@ function LocalFeedPanel({ feed, slug }: Props) {
         <form onSubmit={handleSaveMetadata} className="space-y-4 mb-6">
           <fieldset disabled={metaMutation.isPending} className="space-y-4">
           <h3 className={subHeading}>Feed metadata</h3>
-          <div>
-            <label htmlFor={`local-title-${slug}`} className={labelBase}>Title</label>
-            <input
-              id={`local-title-${slug}`}
-              type="text"
-              value={title}
-              onChange={(e) => setTitle(e.target.value)}
-              required
-              className={`w-full ${inputBase}`}
-            />
-          </div>
-          <div>
-            <label htmlFor={`local-description-${slug}`} className={labelBase}>Description</label>
-            <textarea
-              id={`local-description-${slug}`}
-              value={description}
-              onChange={(e) => setDescription(e.target.value)}
-              rows={6}
-              className={`w-full ${textareaBase}`}
-            />
-          </div>
-          <div>
-            <label htmlFor={`local-author-${slug}`} className={labelBase}>Author</label>
-            <input
-              id={`local-author-${slug}`}
-              type="text"
-              value={author}
-              onChange={(e) => setAuthor(e.target.value)}
-              className={`w-full ${inputBase}`}
-            />
-          </div>
-          <Checkbox
-            checked={explicit}
-            onChange={setExplicit}
-            label="Explicit content"
+          <FeedMetadataFields
+            slug={slug}
+            idPrefix="local"
+            fields={['title', 'description', 'author', 'explicit', 'categories']}
+            values={{ title, description, author, explicit, categoriesInput }}
+            onChange={(patch) => {
+              if (patch.title !== undefined) setTitle(patch.title);
+              if (patch.description !== undefined) setDescription(patch.description);
+              if (patch.author !== undefined) setAuthor(patch.author);
+              if (patch.explicit !== undefined) setExplicit(patch.explicit);
+              if (patch.categoriesInput !== undefined) setCategoriesInput(patch.categoriesInput);
+            }}
           />
-          <div>
-            <label htmlFor={`local-categories-${slug}`} className={labelBase}>Categories</label>
-            <input
-              id={`local-categories-${slug}`}
-              type="text"
-              value={categoriesInput}
-              onChange={(e) => setCategoriesInput(e.target.value)}
-              placeholder="Technology, Business"
-              className={`w-full ${inputBase}`}
-              aria-describedby={`local-categories-${slug}` + '-help'}
-            />
-            <p id={`local-categories-${slug}` + '-help'} className="mt-1 text-sm text-muted-foreground">Comma-separated, e.g. Technology, Business</p>
-          </div>
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
             <div>
               <label htmlFor={`local-medium-${slug}`} className={labelBase}>Medium</label>
@@ -659,25 +649,7 @@ function LocalFeedPanel({ feed, slug }: Props) {
               />
             </div>
           </div>
-          <div>
-            <label htmlFor={`local-artwork-${slug}`} className={labelBase}>Artwork</label>
-            <input
-              id={`local-artwork-${slug}`}
-              type="file"
-              accept="image/jpeg,image/png"
-              onChange={(e) => {
-                const file = e.target.files?.[0];
-                e.target.value = '';
-                if (file) artworkMutation.mutate(file);
-              }}
-              className={fileInputBase}
-            />
-            {artworkMutation.isPending && <p className="mt-1 text-sm text-muted-foreground">Uploading...</p>}
-            {artworkMutation.isSuccess && <p className="mt-1 text-sm text-success">Artwork updated.</p>}
-            {artworkMutation.isError && (
-              <p className="mt-1 text-sm text-destructive">{getErrorMessage(artworkMutation.error, 'Could not upload artwork.')}</p>
-            )}
-          </div>
+          <FeedArtworkUpload slug={slug} />
 
           <CollapsibleSection
             title="Podcasting 2.0 tags"
@@ -781,6 +753,7 @@ function LocalFeedPanel({ feed, slug }: Props) {
               </span>
             )}
           </div>
+          <p className="mb-3 text-xs text-muted-foreground">Up to {uploadMaxMb} MB per file</p>
 
           <div className="mb-3">
             <Checkbox
@@ -1048,6 +1021,7 @@ interface AddEpisodeModalProps {
 
 function AddEpisodeModal({ slug, onClose }: AddEpisodeModalProps) {
   const queryClient = useQueryClient();
+  const uploadMaxMb = useUploadMaxMb();
   const [audioFile, setAudioFile] = useState<File | null>(null);
   const [title, setTitle] = useState('');
   const [season, setSeason] = useState('');
@@ -1080,9 +1054,16 @@ function AddEpisodeModal({ slug, onClose }: AddEpisodeModalProps) {
     !!(audioFile || title || season || episode || publishedAt || description || artworkFile), onClose, mutation.isPending,
   );
 
+  // The route caps the whole multipart request, so audio and artwork count together.
+  const uploadBytes = (audioFile?.size ?? 0) + (artworkFile?.size ?? 0);
+  const sizeError = audioFile
+    ? oversizeMessage(artworkFile ? `${audioFile.name} with artwork` : audioFile.name, uploadBytes, uploadMaxMb)
+    : null;
+
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
-    if (audioFile) mutation.mutate();
+    if (!audioFile || sizeError) return;
+    mutation.mutate();
   };
 
   return (
@@ -1106,7 +1087,7 @@ function AddEpisodeModal({ slug, onClose }: AddEpisodeModalProps) {
           <button
             type="submit"
             form="add-episode-form"
-            disabled={mutation.isPending || !audioFile}
+            disabled={mutation.isPending || !audioFile || !!sizeError}
             className={`${dialogFooterBtn} ${btnPrimary}`}
           >
             {mutation.isPending ? 'Uploading...' : 'Add episode'}
@@ -1125,6 +1106,7 @@ function AddEpisodeModal({ slug, onClose }: AddEpisodeModalProps) {
             onChange={(e) => setAudioFile(e.target.files?.[0] ?? null)}
             className={fileInputBase}
           />
+          <p className="mt-1 text-sm text-muted-foreground">Up to {uploadMaxMb} MB per upload</p>
         </div>
         <div>
           <label htmlFor="add-ep-title" className={labelBase}>Title</label>
@@ -1188,8 +1170,9 @@ function AddEpisodeModal({ slug, onClose }: AddEpisodeModalProps) {
             className={fileInputBase}
           />
         </div>
-        {mutation.isError && (
-          <p role="alert" className="text-sm text-destructive">{getErrorMessage(mutation.error, 'Could not upload files.')}</p>
+        {sizeError && <p role="alert" className="text-sm text-destructive">{sizeError}</p>}
+        {!sizeError && mutation.isError && (
+          <p role="alert" className="text-sm text-destructive">{uploadErrorMessage(mutation.error)}</p>
         )}
       </form>
       {confirmation}

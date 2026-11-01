@@ -11,6 +11,7 @@ from api import (
     get_database,
 )
 from config import (
+    PRICING_OVERRIDE_OPTIONAL, PRICING_OVERRIDE_REQUIRED,
     ALLOWED_AUDIO_BITRATES, ALLOWED_AUDIO_ENCODER_COMPRESSION_LEVELS, AD_DETECTION_PARALLEL_WINDOWS_MIN,
     AD_DETECTION_PARALLEL_WINDOWS_MAX,
     AD_REVIEWER_PARALLEL_ADS_MIN,
@@ -21,6 +22,7 @@ from config import (
     apply_ad_chapter_compat, MAX_AD_DURATION, MAX_AD_DURATION_CONFIRMED,
     MAX_ARTWORK_BYTES_MIN, MAX_ARTWORK_BYTES_MAX, MAX_RSS_BYTES_MIN,
     MAX_AUDIO_DOWNLOAD_MB_MIN,
+    LOCAL_UPLOAD_MAX_MB_MIN, LOCAL_UPLOAD_MAX_MB_MAX,
     PODCAST_SEARCH_PROVIDERS,
     SEGMENT_CATEGORIES, SEGMENT_ACTIONS,
     LOW_AD_YIELD_ACTIONS,
@@ -43,7 +45,7 @@ from database.settings import (
 from user_agent import invalidate_cache as invalidate_user_agent_cache
 from rate_limit_hold import clear_holds_for_provider_change
 from llm_client import (
-    get_effective_provider, get_llm_client,
+    get_effective_provider,
 )
 from llm_route import (
     VALID_SLOTS, SAME_AS_PASS,
@@ -474,15 +476,17 @@ def _model_pricing_patch(submitted):
             continue
         if not isinstance(rates, Mapping):
             return None, (f'modelPricingOverrides.{model_id} must be an object or null', 400)
-        required = {'inputCostPerMtok', 'outputCostPerMtok'}
-        if set(rates) != required:
+        if not PRICING_OVERRIDE_REQUIRED <= set(rates) <= (
+                PRICING_OVERRIDE_REQUIRED | PRICING_OVERRIDE_OPTIONAL):
             return None, (
                 f'modelPricingOverrides.{model_id} must contain inputCostPerMtok '
-                'and outputCostPerMtok', 400)
+                'and outputCostPerMtok, and may contain cacheReadCostPerMtok', 400)
 
         parsed = {}
-        for field in required:
+        for field in rates:
             value = rates[field]
+            if value is None and field in PRICING_OVERRIDE_OPTIONAL:
+                continue
             if isinstance(value, bool) or not isinstance(value, (int, float)):
                 return None, (
                     f'modelPricingOverrides.{model_id}.{field} must be a '
@@ -524,6 +528,8 @@ def _size_cap_writes(data):
         ('maxArtworkBytes', 'max_artwork_bytes', MAX_ARTWORK_BYTES_MIN, MAX_ARTWORK_BYTES_MAX),
         ('maxRssBytes', 'max_rss_bytes', MAX_RSS_BYTES_MIN, None),
         ('maxAudioDownloadMb', 'max_audio_download_mb', MAX_AUDIO_DOWNLOAD_MB_MIN, None),
+        ('localUploadMaxMb', 'local_upload_max_mb',
+         LOCAL_UPLOAD_MAX_MB_MIN, LOCAL_UPLOAD_MAX_MB_MAX),
     )
     writes = []
     for payload_key, db_key, floor, ceiling in caps:
@@ -811,8 +817,7 @@ def _apply_processing_flags(db, data):
     if 'llmJsonSchemaEnabled' in data:
         value = 'true' if data['llmJsonSchemaEnabled'] else 'false'
         db.set_setting('llm_json_schema_enabled', value, is_default=False)
-        # Re-probe on the next endpoint verification now that the opt-in
-        # changed.
+        # The opt-in changed, so both slots need fresh probe answers.
         provider_phases._clear_format_probes(db)
         logger.info(f"Updated llm_json_schema_enabled to: {value}")
     return None
@@ -1800,12 +1805,8 @@ def reset_ad_detection_settings():
 
     for key in AD_RESET_SETTING_KEYS:
         db.reset_setting(key)
-    provider_phases._clear_format_probes(db)
 
-    # Recreate LLM client with reset settings
-    client = get_llm_client(force_new=True)
-    if hasattr(client, 'probe_json_format_support'):
-        client.probe_json_format_support()
+    provider_phases._forget_endpoint_state(db)
 
     provider_phases._mark_whisper_for_reload()
 

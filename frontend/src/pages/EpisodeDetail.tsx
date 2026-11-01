@@ -1,4 +1,5 @@
 import { pageTitle } from '../components/pageStyles';
+import { reprocessMenuCopy } from '../utils/reprocessMenu';
 import { useState, useRef, useMemo } from 'react';
 import { ChevronDown, Pencil, Plus } from 'lucide-react';
 import { useParams, Link } from 'react-router';
@@ -19,8 +20,12 @@ import { SkeletonPageHeader, SkeletonRows } from '../components/Skeleton';
 import Artwork from '../components/Artwork';
 import { episodeArtworkSrc } from '../utils/artworkUrl';
 import { isFailedStatus } from '../utils/episodeStatus';
+import { sponsorBlockLabel, sponsorBlockSubmitLabel } from '../utils/sponsorBlock';
+import { getYouTubeSettings } from '../api/youtube';
 import StatusBadge from '../components/StatusBadge';
 import CloseButton from '../components/CloseButton';
+import EpisodeRating from '../components/EpisodeRating';
+import SponsorBlockSubmit from '../components/SponsorBlockSubmit';
 import { DETECTION_STAGE_META } from '../utils/detectionStage';
 import { CORROBORATION_CLASS, CORROBORATION_META } from '../utils/corroboration';
 import { formatConfidence } from '../utils/confidence';
@@ -49,6 +54,7 @@ import { iconTarget, iconVisual, rowActionBtn } from '../components/rowActionSty
 import { StageBadge } from '../components/StageBadge';
 import ProcessingRunsTable from '../components/ProcessingRunsTable';
 import CostAmount from '../components/CostAmount';
+import EpisodePlayer from '../components/EpisodePlayer';
 import EpisodeLogsCard from '../components/EpisodeLogsCard';
 import { btnBase, btnDestructive, btnLg, btnPrimary, btnSecondary, touchCompact } from '../components/buttonStyles';
 import DropdownMenu, { type DropdownMenuItem } from '../components/DropdownMenu';
@@ -82,6 +88,7 @@ const WINDOW_LOSS_LABELS: Record<string, string> = {
   reasoning_exhausted: 'reasoning budget exhausted',
   output_truncated: 'output cut off at max tokens',
   empty_completion: 'empty reply',
+  context_overflow: 'prompt cut off by Ollama num_ctx',
   other: 'other error',
 };
 
@@ -415,6 +422,11 @@ function EpisodeDetail() {
     queryFn: () => getFeed(slug!),
     enabled: !!slug,
   });
+  const { data: ytSettings } = useQuery({
+    queryKey: ['youtubeSettings'],
+    queryFn: getYouTubeSettings,
+    enabled: feed?.feedType === 'youtube',
+  });
   const { data: settings, isPending: chapterSettingsPending, error: chapterSettingsError, refetch: reloadChapterSettings } = useQuery({
     queryKey: ['settings'],
     queryFn: getSettings,
@@ -742,6 +754,19 @@ function EpisodeDetail() {
   const markerAudition = useAuditionPlayer(
     episode?.hasOriginalAudio ? markerAudioUrl : undefined);
 
+  const description = episode?.description;
+  const chapterNotes = episode?.chapterNotes;
+  const descriptionBlock = useMemo(() => {
+    if (!description?.trim() && !chapterNotes?.trim()) return null;
+    // One block each: RichText collapses whitespace between block tags.
+    return (
+      <ExpandableText className="mt-4 text-muted-foreground" toggleText={{ more: 'Show more', less: 'Show less' }}>
+        {description?.trim() && <RichText html={description} className="block wrap-break-word" />}
+        {chapterNotes?.trim() && <RichText html={chapterNotes} className="mt-4 block wrap-break-word" />}
+      </ExpandableText>
+    );
+  }, [description, chapterNotes]);
+
   if (isLoading) {
     return (
       <div>
@@ -916,6 +941,11 @@ function EpisodeDetail() {
     </div>
   );
 
+  const sbLabel = sponsorBlockLabel(
+    episode.sponsorBlock,
+    ytSettings ? (feed?.ytProbeAttemptsOverride ?? ytSettings.sbProbeAttempts) : undefined,
+  );
+  const sbSubmitLabel = sponsorBlockSubmitLabel(episode.sponsorBlock);
   const failureReason =
     isFailedStatus(episode.status) && episode.error ? episode.error : undefined;
 
@@ -936,9 +966,10 @@ function EpisodeDetail() {
   const redetectDisabled = REDETECT_DISABLED_MODES.has(feed?.processingMode);
   const chaptersRegenerating = regenerateChaptersMutation.isPending
     || !!episode.chaptersRegenerating;
+  const menuCopy = reprocessMenuCopy(feed?.feedType);
   const redetectTooltip = feed?.processingMode && redetectDisabled
     ? `Ad detection is off because this feed runs in ${REDETECT_DISABLED_MODE_LABELS[feed.processingMode]} mode`
-    : 'Re-run ad detection and re-cut using the existing transcript (skips re-transcription)';
+    : menuCopy.redetect.tooltip;
 
   // "Process" vs "Reprocess" is keyed on hasBeenProcessed (processedAt as a
   // pre-field fallback), not status: status cycles back to pending/processing
@@ -1038,32 +1069,41 @@ function EpisodeDetail() {
       )}
 
       <div className="bg-card rounded-lg border border-border p-4 sm:p-6 mb-6">
-        <div className="flex gap-4">
-          <div className="w-16 h-16 sm:w-24 sm:h-24 shrink-0">
+        <div className="grid grid-cols-[4rem_minmax(0,1fr)] sm:grid-cols-[6rem_minmax(0,1fr)] sm:grid-rows-[auto_1fr] gap-x-4 gap-y-2">
+          <div className="w-16 h-16 sm:w-24 sm:h-24 shrink-0 sm:row-span-2">
             <Artwork
               src={episodeArtworkSrc(slug!, episode.id, episode.artworkUrl, feed?.artworkUrl)}
               alt="Podcast artwork"
               className="w-full h-full object-cover rounded-lg"
             />
           </div>
-          <div className="flex flex-col gap-2 min-w-0">
-            <h1 className={pageTitle}>{episode.title}</h1>
-            <div className="flex flex-wrap items-center gap-2 sm:gap-4 text-sm text-muted-foreground">
-              <span>{formatDate(episode.published)}</span>
+          <h1 className={`${pageTitle} min-w-0`}>{episode.title}</h1>
+          <div className="col-span-2 sm:col-span-1 sm:col-start-2 flex flex-col gap-2 min-w-0 text-sm text-muted-foreground">
+            <div className="flex flex-nowrap items-center gap-2 max-[360px]:gap-1 max-[360px]:text-xs sm:gap-4">
+              <span className="shrink-0">{formatDate(episode.published)}</span>
               {episode.status === 'completed' && episode.newDuration ? (
-                <span>{formatDuration(episode.newDuration)}</span>
+                <span className="shrink-0">{formatDuration(episode.newDuration)}</span>
               ) : episode.duration ? (
-                <span>{formatDuration(episode.duration)}</span>
+                <span className="shrink-0">{formatDuration(episode.duration)}</span>
               ) : null}
-              {episode.fileSize && (
-                <span>{formatFileSize(episode.fileSize)}</span>
-              )}
               <StatusBadge
                 status={episode.status}
                 jobState={episode.jobState}
-                className={failureReason ? 'cursor-help' : undefined}
+                className={`shrink-0 max-[360px]:px-1.5 ${failureReason ? 'cursor-help' : ''}`.trim()}
                 title={failureReason}
               />
+              {episode.chaptersAvailable && (
+                <span className={`${badgeBase} ${tint.purple} shrink-0 max-[360px]:px-1.5`}>
+                  Chapters
+                </span>
+              )}
+            </div>
+            <div className="flex flex-wrap items-center gap-2 sm:gap-4 empty:hidden">
+              {episode.fileSize && (
+                <span>{formatFileSize(episode.fileSize)}</span>
+              )}
+              {sbLabel && <span className="text-xs text-muted-foreground">{sbLabel}</span>}
+              {sbSubmitLabel && <span className="text-xs text-muted-foreground">{sbSubmitLabel}</span>}
               {episode.passthroughEnabled && (
                 <span
                   className={`${badgeBase} ${tint.neutral} cursor-help`}
@@ -1091,11 +1131,6 @@ function EpisodeDetail() {
               {episode.transcriptVttAvailable && (
                 <span className={`${badgeBase} ${tint.blue}`}>
                   VTT
-                </span>
-              )}
-              {episode.chaptersAvailable && (
-                <span className={`${badgeBase} ${tint.purple}`}>
-                  Chapters
                 </span>
               )}
               {episode.daiDifferential && (
@@ -1146,10 +1181,12 @@ function EpisodeDetail() {
                   title="Every run this episode has had"
                 />
               )}
+            </div>
+            <div className="flex flex-nowrap items-center gap-2">
               {downloadItems.length > 0 && (
                 <DropdownMenu
                   triggerLabel="Download"
-                  triggerClassName={`${btnBase} ${btnSecondary}`}
+                  triggerClassName={`${btnBase} ${btnSecondary} shrink-0`}
                   chevronClassName="w-3 h-3"
                   title="Download audio"
                   items={downloadItems}
@@ -1157,23 +1194,23 @@ function EpisodeDetail() {
               )}
               <DropdownMenu
                 triggerLabel={reprocessTriggerLabel}
-                triggerClassName={`${btnBase} ${btnPrimary}`}
+                triggerClassName={`${btnBase} ${btnPrimary} shrink-0`}
                 chevronClassName="w-3 h-3"
                 disabled={reprocessBlocked}
                 title={reprocessTriggerTooltip}
                 items={[
-                  { title: reprocessLabel, subtitle: 'Use patterns + AI',
-                    tooltip: 'Use learned patterns + AI analysis',
+                  { title: reprocessLabel, subtitle: menuCopy.reprocess.subtitle,
+                    tooltip: menuCopy.reprocess.tooltip,
                     onClick: () => handleReprocess('reprocess') },
-                  { title: 'Full reprocess', subtitle: 'Skip patterns, AI only',
-                    tooltip: 'Skip pattern DB, AI analyzes everything fresh',
+                  { title: 'Full reprocess', subtitle: menuCopy.full.subtitle,
+                    tooltip: menuCopy.full.tooltip,
                     onClick: () => handleReprocess('full') },
                   ...(episode.hasOriginalAudio ? [{
                     title: 'Recut audio', subtitle: 'Apply edits, no AI',
                     tooltip: 'Re-cut the original audio from your current ad edits (no transcription or AI)',
                     onClick: () => handleReprocess('recut') }] : []),
                   ...(episode.transcriptAvailable ? [{
-                    title: 'Re-detect ads', subtitle: 'Keep transcript, re-cut',
+                    title: 'Re-detect ads', subtitle: menuCopy.redetect.subtitle,
                     disabled: redetectDisabled,
                     tooltip: redetectTooltip,
                     onClick: () => handleReprocess('llm') }] : []),
@@ -1298,9 +1335,10 @@ function EpisodeDetail() {
           <div className="mt-4 pt-4 border-t border-border">
             {/* processedUrl is server-built and carries the feed auth key when
                 enabled; a hardcoded path would 401 under authenticated feeds. */}
-            <audio controls className="w-full" src={episode.processedUrl ?? `/episodes/${slug}/${episode.id}.mp3`}>
-              Your browser does not support the audio element.
-            </audio>
+            <EpisodePlayer
+              src={episode.processedUrl ?? `/episodes/${slug}/${episode.id}.mp3`}
+              chaptersUrl={episode.chaptersAvailable ? episode.chaptersUrl : undefined}
+            />
             {(episode.transcriptVttAvailable || episode.chaptersAvailable) && (
               <div className="flex flex-wrap gap-2 mt-3">
                 {episode.transcriptVttAvailable && episode.transcriptVttUrl && (
@@ -1341,28 +1379,14 @@ function EpisodeDetail() {
         {episode.status !== 'completed' && !episode.processedAt
           && feed?.feedType === 'local' && episode.hasOriginalAudio && (
           <div className="mt-4 pt-4 border-t border-border">
-            <audio controls className="w-full" src={markerAudioUrl}>
-              Your browser does not support the audio element.
-            </audio>
+            <EpisodePlayer src={markerAudioUrl} />
             <p className="mt-2 text-xs text-muted-foreground">
               Original audio; ad removal hasn&apos;t run yet.
             </p>
           </div>
         )}
 
-        {/* One block each: RichText collapses whitespace between block tags. */}
-        {episode.description?.trim() && (
-          <RichText
-            html={episode.description}
-            className="mt-4 block text-muted-foreground wrap-break-word"
-          />
-        )}
-        {episode.chapterNotes?.trim() && (
-          <RichText
-            html={episode.chapterNotes}
-            className="mt-4 block text-muted-foreground wrap-break-word"
-          />
-        )}
+        {descriptionBlock}
       </div>
 
       {feed?.feedType === 'local' && slug && episodeId && (
@@ -1537,6 +1561,17 @@ function EpisodeDetail() {
               );
             })}
           </div>
+        </div>
+      )}
+
+      {episode.status === 'completed' && slug && episodeId && (
+        <div className="bg-card rounded-lg border border-border p-6 mb-6 space-y-4">
+          <EpisodeRating slug={slug} episodeId={episodeId} rating={episode.rating} />
+          {episode.sponsorBlock?.submitAllowed && (
+            <div className="pt-4 border-t border-border">
+              <SponsorBlockSubmit slug={slug} episodeId={episodeId} hasOriginalAudio={episode.hasOriginalAudio} />
+            </div>
+          )}
         </div>
       )}
 

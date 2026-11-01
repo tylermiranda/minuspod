@@ -160,6 +160,7 @@ from .prompts import (
     CATEGORY_REPAIR_JSON_SCHEMA,
     CATEGORY_REPAIR_MAX_TOKENS,
     AD_DETECTION_JSON_SCHEMA,
+    ad_detection_json_schema,
     format_category_repair_prompt,
     log_assembled_system_prompt,
     parse_category_repair_response,
@@ -756,6 +757,7 @@ def _pattern_match_evidence(match, kind: str) -> str:
 
 
 _SPONSOR_MATCH_STAGES = ('fingerprint', 'text_pattern')
+LEARNABLE_STAGES = frozenset({'claude', 'sponsorblock'})
 
 
 def _known_sponsor_matchers(ads: list[dict],
@@ -1199,6 +1201,7 @@ class AdDetector:
         Never includes spans or timestamps (pass 1 stays blind to stage 2)."""
         if not podcast_slug:
             return ""
+        self._ensure_deps()
         try:
             patterns = self.db.get_ad_patterns(podcast_id=podcast_slug)
             sponsor_categories = self.db.get_sponsor_segment_categories()
@@ -1260,12 +1263,14 @@ class AdDetector:
         return ads
 
     def _call_llm_for_window(self, *, model, system_prompt, prompt, llm_timeout,
-                              max_retries, slug, episode_id, window_label, pass_name):
+                              max_retries, slug, episode_id, window_label, pass_name,
+                              response_schema=AD_DETECTION_JSON_SCHEMA):
         """Thin wrapper over utils.llm_call.call_llm_for_window with per-stage tunables.
 
         ``pass_name`` selects which config keys (DETECTION_* vs VERIFICATION_*) supply
         the temperature/max_tokens/reasoning values, and is forwarded to the LLM
-        client for per-pass fallback flag scoping.
+        client for per-pass fallback flag scoping. ``response_schema`` is sent
+        only where schema output is enabled; json_object mode ignores it.
         """
         phase = _phase_for_pass(pass_name)
         live = live_route_params(phase, model, llm_timeout, max_retries)
@@ -1293,7 +1298,7 @@ class AdDetector:
             credential_slot=credential_slot,
             stage_tunable_prefix=phase,
             response_format=schema_format_for(
-                model, 'ad_detection', AD_DETECTION_JSON_SCHEMA,
+                model, 'ad_detection', response_schema,
                 'Ad segments detected in this window.', provider=provider),
         )
 
@@ -1366,6 +1371,7 @@ class AdDetector:
             slug=slug, episode_id=episode_id,
             window_label=window_label,
             pass_name=pass_name,
+            response_schema=ad_detection_json_schema(addressing_mode),
         )
         if response is None:
             logger.error(
@@ -2586,7 +2592,8 @@ class AdDetector:
         _check_cancel(cancel_event, slug, episode_id)
 
         # Stage 3: Claude API for remaining content
-        logger.info(f"[{slug}:{episode_id}] Stage 3: Claude API detection")
+        logger.info(f"[{slug}:{episode_id}] Stage 3: "
+                    f"{'LLM detection skipped' if skip_llm else 'Claude API detection'}")
 
         # Keep-content (whitelist) mode -- opt-in per feed. Label the show
         # content and remove the complement. If the content pass produces
@@ -2884,7 +2891,7 @@ class AdDetector:
         """Apply basic eligibility filters before sponsor resolution.
 
         Returns True if the ad should proceed to sponsor extraction.
-        Filters: was_cut, detection_stage == 'claude', confidence floor,
+        Filters: was_cut, detection_stage in LEARNABLE_STAGES, confidence floor,
         and stricter confidence for long (>90s) detections.
         """
         # Learn from removed ads, or a keep/mark-action marker: it still
@@ -2897,8 +2904,11 @@ class AdDetector:
         if ad.get('_skip_pattern_learning'):
             return False
 
-        # Only learn from Claude detections (not fingerprint/text pattern)
-        if ad.get('detection_stage') != 'claude':
+        # A category label names no sponsor, so a text pattern from it is always rejected.
+        if ad.get('label_sponsor'):
+            return False
+
+        if ad.get('detection_stage') not in LEARNABLE_STAGES:
             return False
 
         # Require high confidence
@@ -2932,9 +2942,9 @@ class AdDetector:
 
     @staticmethod
     def _learning_candidates(ad: dict, min_piece_s: float) -> list[dict]:
-        """The marker itself when claude found it, else the stretches of its claude members no pattern explains."""
+        """The marker itself when a learnable stage found it, else the stretches of its claude members no pattern explains."""
         stage = ad.get('detection_stage')
-        if stage == 'claude':
+        if stage in LEARNABLE_STAGES:
             return [ad]
         members = recorded_member_spans(ad)
         if not members:

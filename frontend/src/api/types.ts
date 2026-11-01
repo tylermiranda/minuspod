@@ -29,7 +29,19 @@ export interface Feed {
   // Local (imported-archive) feeds have no upstream RSS: subscribed is the
   // default for feeds pulled from a source URL. Absent on backends that
   // predate local feeds, which read as 'subscribed'.
-  feedType?: 'subscribed' | 'local' | 'recents';
+  feedType?: 'subscribed' | 'local' | 'recents' | 'youtube';
+  youtubeSourceKind?: 'playlist' | 'channel' | 'video' | null;
+  youtubeSourceId?: string | null;
+  youtubeSourceUrl?: string | null;
+  youtubeIncludeShorts?: boolean | null;
+  ytProcessDelayMinutesOverride?: number | null;
+  ytProbeAttemptsOverride?: number | null;
+  ytProbeIntervalMinutesOverride?: number | null;
+  ytLlmFallbackOverride?: boolean | null;
+  ytLlmOnTopOverride?: boolean | null;
+  ytCaptionsOverride?: boolean | null;
+  ytHidePrivateOverride?: boolean | null;
+  ytTranscribeOverride?: boolean | null;
   description?: string;
   artworkUrl?: string;
   // Explicit "do we hold an uploaded file" signal (artworkUrl is never
@@ -47,6 +59,8 @@ export interface Feed {
   // backend's p20_channel_json.
   p20?: Record<string, unknown>;
   episodeCount: number;
+  ratingAverage?: number | null;
+  ratingCount?: number;
   processedCount?: number;
   statusCounts?: EpisodeStatusCounts;
   lastRefreshed?: string;
@@ -253,6 +267,50 @@ export interface Episode {
   // no transcription/detection/LLM, even when the feed itself is not in
   // pass-through mode.
   passthroughEnabled?: boolean | null;
+  sponsorBlock?: {
+    state: 'waiting' | 'probing' | 'watching' | 'done' | 'exhausted' | 'llm' | null;
+    attempts: number;
+    nextCheckAt: string | null;
+    segmentCount: number;
+    note: string | null;
+    lastError: string | null;
+    submissions?: SbSubmission[];
+    submitAllowed?: boolean;
+  } | null;
+  rating?: EpisodeRating | null;
+}
+
+export interface EpisodeRating {
+  value: 1 | 2 | 3 | 4 | 5;
+  notes: string | null;
+  ratedAt: string;
+}
+
+export interface SbCandidate {
+  start: number;
+  end: number;
+  category: string;
+  sbCategory: string;
+  evidence: string[];
+  submission: SbSubmission | null;
+}
+
+export type SbCandidatesReason = 'not_youtube' | 'disabled' | 'no_user_id' | 'community_marks' | 'no_video_id' | 'marks_unverified' | 'not_completed' | 'service_down';
+
+export interface SbCandidatesResponse {
+  allowed: boolean;
+  reason: SbCandidatesReason | null;
+  segments: SbCandidate[];
+}
+
+export interface SbSubmission {
+  start: number;
+  end: number;
+  category: string;
+  status: 'submitted' | 'duplicate' | 'rejected' | 'rate_limited' | 'error';
+  uuid?: string | null;
+  at: string;
+  detail?: string;
 }
 
 export interface EpisodeNeighbor {
@@ -294,7 +352,7 @@ export interface UpstreamTranscript {
 
 // Windows the latest run lost in one pass, and what they were lost to
 // (rate_limit, server_error, connectivity, reasoning_exhausted,
-// output_truncated, empty_completion, other).
+// output_truncated, empty_completion, context_overflow, other).
 export interface CoverageGap {
   failed: number;
   total: number | null;
@@ -442,6 +500,8 @@ export interface ProcessingRunStats {
   transcriptionSkipped?: boolean;
   // Explicitly records that normalization was disabled for this run.
   normalizationSkipped?: boolean;
+  // SponsorBlock-only run: marks are cut as given, so audio analysis did not run.
+  audioAnalysisSkipped?: boolean;
   downloadedDuration?: number | null;
   transcriptSegments?: number;
   // failureClasses is absent when no window was lost; see CoverageGap for the
@@ -478,6 +538,7 @@ export interface ProcessingRunTimings {
   // Stage values may overlap. FFmpeg is the combined elapsed time for all
   // FFmpeg tasks in the run, including retries. Finalize ends before history.
   downloadSeconds?: number | null;
+  sponsorblockSeconds?: number | null;
   transcriptionSeconds?: number | null;
   transcriptDiffSeconds?: number | null;
   differentialSeconds?: number | null;
@@ -522,6 +583,8 @@ export interface EpisodeProcessingRun {
   errorMessage: string | null;
   inputTokens: number;
   outputTokens: number;
+  cacheReadTokens?: number;
+  cacheWriteTokens?: number;
   llmCost: number;
   // True when this run stored a pipeline log the run-log endpoint can serve.
   hasLog?: boolean;
@@ -681,6 +744,7 @@ export interface SettingValueNumberOrNull {
 export interface ModelPricingOverride {
   inputCostPerMtok: number;
   outputCostPerMtok: number;
+  cacheReadCostPerMtok?: number | null;
 }
 
 export type ModelPricingOverrides = Record<string, ModelPricingOverride>;
@@ -895,6 +959,7 @@ export interface Settings {
   maxArtworkBytes: SettingValueNumber;
   maxRssBytes: SettingValueNumber;
   maxAudioDownloadMb: SettingValueNumber;
+  localUploadMaxMb: SettingValueNumber;
   adDetectionParallelWindows: SettingValueNumber;
   adReviewerParallelAds: SettingValueNumber;
   transcribeMaxChunkSeconds: SettingValueNumber;
@@ -1020,6 +1085,8 @@ export interface Settings {
   modelPricingOverrides: { value: ModelPricingOverrides; isDefault: boolean };
   apiKeyConfigured: boolean;
   podcastIndexApiKeyConfigured: boolean;
+  youtubeEnabled: SettingValueBoolean;
+  youtubeApiKeyConfigured: boolean;
   podcastSearchProvider: SettingValue;
   // Whether podcastSearchProvider's resolved value can actually run search.
   podcastSearchReady: boolean;
@@ -1093,6 +1160,7 @@ export interface Settings {
     maxArtworkBytes: number;
     maxRssBytes: number;
     maxAudioDownloadMb: number;
+    localUploadMaxMb: number;
     providerRequestsPerMin: number;
     providerRequestsPerDay: number;
     secondaryProviderRequestsPerMin: number;
@@ -1227,6 +1295,7 @@ export interface UpdateSettingsPayload {
   maxArtworkBytes?: number;
   maxRssBytes?: number;
   maxAudioDownloadMb?: number;
+  localUploadMaxMb?: number;
   adDetectionParallelWindows?: number;
   adReviewerParallelAds?: number;
   transcribeMaxChunkSeconds?: number;
@@ -1419,6 +1488,7 @@ export interface ClaudeModel {
   name: string;
   inputCostPerMtok?: number;
   outputCostPerMtok?: number;
+  cacheReadCostPerMtok?: number | null;
   pricingSource?: string;
 }
 
@@ -1776,13 +1846,15 @@ export interface ModelUsageStat {
   distinctEpisodes: number;
   inputTokens: number;
   outputTokens: number;
+  cacheReadTokens: number;
+  cacheWriteTokens: number;
   knownCostUsd: string;
   unknownCostCount: number;
 }
 
 export type ModelUsageSortField =
   | 'provider' | 'model' | 'calls' | 'distinctEpisodes'
-  | 'inputTokens' | 'outputTokens' | 'knownCostUsd' | 'unknownCostCount';
+  | 'inputTokens' | 'outputTokens' | 'knownCostUsd' | 'unknownCostCount' | 'cacheHitRate';
 
 export interface ModelUsageResponse {
   items: ModelUsageStat[];
@@ -1920,6 +1992,8 @@ export interface SpendAttempt {
   status: 'success' | 'failure' | 'inconclusive';
   inputTokens: number | null;
   outputTokens: number | null;
+  cacheReadTokens: number | null;
+  cacheWriteTokens: number | null;
   costUsd: string | null;
   costSource: string | null;
   createdAt: string;

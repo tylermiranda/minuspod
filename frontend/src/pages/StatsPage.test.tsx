@@ -299,6 +299,7 @@ describe('StatsPage LLM cost ledger', () => {
     items: [{
       provider: 'anthropic', model: 'claude-sonnet', calls: 12, distinctEpisodes: 5,
       inputTokens: 40000, outputTokens: 8000, knownCostUsd: '1.234500', unknownCostCount: 0,
+      cacheReadTokens: 30000, cacheWriteTokens: 2000,
     }],
     total: 40, totalPages: 2, page: 1, limit: 20,
   };
@@ -312,6 +313,36 @@ describe('StatsPage LLM cost ledger', () => {
     }],
     total: 1, totalPages: 1, page: 1, limit: 20,
   };
+
+  it('shows the cache hit rate per model with the raw counts on hover', async () => {
+    mockGetModelUsageStats.mockReset();
+    mockGetModelUsageStats.mockResolvedValue(MODEL_USAGE_PAGE);
+    renderPage();
+    // Desktop table and mobile card both mount; each carries the hover title.
+    const cells = [...await screen.findAllByText('75%'), await screen.findByText('Cache hit 75%')];
+    expect(cells).toHaveLength(2);
+    cells.forEach((c) => expect((c.closest('[title]') as HTMLElement).title).toContain('30.0K read'));
+  });
+
+  it('shows the three cache rows in the model usage detail panel', async () => {
+    renderPage();
+    const [open] = await screen.findAllByRole('button', { name: 'Show usage detail for anthropic claude-sonnet' });
+    fireEvent.click(open);
+    const dl = (await screen.findAllByText('Cache hit rate'))[0].closest('dl') as HTMLElement;
+    const d = within(dl);
+    expect(d.getByText('Cache read').nextElementSibling?.textContent).toBe('30.0K');
+    expect(d.getByText('Cache write').nextElementSibling?.textContent).toBe('2.0K');
+    expect(d.getByText('Cache hit rate').nextElementSibling?.textContent).toBe('75%');
+  });
+
+  it('adds the cache hit rate to the LLM token hint', async () => {
+    mockGetLlmStats.mockResolvedValue({
+      ...LLM_STATS, calls: 1, requests: 1,
+      tokens: { ...LLM_STATS.tokens, input: 40000, cacheRead: 30000, cacheWrite: 2000 },
+    });
+    renderPage();
+    expect(await screen.findByText(/75% cache hit/)).toBeTruthy();
+  });
 
   function lastMainListParams() {
     const calls = mockGetModelUsageStats.mock.calls;
@@ -422,6 +453,7 @@ describe('StatsPage ledger: incomplete cost display', () => {
     items: [{
       provider: 'openrouter', model: 'llama-3', calls: 12, distinctEpisodes: 5,
       inputTokens: 40000, outputTokens: 8000, knownCostUsd: '1.234500', unknownCostCount: 3,
+      cacheReadTokens: 0, cacheWriteTokens: 0,
     }],
     total: 1, totalPages: 1, page: 1, limit: 20,
   };
@@ -856,6 +888,7 @@ describe('StatsPage spend section: copy, labels and table chrome', () => {
       items: [{
         provider: 'anthropic', model: 'claude-sonnet', calls: 12, distinctEpisodes: 5,
         inputTokens: 40000, outputTokens: 8000, knownCostUsd: '1.234500', unknownCostCount: 0,
+        cacheReadTokens: 0, cacheWriteTokens: 0,
       }],
       total: 40, totalPages: 2, page: 1, limit: 20,
     });
@@ -887,6 +920,7 @@ describe('StatsPage spend section: copy, labels and table chrome', () => {
 const MODEL_USAGE_ROW = {
   provider: 'anthropic', model: 'claude-sonnet', calls: 12, distinctEpisodes: 3,
   inputTokens: 1000, outputTokens: 200, knownCostUsd: '1.25', unknownCostCount: 2,
+  cacheReadTokens: 0, cacheWriteTokens: 0,
 };
 const EPISODE_COST_ROW = {
   podcastSlug: 'a-show', podcastTitle: 'A Show', episodeId: 'ep1', episodeTitle: 'Episode One',
@@ -986,14 +1020,14 @@ describe('StatsPage with populated spend data', () => {
         {
           attemptId: 'a1', phase: 'detection', invokingPass: 1, provider: 'anthropic',
           credentialSlot: 'primary', model: 'claude-sonnet', returnedModel: null,
-          status: 'success', inputTokens: 900, outputTokens: 100, costUsd: '1.25',
+          status: 'success', inputTokens: 900, outputTokens: 100, cacheReadTokens: 450, cacheWriteTokens: 0, costUsd: '1.25',
           costSource: 'catalog', createdAt: '2026-09-01T10:00:00Z',
           finalizedAt: '2026-09-01T10:00:05Z',
         },
         {
           attemptId: 'a2', phase: 'review', invokingPass: 1, provider: 'anthropic',
           credentialSlot: 'primary', model: 'claude-haiku', returnedModel: null,
-          status: 'inconclusive', inputTokens: 100, outputTokens: 100, costUsd: null,
+          status: 'inconclusive', inputTokens: 100, outputTokens: 100, cacheReadTokens: null, cacheWriteTokens: null, costUsd: null,
           costSource: null, createdAt: '2026-09-01T10:01:00Z',
           finalizedAt: '2026-09-01T10:01:02Z',
         },
@@ -1012,5 +1046,15 @@ describe('StatsPage with populated spend data', () => {
     expect(screen.getAllByText('Unknown').length).toBeGreaterThan(0);
     expect(screen.getAllByText('Abstained').length).toBeGreaterThan(0);
     expect(screen.getAllByText(/1 of 2 calls have no recorded price/).length).toBeGreaterThan(0);
+    const scroller = screen.getAllByRole('region', { name: 'Contributing calls; scroll for more columns' })[0];
+    expect(scroller.tabIndex).toBe(0);
+    const panel = within(screen.getAllByRole('table', { name: 'Contributing calls' })[0]);
+    expect(panel.getByRole('columnheader', { name: 'Cache hit' })).toBeTruthy();
+    const hit = panel.getByText('50%');
+    expect(hit.getAttribute('title')).toBe('450 read, 0 write of 900 input');
+    const blank = panel.getAllByRole('row')[2].querySelector('td:nth-child(6)') as HTMLElement;
+    expect(blank.textContent).toBe('-');
+    expect(blank.getAttribute('title')).toBeNull();
+    expect(screen.getAllByText('-').length).toBeGreaterThan(0);
   });
 });

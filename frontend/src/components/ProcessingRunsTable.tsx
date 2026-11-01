@@ -1,8 +1,8 @@
 import { Fragment, ReactNode, useState } from 'react';
 import { ChevronDown, ChevronRight } from 'lucide-react';
 import { EpisodeProcessingRun, LLM_PROVIDER_LABELS, LlmProvider, RunPhaseUsage } from '../api/types';
-import { formatCost, formatDateTime, formatElapsed, formatPercent, sentenceCase } from '../utils/format';
-import { formatTokenCount, formatTokenRange } from '../pages/settings/settingsUtils';
+import { cacheHit, formatCost, formatDateTime, formatElapsed, formatPercent, formatTokenCount, sentenceCase } from '../utils/format';
+import { formatTokenRange } from '../pages/settings/settingsUtils';
 import DisclosureButton from './DisclosureButton';
 import CopyButton from './CopyButton';
 import CostAmount from './CostAmount';
@@ -22,6 +22,7 @@ const RSS_DELTA_NOTE_SECONDS = 120;
 
 const TIMING_STAGES = [
   ['downloadSeconds', 'Download'],
+  ['sponsorblockSeconds', 'SponsorBlock lookup'],
   ['transcriptionSeconds', 'Transcription'],
   ['transcriptDiffSeconds', 'Transcript diff'],
   ['differentialSeconds', 'Differential'],
@@ -121,6 +122,7 @@ function timingValue(run: EpisodeProcessingRun, key: typeof TIMING_STAGES[number
   if ((key === 'detectionSeconds' || key === 'verificationSeconds') && run.stats?.cueOnly) {
     return 'Not applicable';
   }
+  if (key === 'audioAnalysisSeconds' && run.stats?.audioAnalysisSkipped) return 'Skipped';
   if (key === 'normalizationSeconds' && run.stats?.normalizationSkipped === true) {
     return 'Skipped';
   }
@@ -134,6 +136,9 @@ function TimingBreakdown({ run }: { run: EpisodeProcessingRun }) {
   if (!run.stats?.timings) {
     return <p className="mt-3 border-t border-border/40 pt-2 text-xs text-muted-foreground">Timing unavailable for this run</p>;
   }
+  const stages = TIMING_STAGES.filter(
+    ([key]) => key !== 'sponsorblockSeconds' || run.stats?.timings?.sponsorblockSeconds != null,
+  );
   return (
     <div className="mt-3 w-full border-t border-border/40 pt-2 sm:w-[calc(100cqw-1.5rem)]">
       <h4 className="text-xs font-medium text-muted-foreground">Elapsed by stage</h4>
@@ -141,7 +146,7 @@ function TimingBreakdown({ run }: { run: EpisodeProcessingRun }) {
         Stage times may overlap. FFmpeg totals include all tasks and retries.
       </p>
       <dl className="mt-2 grid grid-cols-1 gap-x-6 gap-y-1 text-xs tabular-nums sm:grid-cols-2 lg:grid-cols-3">
-        {TIMING_STAGES.map(([key, label]) => (
+        {stages.map(([key, label]) => (
           <div key={key} className="flex justify-between gap-3">
             <dt className="text-muted-foreground">{label}</dt>
             <dd className="text-right">{timingValue(run, key)}</dd>
@@ -343,9 +348,9 @@ function PhaseBreakdown({ run, layout }: { run: EpisodeProcessingRun; layout: 't
     { label: 'Model', align: 'left', render: (p) => p.returnedModel ?? p.configuredModel, title: modelTitle },
     { label: 'Input', align: 'right', render: (p) => formatTokenCount(p.inputTokens) },
     { label: 'Output', align: 'right', render: (p) => formatTokenCount(p.outputTokens) },
-    ...(hasCache ? [{ label: 'Cache', align: 'right' as const, render: (p: RunPhaseUsage) => (
-      p.cacheReadTokens || p.cacheWriteTokens
-        ? `${formatTokenCount(p.cacheReadTokens)} r / ${formatTokenCount(p.cacheWriteTokens)} w` : '-') }] : []),
+    ...(hasCache ? [{ label: 'Cache hit', align: 'right' as const,
+      render: (p: RunPhaseUsage) => cacheHit(p.cacheReadTokens, p.cacheWriteTokens, p.inputTokens).text || '-',
+      title: (p: RunPhaseUsage) => cacheHit(p.cacheReadTokens, p.cacheWriteTokens, p.inputTokens).title }] : []),
     ...(hasReasoning ? [{ label: 'Reasoning', align: 'right' as const,
       render: (p: RunPhaseUsage) => (p.reasoningTokens ? formatTokenCount(p.reasoningTokens) : '-') }] : []),
     { label: 'Cost', align: 'right', render: (p) => (p.costUsd == null ? 'Unknown' : formatCost(parseFloat(p.costUsd))) },

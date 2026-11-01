@@ -24,6 +24,8 @@ https://github.com/user-attachments/assets/1c3800e7-5fb0-402b-b42f-89ae6140f45f
 
 Select Anthropic and save an API key under Settings > AI & Processing. Each stage can use its own model. MinusPod chooses a tool-call format that the selected model supports. Models that reject forced tool calls use automatic tool choice with a strict schema. A response without the requested tool result follows the normal bounded retry policy; its token usage still counts.
 
+Temperature is not sent to Anthropic. API version 2026-10-21 removed the parameter on every model, so Anthropic stages run at the model default.
+
 ### Reasoning settings
 
 Under LLM Tunables, use **Reasoning budget** for models that accept manual thinking budgets, such as Claude 4.5 and 4.6. Use **Reasoning effort** for adaptive-only models, including Opus 4.7, Opus 4.8, and Claude 5 models. MinusPod sends the applicable setting for the model assigned to each stage. Both values persist when switching models or providers.
@@ -34,7 +36,7 @@ Leave effort blank to use the configured default; without an environment default
 
 MinusPod requests a 5-minute cache for static Anthropic system prompts. Transcript snippets and other per-call messages remain outside that cache boundary. Caching is automatic; there is no setting to enable it. Short prompts may not meet the provider's minimum cache size, and a changed prompt or expired cache causes a miss. See [Anthropic's prompt caching guide](https://platform.claude.com/docs/en/build-with-claude/prompt-caching).
 
-Input token totals include cache reads and writes. Processing history reports these counts separately as subsets of input tokens. For direct Anthropic calls, estimated cost uses the model's cache-read discount and the 5-minute cache-write rate. A provider-reported cost takes precedence; calls without known pricing remain unpriced.
+Input token totals include cache reads and writes. Processing history reports these counts separately as subsets of input tokens. For direct Anthropic calls, estimated cost uses the model's cache-read discount and the 5-minute cache-write rate. For OpenAI-compatible and OpenRouter calls, cached input tokens bill at the model's cache read rate when the pricing catalog or an operator override supplies one, and at the full input rate otherwise. The Stats page shows the resulting cache hit rate (cache reads over input tokens) per model, per run and per contributing call. A provider-reported cost takes precedence; calls without known pricing remain unpriced.
 
 ## Using Claude Code Wrapper (Max Subscription)
 
@@ -318,7 +320,7 @@ MinusPod tracks token usage and cost for every LLM call. The Settings page and `
 
 ### Custom model pricing
 
-Settings > AI & Processing > AI Models shows pricing fields for configured routes, including enabled standby and supported manual chapter and Cleanup models. Enter input and output rates in USD per 1 million tokens. An operator override wins over catalog pricing and appears as `pricingSource: "operator"`. Leave both fields blank to use the catalog. Save both as `0` to mark a model explicitly free; missing pricing is different.
+Settings > AI & Processing > AI Models shows pricing fields for configured routes, including enabled standby and supported manual chapter and Cleanup models. Enter input and output rates in USD per 1 million tokens. A third optional field sets the cached input rate; leave it blank to bill cached input at the input rate. An operator override wins over catalog pricing and appears as `pricingSource: "operator"`. Leave both fields blank to use the catalog. Save both as `0` to mark a model explicitly free; missing pricing is different.
 
 Inactive prices stay saved and reappear when those models are selected again. Recorded call costs stay unchanged.
 
@@ -336,6 +338,8 @@ Pricing is fetched automatically based on your configured provider:
 | System One compatible | Operator pricing override | Unknown unless configured |
 
 Pricing refreshes once every 24 hours in the background. You can also force a refresh with `POST /api/v1/system/model-pricing/refresh`, or view current rates with `GET /api/v1/system/model-pricing`; see [API](api-and-webhooks.md#api).
+
+The OpenRouter API and the LiteLLM fallback also publish a cache read rate for some models. When the primary source has no cache rate for a model, the chain fills it from a later source. An operator override can set it as `cacheReadCostPerMtok`.
 
 ### How model matching works
 

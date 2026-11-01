@@ -116,7 +116,7 @@ function AIModelsSection({
           </div>
         )}
 
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-3">
           <StageProviderSelect
             id="detectionProvider"
             label="Ad detection provider"
@@ -124,6 +124,7 @@ function AIModelsSection({
             options={detectionOptions}
             onChange={onDetectionProviderChange}
             secondaryEnabled={secondaryProviderEnabled}
+            aligned
           />
           <ModelSelect
             id="model"
@@ -132,10 +133,11 @@ function AIModelsSection({
             catalog={detectionCatalog}
             onChange={onSelectedModelChange}
             description="Model used to analyze transcripts and detect ads."
+            aligned
           />
         </div>
 
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-3">
           <StageProviderSelect
             id="verificationProvider"
             label="Verification provider"
@@ -143,6 +145,7 @@ function AIModelsSection({
             options={inheritedOptions}
             onChange={onVerificationProviderChange}
             secondaryEnabled={secondaryProviderEnabled}
+            aligned
           />
           <ModelSelect
             id="verificationModel"
@@ -151,10 +154,11 @@ function AIModelsSection({
             catalog={verificationCatalog}
             onChange={onVerificationModelChange}
             description="Re-runs detection on processed audio to catch missed ads (can differ for cost optimization)"
+            aligned
           />
         </div>
 
-        <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-x-3">
           <StageProviderSelect
             id="chaptersProvider"
             label="Chapters provider"
@@ -162,6 +166,7 @@ function AIModelsSection({
             options={inheritedOptions}
             onChange={onChaptersProviderChange}
             secondaryEnabled={secondaryProviderEnabled}
+            aligned
           />
           <ModelSelect
             id="chaptersModel"
@@ -170,6 +175,7 @@ function AIModelsSection({
             catalog={chaptersCatalog}
             onChange={onChaptersModelChange}
             description="Chapter title generation and topic detection (smaller/cheaper models work well)"
+            aligned
           />
         </div>
 
@@ -178,7 +184,7 @@ function AIModelsSection({
             <div>
               <h4 className={subHeading}>Custom pricing</h4>
               <p className="mt-1 text-sm text-muted-foreground">
-                Set USD prices per 1 million tokens when the catalog price is missing or wrong. Leave both fields blank to use the catalog. Enter 0 for a free model.
+                Set USD prices per 1 million tokens when the catalog price is missing or wrong. Leave input and output blank to use the catalog. The cached input price is optional. Enter 0 for a free model.
               </p>
             </div>
             {configuredModelIds.map((modelId, index) => {
@@ -209,6 +215,33 @@ function formatUsdRate(value: number): string {
   }).format(value);
 }
 
+function RateField({ id, label, value, onChange, disabled, describedBy }: {
+  id: string;
+  label: string;
+  value: string;
+  onChange: (value: string) => void;
+  disabled: boolean;
+  describedBy?: string;
+}) {
+  return (
+    <div className="grid grid-rows-subgrid row-span-2 gap-y-0 min-w-0">
+      <label htmlFor={id} className={labelBase}>{label}</label>
+      <input
+        id={id}
+        disabled={disabled}
+        aria-describedby={describedBy}
+        type="number"
+        min="0"
+        step="any"
+        inputMode="decimal"
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+        className={`${inputBase} w-full`}
+      />
+    </div>
+  );
+}
+
 function ModelPricingFields({
   fieldId,
   modelId,
@@ -226,25 +259,35 @@ function ModelPricingFields({
 }) {
   const savedInput = override === undefined ? '' : String(override.inputCostPerMtok);
   const savedOutput = override === undefined ? '' : String(override.outputCostPerMtok);
+  const savedCache = override?.cacheReadCostPerMtok == null ? '' : String(override.cacheReadCostPerMtok);
   const inputDraft = useDraftField(savedInput, (value) => value);
   const outputDraft = useDraftField(savedOutput, (value) => value);
+  const cacheDraft = useDraftField(savedCache, (value) => value);
   const { value: inputRate, setValue: setInputRate } = inputDraft;
   const { value: outputRate, setValue: setOutputRate } = outputDraft;
+  const { value: cacheRate, setValue: setCacheRate } = cacheDraft;
   const [message, setMessage] = useState<string | null>(null);
 
-  const isDirty = inputRate !== savedInput || outputRate !== savedOutput;
+  const isDirty = inputRate !== savedInput || outputRate !== savedOutput || cacheRate !== savedCache;
   useUnsavedChanges(isDirty);
   const commit = async () => {
     setMessage(null);
-    const bothBlank = inputRate.trim() === '' && outputRate.trim() === '';
-    if ((inputRate.trim() === '') !== (outputRate.trim() === '')) {
+    const blank = { input: inputRate.trim() === '', output: outputRate.trim() === '', cache: cacheRate.trim() === '' };
+    const bothBlank = blank.input && blank.output;
+    if (blank.input !== blank.output) {
       setMessage('Enter both prices, or leave both blank.');
       return;
     }
+    if (bothBlank && !blank.cache) {
+      setMessage('Enter input and output prices before a cached input price.');
+      return;
+    }
+    const hasCache = !blank.cache;
     const input = Number(inputRate);
     const output = Number(outputRate);
-    if (!bothBlank && (!Number.isFinite(input) || !Number.isFinite(output)
-      || input < 0 || output < 0)) {
+    const cache = Number(cacheRate);
+    const invalid = (blankField: boolean, n: number) => !blankField && (!Number.isFinite(n) || n < 0);
+    if (invalid(blank.input, input) || invalid(blank.output, output) || invalid(blank.cache, cache)) {
       setMessage('Prices must be non-negative numbers.');
       return;
     }
@@ -252,14 +295,22 @@ function ModelPricingFields({
       await onUpdate(modelId, bothBlank ? null : {
         inputCostPerMtok: input,
         outputCostPerMtok: output,
+        ...(hasCache && { cacheReadCostPerMtok: cache }),
       });
       inputDraft.markClean(bothBlank ? '' : String(input));
       outputDraft.markClean(bothBlank ? '' : String(output));
+      cacheDraft.markClean(bothBlank || !hasCache ? '' : String(cache));
       setMessage(bothBlank ? 'Using catalog pricing.' : 'Custom pricing saved.');
     } catch (error) {
       setMessage(error instanceof Error ? error.message : 'Could not save custom pricing.');
     }
   };
+
+  const rateFields = [
+    { key: 'input', label: 'Input', value: inputRate, setValue: setInputRate },
+    { key: 'output', label: 'Output', value: outputRate, setValue: setOutputRate },
+    { key: 'cache', label: 'Cached input', value: cacheRate, setValue: setCacheRate },
+  ];
 
   const catalogAvailable = catalogModel?.inputCostPerMtok != null
     && catalogModel.outputCostPerMtok != null
@@ -268,41 +319,19 @@ function ModelPricingFields({
   return (
     <fieldset className="space-y-3">
       <legend className="font-mono text-sm text-foreground break-all">{modelId}</legend>
-      <div className="grid gap-3 sm:grid-cols-2">
-        <div>
-          <label htmlFor={`${fieldId}-input`} className={labelBase}>
-            Input, USD per 1 million tokens
-          </label>
-          <input
-            id={`${fieldId}-input`}
+      <p className="text-sm text-muted-foreground">USD per 1 million tokens</p>
+      <div className="grid grid-cols-3 gap-x-3">
+        {rateFields.map(({ key, label, value, setValue }) => (
+          <RateField
+            key={key}
+            id={`${fieldId}-${key}`}
+            label={label}
+            value={value}
+            onChange={(next) => { setValue(next); setMessage(null); }}
             disabled={saving}
-            aria-describedby={message ? `${fieldId}-result` : undefined}
-            type="number"
-            min="0"
-            step="any"
-            inputMode="decimal"
-            value={inputRate}
-            onChange={(event) => { setInputRate(event.target.value); setMessage(null); }}
-            className={`${inputBase} w-full`}
+            describedBy={message ? `${fieldId}-result` : undefined}
           />
-        </div>
-        <div>
-          <label htmlFor={`${fieldId}-output`} className={labelBase}>
-            Output, USD per 1 million tokens
-          </label>
-          <input
-            id={`${fieldId}-output`}
-            disabled={saving}
-            aria-describedby={message ? `${fieldId}-result` : undefined}
-            type="number"
-            min="0"
-            step="any"
-            inputMode="decimal"
-            value={outputRate}
-            onChange={(event) => { setOutputRate(event.target.value); setMessage(null); }}
-            className={`${inputBase} w-full`}
-          />
-        </div>
+        ))}
       </div>
       <div className="flex flex-wrap items-center gap-3">
         <button
@@ -315,7 +344,7 @@ function ModelPricingFields({
         </button>
         {catalogAvailable && (
           <span className="text-xs text-muted-foreground">
-            Catalog: {formatUsdRate(catalogModel.inputCostPerMtok!)} input, {formatUsdRate(catalogModel.outputCostPerMtok!)} output
+            Catalog: {formatUsdRate(catalogModel.inputCostPerMtok!)} input, {formatUsdRate(catalogModel.outputCostPerMtok!)} output{typeof catalogModel.cacheReadCostPerMtok === 'number' && `, ${formatUsdRate(catalogModel.cacheReadCostPerMtok)} cached input`}
           </span>
         )}
       </div>

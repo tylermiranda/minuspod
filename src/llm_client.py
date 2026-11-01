@@ -106,6 +106,7 @@ _JSON_SCHEMA_SETTING_KEY = 'llm_json_schema_supported'
 # verify uses force_new clients, so without this memo an always-inconclusive
 # endpoint would be probed again on every verification (~5 min cadence).
 _SCHEMA_PROBE_ATTEMPTED: set[tuple[str, str]] = set()
+_schema_probe_lock = threading.Lock()
 
 # Both probe results are a JSON {model: bool} map, keyed by model rather than
 # endpoint (#693): one URL can serve models that differ, and one model's 400
@@ -391,12 +392,21 @@ def _omit_temperature_override() -> bool:
     return coerce_bool_setting(_get_cached_setting('omit_temperature'))
 
 
-def supports_json_schema_for_calls(model: str | None = None) -> bool:
-    """Return the configured schema-probe result for the active OpenAI endpoint."""
-    if get_effective_provider() != PROVIDER_OPENAI_COMPATIBLE:
+def supports_json_schema_for_calls(model: str | None = None, provider: str | None = None) -> bool:
+    """Return whether JSON calls on the routed (else global) provider send json_schema.
+
+    OpenAI-compatible endpoints need the operator opt-in and a passing probe.
+    Ollama needs only the opt-in: its native client sends the schema as the
+    /api/chat ``format``, which constrains decoding to it, while plain json
+    mode leaves the model to pick the array's key itself.
+    """
+    provider = provider or get_effective_provider()
+    if provider not in (PROVIDER_OPENAI_COMPATIBLE, PROVIDER_OLLAMA):
         return False
     if not coerce_bool_setting(_get_cached_setting('llm_json_schema_enabled')):
         return False
+    if provider == PROVIDER_OLLAMA:
+        return True
     return _format_flag_for(_JSON_SCHEMA_SETTING_KEY, model) is True
 
 
@@ -703,6 +713,11 @@ class LLMClient(ABC):
         # Which account this client authenticates as; part of the model-list
         # cache identity so two accounts on one endpoint never share a list.
         self.credential_slot = 'primary'
+        # Provider type this client was built for. A stage routed to Provider
+        # B may differ from the global provider, and request shapes such as
+        # the reasoning field must follow the provider actually called. None
+        # for clients built outside the factory, which use the global provider.
+        self.provider_key: str | None = None
         # Provider-config revision this client was built on; a mismatch at
         # acquire time rebuilds it so a rotated credential is never reused.
         self._config_revision = None
@@ -799,12 +814,11 @@ class LLMClient(ABC):
         try:
             return send_fn(eff_max, eff_temp, eff_reasoning), eff_max, eff_temp, eff_reasoning
         except Exception as e:
-            if is_temperature_rejection_error(e):
-                # The model rejects temperature outright (Anthropic's
-                # adaptive-thinking generation); a default-temperature retry
-                # would 400 identically. Self-heal: mark_model_omits_temperature()
-                # makes model_omits_temperature() return True for `model` from
-                # now on, so re-invoking send_fn here picks that up immediately.
+            # Only proxy routes send temperature; the native Anthropic client never does.
+            if provider != PROVIDER_ANTHROPIC and is_temperature_rejection_error(e):
+                # A proxy route to a model that rejects temperature: a default-temperature
+                # retry would 400 identically. mark_model_omits_temperature() makes the
+                # immediate re-send (and every later call) omit it.
                 _log_temperature_omission(provider_label, episode_id, pass_name, model, e)
                 mark_model_omits_temperature(model)
                 _record_extra_dispatch()
@@ -1198,14 +1212,10 @@ class AnthropicClient(LLMClient):
                 "cache_control": {"type": "ephemeral", "ttl": "5m"},
             }]
 
-        # Operator override (settings.omit_temperature) takes priority over
-        # the static list / learned memo; see model_omits_temperature().
-        omit_temp_override = _omit_temperature_override()
+        self._log_messages("Anthropic", effective_system, messages, model, None, eff_max)
 
-        self._log_messages("Anthropic", effective_system, messages, model,
-                           None if model_omits_temperature(model, omit_temp_override) else eff_temp, eff_max)
-
-        def _send(tok, tmp, reasoning):
+        # _tmp is dropped: API version 2026-10-21 removed temperature on every model.
+        def _send(tok, _tmp, reasoning):
             kw = dict(
                 model=model,
                 max_tokens=tok,
@@ -1213,14 +1223,6 @@ class AnthropicClient(LLMClient):
                 messages=messages,
                 timeout=timeout,
             )
-            # Anthropic's adaptive-thinking models reject temperature with a 400.
-            # Re-consulted on every call (not hoisted) so a retry after
-            # mark_model_omits_temperature() picks up the freshly-learned state.
-            # anthropic>=1.0 dropped temperature from messages.create's
-            # signature, so it goes on the wire via extra_body; the API-side
-            # 400 for no-sampling models is unchanged.
-            if not model_omits_temperature(model, omit_temp_override):
-                kw["extra_body"] = {"temperature": tmp}
             reasoning_kwargs = translate_reasoning_effort(
                 PROVIDER_ANTHROPIC, reasoning, model)
             kw.update(reasoning_kwargs)
@@ -1368,6 +1370,48 @@ class OllamaNativeChatError(Exception):
         self.response = response
 
 
+class OllamaContextOverflowError(Exception):
+    """Ollama cut a prompt longer than num_ctx down to about num_ctx/2,
+    dropping its start (system prompt and instructions included), and answered
+    anyway (#893). Terminal: the same prompt overflows again. Carries the
+    response so the ledger can still record the tokens Ollama evaluated."""
+
+    def __init__(self, message: str, *, num_ctx: int, prompt_tokens: int,
+                 estimated_tokens: int, response=None):
+        super().__init__(message)
+        self.num_ctx = num_ctx
+        self.prompt_tokens = prompt_tokens
+        self.estimated_tokens = estimated_tokens
+        self.response = response
+
+
+# Ollama truncates an overflowing prompt to num_ctx/2 plus a few kept tokens
+# (limit=8195 at 16384, 4098 at 8192); this band absorbs the kept tokens.
+OLLAMA_OVERFLOW_BAND_TOKENS = 64
+# The reported count must also sit well below the prompt's own size estimate,
+# so a prompt that is genuinely about num_ctx/2 long is not flagged.
+OLLAMA_OVERFLOW_ESTIMATE_RATIO = 1.5
+# Rough chars-per-token for the prompt size estimate.
+OLLAMA_PROMPT_CHARS_PER_TOKEN = 4
+
+
+def estimate_prompt_tokens(messages: list[dict]) -> int:
+    """Rough token estimate for a chat prompt, from its character count."""
+    chars = 0
+    for message in messages:
+        content = message.get('content')
+        chars += len(content if isinstance(content, str) else str(content or ''))
+    return chars // OLLAMA_PROMPT_CHARS_PER_TOKEN
+
+
+def ollama_prompt_was_truncated(prompt_tokens, num_ctx, estimated_tokens) -> bool:
+    """True when Ollama's prompt_eval_count shows it cut the prompt to num_ctx/2."""
+    if not isinstance(prompt_tokens, int) or not num_ctx:
+        return False
+    return (abs(prompt_tokens - num_ctx // 2) <= OLLAMA_OVERFLOW_BAND_TOKENS
+            and estimated_tokens >= prompt_tokens * OLLAMA_OVERFLOW_ESTIMATE_RATIO)
+
+
 class OpenAICompatibleClient(LLMClient):
     """OpenAI-compatible API client.
 
@@ -1469,8 +1513,10 @@ class OpenAICompatibleClient(LLMClient):
         token_param = cached_param or "max_completion_tokens"
 
         # Provider detection picks the right reasoning shape (OpenRouter vs
-        # OpenAI-native vs Ollama). get_effective_provider() reads DB+env.
-        active_provider = get_effective_provider()
+        # OpenAI-native vs Ollama). Use the provider this client was built
+        # for: the global provider (get_effective_provider() reads DB+env)
+        # can be another type when this stage is routed to Provider B.
+        active_provider = self.provider_key or get_effective_provider()
 
         def _build_kwargs(tok, tmp, reasoning):
             kw = {
@@ -1854,10 +1900,12 @@ class OpenAICompatibleClient(LLMClient):
             if self._get_json_schema_supported(model) is not None:
                 continue
             key = (self.base_url, model)
-            if key in _SCHEMA_PROBE_ATTEMPTED:
-                continue
-            _SCHEMA_PROBE_ATTEMPTED.add(key)
-            self.probe_json_schema_support(model=model)
+            # Both slots may verify at once; one probe per endpoint and model.
+            with _schema_probe_lock:
+                first = key not in _SCHEMA_PROBE_ATTEMPTED
+                _SCHEMA_PROBE_ATTEMPTED.add(key)
+            if first:
+                self.probe_json_schema_support(model=model)
 
     @staticmethod
     def _configured_models(fallback_model: str) -> list[str]:
@@ -1909,6 +1957,11 @@ class OllamaNativeClient(OpenAICompatibleClient):
     def __init__(self, *, ollama_num_ctx: int, **kwargs):
         super().__init__(**kwargs)
         self._ollama_num_ctx = ollama_num_ctx
+
+    def _probe_json_schema_if_enabled(self, fallback_model: str) -> None:
+        """No probe: the schema goes out as the native ``format``, which the
+        /v1 probe does not exercise, and a thinking model can outlast the
+        probe's timeout there."""
 
     def messages_create(
         self,
@@ -1963,7 +2016,28 @@ class OllamaNativeClient(OpenAICompatibleClient):
             _send,
         )
         self._record_circuit_breaker(success=True)
-        return self._map_ollama_native_response(data, model, eff_max)
+        llm_response = self._map_ollama_native_response(data, model, eff_max)
+        self._raise_if_context_overflow(
+            llm_response, model, estimate_prompt_tokens(all_messages))
+        return llm_response
+
+    def _raise_if_context_overflow(self, llm_response: LLMResponse, model: str,
+                                   estimated_tokens: int) -> None:
+        """Fail the call when Ollama silently truncated the prompt (#893)."""
+        prompt_tokens = (llm_response.usage or {}).get('input_tokens')
+        if not ollama_prompt_was_truncated(
+                prompt_tokens, self._ollama_num_ctx, estimated_tokens):
+            return
+        raise OllamaContextOverflowError(
+            f"Ollama truncated the prompt for {model} to {prompt_tokens} tokens "
+            f"(about half of num_ctx={self._ollama_num_ctx}); the prompt is about "
+            f"{estimated_tokens} tokens, so its start and the instructions were "
+            f"dropped. Raise num_ctx (Settings > Context window, or OLLAMA_NUM_CTX).",
+            num_ctx=self._ollama_num_ctx,
+            prompt_tokens=prompt_tokens,
+            estimated_tokens=estimated_tokens,
+            response=llm_response,
+        )
 
     def _build_ollama_native_request(
         self, model: str, all_messages: list[dict], max_tokens: int,
@@ -2146,6 +2220,17 @@ def _normalize_base_url_for_provider(provider: str, base_url: str) -> str:
     return base_url
 
 
+def _slot_base_url(base_url: str | None, credential_slot: str) -> str:
+    """Raw endpoint for a non-Anthropic slot: an explicit URL, else the slot's own setting."""
+    if base_url:
+        return base_url
+    if credential_slot == 'secondary':
+        return _get_cached_setting('secondary_provider_base_url') or DEFAULT_OPENAI_BASE_URL
+    if credential_slot == 'failover':
+        return _get_cached_setting('failover_llm_base_url') or DEFAULT_OPENAI_BASE_URL
+    return get_effective_base_url()
+
+
 def _resolve_cache_key(provider_key: str, base_url: str | None = None,
                        credential_slot: str = 'primary') -> tuple[str, str | None, str]:
     """Client cache key for a provider: (provider_key, normalized_base, credential_slot).
@@ -2173,7 +2258,7 @@ def _resolve_cache_key(provider_key: str, base_url: str | None = None,
                    or os.getenv('SYSTEMONE_BASE_URL') or '')
         return (provider_key, raw.rstrip('/'), credential_slot)
     if provider_key in PROVIDERS_NON_ANTHROPIC:
-        raw = base_url or get_effective_base_url()
+        raw = _slot_base_url(base_url, credential_slot)
         return (provider_key, _normalize_base_url_for_provider(provider_key, raw), credential_slot)
     return (provider_key, base_url, credential_slot)
 
@@ -2276,6 +2361,7 @@ def get_client_for_provider(provider_key: str, base_url: str | None = None,
             )
             client = AnthropicClient()
         client.credential_slot = credential_slot
+        client.provider_key = provider_key
         client._config_revision = revision
 
         # No usage callback wired: utils.llm_call records every dispatch
@@ -2380,7 +2466,7 @@ def _build_client(provider: str, base_url: str | None = None,
             }
         )
     elif provider in PROVIDERS_NON_ANTHROPIC:
-        raw_base_url = base_url or get_effective_base_url()
+        raw_base_url = _slot_base_url(base_url, credential_slot)
         normalized_base_url = _normalize_base_url_for_provider(provider, raw_base_url)
         if provider == PROVIDER_OLLAMA:
             if normalized_base_url != raw_base_url:
@@ -2422,6 +2508,7 @@ def create_client_for_provider(
             logger.warning(f"Unknown provider '{provider}' for preview client")
         else:
             client.credential_slot = credential_slot
+            client.provider_key = provider
         return client
     except Exception as e:
         logger.error(f"Failed to create preview client for provider '{provider}': {e}")
@@ -2466,7 +2553,34 @@ def _verify_endpoint(label: str) -> bool:
         return False
 
 
+def _probe_secondary_provider_formats() -> None:
+    """Probe response_format support on the secondary slot's endpoint."""
+    try:
+        provider = _get_cached_setting('secondary_provider')
+        if provider not in (PROVIDER_OPENAI_COMPATIBLE, PROVIDER_OLLAMA):
+            return
+        client = get_client_for_provider(provider, credential_slot='secondary')
+        if hasattr(client, 'verify_connection'):
+            client.verify_connection(timeout=HTTP_TIMEOUT_API)
+    except Exception as e:
+        logger.warning(f"Secondary provider probe skipped: {e}")
+
+
+def probe_secondary_provider_formats() -> None:
+    """Probe an enabled secondary slot on a daemon thread so boot and saves never wait on it."""
+    if not coerce_bool_setting(_get_cached_setting('secondary_provider_enabled')):
+        return
+    threading.Thread(target=_probe_secondary_provider_formats, daemon=True).start()
+
+
 def verify_llm_connection() -> bool:
+    """Verify the primary endpoint at startup, then probe the secondary slot."""
+    ok = _verify_primary_connection()
+    probe_secondary_provider_formats()
+    return ok
+
+
+def _verify_primary_connection() -> bool:
     """Verify the LLM endpoint is reachable at startup.
 
     For OpenRouter and openai-compatible providers (including Ollama),

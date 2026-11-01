@@ -40,6 +40,7 @@ from llm_client import (
 )
 from utils.opml import modified_feed_url
 from api.settings import common, operations
+from youtube import settings as yt_settings
 
 
 # ========== Settings Endpoints ==========
@@ -67,7 +68,8 @@ def _build_settings_payload():
         SILENCE_SNAP_NOISE_DB, SILENCE_SNAP_MIN_DURATION_SECONDS,
         SILENCE_SNAP_MAX_DISTANCE_SECONDS,
     )
-    settings = common._settings_view(db.get_all_settings())
+    snapshot = db.get_all_settings()
+    settings = common._settings_view(snapshot)
 
     # Shorthand for building {value, isDefault} response dicts
     def _sv(key, value=None):
@@ -713,6 +715,8 @@ def _build_settings_payload():
         'providerBMaxRetries': _sv('secondary_llm_max_retries', provider_b_max_retries),
         'whisperMaxAttempts': _sv('whisper_max_attempts', whisper_max_attempts),
         'podcastIndexApiKeyConfigured': bool(podcast_index_api_key),
+        'youtubeEnabled': _sv('youtube_enabled', yt_settings.load_global(db).enabled),
+        'youtubeApiKeyConfigured': bool(yt_settings.api_key(db)),
         # value is resolved, not raw: unset falls back to PodcastIndex when
         # its credentials exist (pre-option installs keep their behavior),
         # else iTunes. isDefault marks a derived value; saving from the UI
@@ -790,6 +794,7 @@ def _build_settings_payload():
         'maxArtworkBytes': _sv('max_artwork_bytes', max_artwork_bytes),
         'maxRssBytes': _sv('max_rss_bytes', max_rss_bytes),
         'maxAudioDownloadMb': _sv('max_audio_download_mb', max_audio_download_mb),
+        'localUploadMaxMb': _sv('local_upload_max_mb', _int_setting('local_upload_max_mb')),
         'whisperApiTimeoutSeconds': _sv('whisper_api_timeout_seconds', whisper_api_timeout_seconds),
         'transcribeMaxChunkSeconds': _sv('transcribe_max_chunk_seconds', transcribe_max_chunk_seconds),
         'transcribeConcurrentChunks': _sv('transcribe_concurrent_chunks', transcribe_concurrent_chunks),
@@ -805,7 +810,8 @@ def _build_settings_payload():
             for payload_key, db_key, _ in STAGE_TUNABLE_PAYLOAD_KEYS
         },
     }
-    systemone_profiles, systemone_defaults, systemone_shipped = profile_payload(settings)
+    # profile_payload reads the raw {value, is_default} rows, not the SettingEntry view.
+    systemone_profiles, systemone_defaults, systemone_shipped = profile_payload(snapshot)
     payload['systemOneTunables'] = systemone_profiles
     payload['systemOneTunablesIsDefault'] = systemone_defaults
     payload['systemOneTunableDefaults'] = systemone_shipped

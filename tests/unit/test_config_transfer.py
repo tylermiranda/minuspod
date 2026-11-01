@@ -6,6 +6,7 @@ import pytest
 
 import config_transfer
 import secrets_crypto
+from utils.feed_guid import compute_feed_guid
 from config_transfer import ConfigTransferError
 from fx_rates import FxRate, FxRateError
 from rate_limit_hold import active_held_pairs, record_hold_until
@@ -52,6 +53,20 @@ def test_export_includes_only_config_fields_and_round_trips_recents(temp_db):
     subscribed = next(feed for feed in exported['feeds'] if feed['slug'] == 'example-feed')
     assert 'last_refresh_error' not in subscribed['settings']
     assert 'user_tags' in subscribed['settings']
+
+
+def test_export_carries_youtube_settings_but_not_ytdlp_status(temp_db):
+    temp_db.set_setting('youtube_ytdlp_version', '2026.10.26', is_default=False)
+    exported = config_transfer.export_config(temp_db, '2.98.2')
+    assert 'youtube_process_delay_minutes' in exported['settings']
+    assert 'youtube_ytdlp_version' not in exported['settings']
+
+
+def test_export_omits_the_proxy_url(temp_db):
+    temp_db.set_setting('youtube_proxy_url', 'socks5h://u:secret@host:1080', is_default=False)
+    exported = config_transfer.export_config(temp_db, '2.98.2')
+    assert 'youtube_proxy_url' not in exported['settings']
+    assert 'secret' not in json.dumps(exported)
 
 
 def test_export_budget_includes_worst_apply_envelope_and_utf8_bytes(temp_db, monkeypatch):
@@ -305,7 +320,8 @@ def test_nullable_models_remain_inherited_during_provider_restore(temp_db, monke
     temp_db.set_setting('llm_provider', 'anthropic')
     temp_db.set_setting('verification_model', 'old-model')
     temp_db.set_setting('chapters_model', 'old-model')
-    monkeypatch.setattr('api.settings.provider_phases._probe_after_provider_change', lambda: None)
+    monkeypatch.setattr('api.settings.provider_phases._refresh_after_provider_change', lambda: None)
+    monkeypatch.setattr('api.settings.provider_phases._reprobe_primary', lambda: None)
     document = _document({'llm_provider': 'ollama', 'claude_model': 'new-model',
                           'verification_model': None, 'chapters_model': None})
     preview = config_transfer.build_preview(temp_db, document, 'global')
@@ -945,3 +961,80 @@ def test_chapter_notes_restores_from_backup(temp_db, monkeypatch):
         db, exported, 'everything', None, preview['previewToken'])
 
     assert db.get_podcast_by_slug('notes-feed')['chapter_notes'] == 'Give donations their own chapter.'
+
+
+GUID = compute_feed_guid('http://localhost:8000/yt-xfer')
+
+
+def test_youtube_feed_round_trips(temp_db):
+    db = temp_db
+    db.create_podcast('yt-xfer', 'youtube://channel/UCabcdefghijklmnopqrstuv', 'YT', feed_type='youtube')
+    db.update_podcast('yt-xfer', youtube_source_kind='channel', youtube_source_id='UCabcdefghijklmnopqrstuv',
+                      yt_probe_attempts_override=2, yt_captions_override=1, yt_transcribe_override=0,
+                      p20_channel_json=json.dumps({'medium': 'podcast', 'locked': 'yes', 'guid': GUID}))
+    db.create_podcast('plain-xfer', 'https://example.com/plain.xml', 'Plain')
+    exported = config_transfer.export_config(db, '2.98.2')
+    feed = next(f for f in exported['feeds'] if f['slug'] == 'yt-xfer')
+    assert feed['feedType'] == 'youtube'
+    assert feed['settings']['youtube_source_id'] == 'UCabcdefghijklmnopqrstuv'
+    assert feed['settings']['yt_probe_attempts_override'] == 2
+    assert feed['settings']['yt_captions_override'] is True
+    assert feed['settings']['yt_transcribe_override'] is False
+    guid = feed['settings']['p20_channel_json']['guid']
+    assert guid == GUID
+    plain = next(f for f in exported['feeds'] if f['slug'] == 'plain-xfer')
+    assert not any(k.startswith(('youtube_', 'yt_')) for k in plain['settings'])
+    assert 'p20_channel_json' not in plain['settings']
+    db.delete_podcast('yt-xfer')
+    document = {**exported, 'feeds': [feed]}
+    preview = config_transfer.build_preview(db, document, 'feeds', ['yt-xfer'])
+    config_transfer.apply_config(db, document, 'feeds', ['yt-xfer'], preview['previewToken'])
+    row = db.get_podcast_by_slug('yt-xfer')
+    assert row['feed_type'] == 'youtube' and row['yt_probe_attempts_override'] == 2
+    assert json.loads(row['p20_channel_json'])['guid'] == guid
+
+
+def test_youtube_feed_import_rejects_bad_identity_and_foreign_columns(temp_db):
+    bad = {'slug': 'yt-bad', 'feedType': 'youtube',
+           'settings': {'source_url': 'https://example.com/x', 'title': 'x',
+                        'youtube_source_kind': 'channel', 'youtube_source_id': 'UCabc'}}
+    with pytest.raises(ConfigTransferError):
+        config_transfer.build_preview(temp_db, _document(feeds=[bad]), 'feeds', ['yt-bad'])
+    foreign = _feed(slug='yt-foreign', yt_probe_attempts_override=2)
+    with pytest.raises(ConfigTransferError, match='YouTube-only'):
+        config_transfer.build_preview(temp_db, _document(feeds=[foreign]), 'feeds', ['yt-foreign'])
+
+
+def _yt_feed(**settings):
+    base = {'source_url': 'youtube://channel/UCabcdefghijklmnopqrstuv', 'title': 'YT',
+            'youtube_source_kind': 'channel', 'youtube_source_id': 'UCabcdefghijklmnopqrstuv'}
+    return {'slug': 'yt-new', 'feedType': 'youtube', 'settings': {**base, **settings}}
+
+
+def test_youtube_import_without_channel_block_mints_one(temp_db):
+    document = _document(feeds=[_yt_feed()])
+    preview = config_transfer.build_preview(temp_db, document, 'feeds', ['yt-new'])
+    config_transfer.apply_config(temp_db, document, 'feeds', ['yt-new'], preview['previewToken'])
+    channel = json.loads(temp_db.get_podcast_by_slug('yt-new')['p20_channel_json'])
+    assert channel['medium'] == 'podcast' and channel['locked'] == 'yes' and channel['guid']
+
+
+@pytest.mark.parametrize('override', [
+    {'youtube_source_kind': 'playlist'},
+    {'youtube_source_kind': ['channel']},
+    {'youtube_source_id': 'UCother'},
+    {'source_url': 'youtube://channel/UCabcdefghijklmnopqrstuv\n'},
+    {'youtube_source_id': 'UCabcdefghijklmnopqrstuv\n', 'source_url': 'youtube://channel/UCabcdefghijklmnopqrstuv\n'},
+])
+def test_youtube_import_rejects_mismatched_source(temp_db, override):
+    with pytest.raises(ConfigTransferError, match='YouTube|youtube_source_kind'):
+        config_transfer.build_preview(temp_db, _document(feeds=[_yt_feed(**override)]), 'feeds', ['yt-new'])
+
+
+def test_youtube_import_accepts_a_video_source(temp_db):
+    feed = _yt_feed(source_url='youtube://video/abc123def45', youtube_source_kind='video',
+                    youtube_source_id='abc123def45')
+    document = _document(feeds=[feed])
+    preview = config_transfer.build_preview(temp_db, document, 'feeds', ['yt-new'])
+    config_transfer.apply_config(temp_db, document, 'feeds', ['yt-new'], preview['previewToken'])
+    assert temp_db.get_podcast_by_slug('yt-new')['youtube_source_kind'] == 'video'

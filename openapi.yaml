@@ -67,6 +67,10 @@ tags:
     description: >-
       Local (archive-import) feeds: no upstream RSS, episode upload and
       edits, and bulk directory/upload import (#625)
+  - name: YouTube
+    description: >-
+      YouTube playlist and channel feeds: source preview, Data API key test,
+      cookies, and yt-dlp updates. Global settings live under Settings.
   - name: Failover
     description: >-
       Provider failover (#806): state of the LLM A/B and transcriber
@@ -387,12 +391,37 @@ paths:
                   example: my-podcast
                 feedType:
                   type: string
-                  enum: [subscribed, local, recents]
+                  enum: [subscribed, local, recents, youtube]
                   default: subscribed
                   description: >-
                     "local" creates an archive-import feed with no upstream
                     RSS: title is required, sourceUrl is ignored, and no
-                    fetch happens. Omit or "subscribed" for a normal feed.
+                    fetch happens. "youtube" creates a feed from a YouTube
+                    playlist or channel: sourceKind, sourceId and title are
+                    required, sourceUrl is ignored, and the first listing runs
+                    before the response. Omit or "subscribed" for a normal feed.
+                sourceKind:
+                  type: string
+                  enum: [playlist, channel]
+                  description: YouTube feeds only. Kind of the source.
+                sourceId:
+                  type: string
+                  description: YouTube feeds only. Canonical playlist id or channel id, as returned by the preview.
+                  example: UCxxxxxxxxxxxxxxxxxxxxxx
+                artworkUrl:
+                  type: string
+                  format: uri
+                  description: YouTube feeds only. Cover image downloaded once at creation.
+                includeShorts:
+                  type:
+                    - boolean
+                    - 'null'
+                  description: YouTube feeds only. Whether videos of 180 seconds or less are listed; null follows the default.
+                autoProcessOverride:
+                  type:
+                    - boolean
+                    - 'null'
+                  description: Per-feed auto-process override applied at creation. Null inherits the global setting.
                 title:
                   type: string
                   description: Feed title. Required and editable when feedType is "local"; ignored for a subscribed feed, which takes its title from the upstream RSS on refresh.
@@ -1178,6 +1207,39 @@ paths:
                     - boolean
                     - 'null'
                   description: Per-feed override for retaining the pre-cut original audio. Null falls back to the global keepOriginalAudio setting; true always keeps it; false never does. Applies from the next episode processed.
+                ytProcessDelayMinutesOverride:
+                  type: [integer, 'null']
+                  minimum: 0
+                  maximum: 1440
+                  description: YouTube feeds only. Minutes to wait after a video is published before processing. Null follows the global setting.
+                ytProbeAttemptsOverride:
+                  type: [integer, 'null']
+                  minimum: 0
+                  maximum: 48
+                  description: YouTube feeds only. SponsorBlock lookup attempts. Null follows the global setting.
+                ytProbeIntervalMinutesOverride:
+                  type: [integer, 'null']
+                  minimum: 5
+                  maximum: 1440
+                  description: YouTube feeds only. Minutes between SponsorBlock lookup attempts. Null follows the global setting.
+                ytLlmFallbackOverride:
+                  type: [boolean, 'null']
+                  description: YouTube feeds only. Run LLM detection when SponsorBlock has no data. Null follows the global setting.
+                ytLlmOnTopOverride:
+                  type: [boolean, 'null']
+                  description: YouTube feeds only. Run LLM detection on top of SponsorBlock segments. Null follows the global setting.
+                ytCaptionsOverride:
+                  type: [boolean, 'null']
+                  description: YouTube feeds only. Use YouTube captions as the transcript. Null follows the global setting.
+                ytHidePrivateOverride:
+                  type: [boolean, 'null']
+                  description: YouTube feeds only. Hide private and deleted episodes from the listing. Null follows the global setting.
+                ytTranscribeOverride:
+                  type: [boolean, 'null']
+                  description: YouTube feeds only. Transcribe with the configured transcriber when captions are missing. Null follows the global setting.
+                youtubeIncludeShorts:
+                  type: [boolean, 'null']
+                  description: YouTube feeds only. Whether videos of 180 seconds or less are listed. Null follows the default.
                 segmentCategoryActions:
                   type:
                     - object
@@ -1221,7 +1283,7 @@ paths:
                   type:
                     - string
                     - 'null'
-                  description: Feed description, rewritten into the served channel <description>. Editable on any feed, local or subscribed, unlike title/author/explicit/categories/p20 below, which are local-feed only.
+                  description: Feed description, rewritten into the served channel <description>. Editable on any feed, local or subscribed, unlike title and p20 below, which are local-feed only (author, explicit and categories also work on YouTube feeds).
                 title:
                   type: string
                   description: >-
@@ -1233,19 +1295,19 @@ paths:
                   type:
                     - string
                     - 'null'
-                  description: itunes:author. Local feeds only; 400 on a subscribed feed.
+                  description: itunes:author. Local and YouTube feeds; 400 on a subscribed feed.
                 explicit:
                   type:
                     - boolean
                     - 'null'
-                  description: itunes:explicit. Local feeds only; 400 on a subscribed feed. Null clears.
+                  description: itunes:explicit. Local and YouTube feeds; 400 on a subscribed feed. Null clears.
                 categories:
                   type:
                     - array
                     - 'null'
                   items:
                     type: string
-                  description: itunes:category list. Local feeds only; 400 on a subscribed feed. Null clears.
+                  description: itunes:category list. Local and YouTube feeds; 400 on a subscribed feed. Null clears.
                 p20:
                   allOf:
                     - $ref: '#/components/schemas/LocalFeedP20'
@@ -1476,11 +1538,12 @@ paths:
     post:
       tags:
         - LocalFeeds
-      summary: Upload cover art for a local feed
+      summary: Upload cover art for a local, recents or YouTube feed
       description: >-
-        Local feeds only (400 on a subscribed feed, whose artwork comes
-        from the upstream RSS on refresh). JPEG or PNG, detected from the
-        file bytes rather than the client-supplied content type. Bound by
+        Local, recents and YouTube feeds only (400 on a subscribed RSS
+        feed, whose artwork comes from the upstream RSS on refresh). JPEG
+        or PNG, detected from the file bytes rather than the
+        client-supplied content type. Bound by
         the app's default 10 MB request cap. A response under 1400x1400
         still succeeds but carries a warning field, since podcast
         directories generally expect at least that.
@@ -1514,7 +1577,7 @@ paths:
                     type: string
                     description: Present when the image is smaller than 1400x1400 in either dimension.
         '400':
-          description: Not a local feed, missing file, or not a JPEG/PNG image
+          description: Not a local, recents or YouTube feed, missing file, or not a JPEG/PNG image
           content:
             application/json:
               schema:
@@ -1711,6 +1774,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '413':
+          description: Upload exceeds the configured local upload size limit
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UploadTooLarge'
     patch:
       tags:
         - LocalFeeds
@@ -2403,6 +2472,174 @@ paths:
           description: A regeneration is already running, the episode is being processed, or an LLM provider rate-limit hold is active
         '500':
           $ref: '#/components/responses/ServerError'
+
+  /feeds/{slug}/episodes/{episode_id}/sponsorblock/candidates:
+    get:
+      tags:
+        - Episodes
+      summary: List segments reviewable for SponsorBlock
+      description: |
+        Lists the cut sponsor and self promotion segments of a YouTube episode that
+        carry evidence beyond the model, with any recorded submission outcome.
+        Segments already submitted are returned so they can be shown as sent.
+        allowed is false, with a reason, when submission is not possible.
+      operationId: getSponsorBlockCandidates
+      parameters:
+        - $ref: '#/components/parameters/slug'
+        - $ref: '#/components/parameters/episode_id'
+      responses:
+        '200':
+          description: Candidate segments
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [allowed, reason, segments]
+                properties:
+                  allowed: { type: boolean }
+                  reason:
+                    type: [string, 'null']
+                    description: service_down means SponsorBlock failed its last availability probe.
+                    enum: [not_youtube, not_completed, disabled, no_user_id, community_marks, no_video_id, marks_unverified, service_down, null]
+                  segments:
+                    type: array
+                    items:
+                      type: object
+                      required: [start, end, category, sbCategory, evidence, submission]
+                      properties:
+                        start: { type: number }
+                        end: { type: number }
+                        category: { type: [string, 'null'] }
+                        sbCategory: { type: string, enum: [sponsor, selfpromo] }
+                        evidence:
+                          type: array
+                          items: { type: string }
+                        submission:
+                          oneOf:
+                            - $ref: '#/components/schemas/SponsorBlockSubmission'
+                            - type: 'null'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /feeds/{slug}/episodes/{episode_id}/sponsorblock/submit:
+    post:
+      tags:
+        - Episodes
+      summary: Submit reviewed segments to SponsorBlock
+      description: |
+        Sends the segments a person selected to SponsorBlock. SponsorBlock forbids
+        automated submissions, so this is the only way MinusPod sends anything.
+        Each segment must match a candidate within 0.05 seconds and must not
+        already be submitted. Outcomes are recorded on the episode. A duplicate
+        or rejected result is a recorded outcome and returns 200. Rate limited to
+        10 per minute.
+      operationId: submitSponsorBlockSegments
+      parameters:
+        - $ref: '#/components/parameters/slug'
+        - $ref: '#/components/parameters/episode_id'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [segments]
+              properties:
+                segments:
+                  type: array
+                  minItems: 1
+                  maxItems: 20
+                  items:
+                    type: object
+                    required: [start, end]
+                    properties:
+                      start: { type: number }
+                      end: { type: number }
+      responses:
+        '200':
+          description: Recorded outcomes, one per segment
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SponsorBlockSubmitResult'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '429':
+          description: SponsorBlock rate limited the submission, or the endpoint limit was reached. The outcome is recorded.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SponsorBlockSubmitResult'
+        '502':
+          description: The request to SponsorBlock failed. The outcome is recorded.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SponsorBlockSubmitResult'
+
+  /feeds/{slug}/episodes/{episode_id}/rating:
+    put:
+      tags:
+        - Episodes
+      summary: Rate an episode
+      description: |
+        Stores a 1 to 5 quality rating. Notes are trimmed, limited to 2000
+        characters and kept only below 5. A rating of 5 confirms every cut ad
+        segment through the same path as a confirm correction, without changing
+        the audio or queuing a recut.
+      operationId: putEpisodeRating
+      parameters:
+        - $ref: '#/components/parameters/slug'
+        - $ref: '#/components/parameters/episode_id'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [rating]
+              properties:
+                rating: { type: integer, minimum: 1, maximum: 5 }
+                notes: { type: [string, 'null'], maxLength: 2000 }
+      responses:
+        '200':
+          description: The stored rating and how many cut segments were newly confirmed
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [rating, confirmedMarkers]
+                properties:
+                  rating:
+                    $ref: '#/components/schemas/EpisodeRating'
+                  confirmedMarkers: { type: integer }
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    delete:
+      tags:
+        - Episodes
+      summary: Clear an episode rating
+      description: Clears the rating, notes and rating time. Confirmations already recorded stay.
+      operationId: deleteEpisodeRating
+      parameters:
+        - $ref: '#/components/parameters/slug'
+        - $ref: '#/components/parameters/episode_id'
+      responses:
+        '200':
+          description: The rating is now null
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  rating:
+                    type: 'null'
+        '404':
+          $ref: '#/components/responses/NotFound'
 
   /feeds/{slug}/reprocess-all:
     post:
@@ -3213,7 +3450,7 @@ paths:
           description: Unrecognized values fall back to knownCostUsd.
           schema:
             type: string
-            enum: [provider, model, calls, distinctEpisodes, inputTokens, outputTokens, knownCostUsd, unknownCostCount]
+            enum: [provider, model, calls, distinctEpisodes, inputTokens, outputTokens, knownCostUsd, unknownCostCount, cacheHitRate]
             default: knownCostUsd
         - name: sortDir
           in: query
@@ -3269,6 +3506,8 @@ paths:
                         distinctEpisodes: { type: integer }
                         inputTokens: { type: integer }
                         outputTokens: { type: integer }
+                        cacheReadTokens: { type: integer, description: "Summed from the ledger; cached tokens are counted inside inputTokens." }
+                        cacheWriteTokens: { type: integer, description: "Summed from the ledger; cached tokens are counted inside inputTokens." }
                         knownCostUsd:
                           type: string
                           description: Decimal string; sum of rows with a resolved cost.
@@ -3618,6 +3857,14 @@ paths:
                             - integer
                             - 'null'
                         outputTokens:
+                          type:
+                            - integer
+                            - 'null'
+                        cacheReadTokens:
+                          type:
+                            - integer
+                            - 'null'
+                        cacheWriteTokens:
                           type:
                             - integer
                             - 'null'
@@ -4783,6 +5030,225 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
+
+  /youtube/preview:
+    post:
+      tags:
+        - YouTube
+      summary: Preview a YouTube source
+      description: >-
+        Resolves a playlist, channel or handle URL and returns its identity plus podcast
+        directory matches that may offer the same show as an RSS feed. Returns enabled false
+        with no lookup when YouTube feeds are disabled.
+      operationId: previewYoutubeSource
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [url]
+              properties:
+                url:
+                  type: string
+                  example: https://www.youtube.com/@example
+      responses:
+        '200':
+          description: Source preview
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  enabled:
+                    type: boolean
+                  source:
+                    type:
+                      - object
+                      - 'null'
+                    properties:
+                      kind:
+                        type: string
+                        enum: [playlist, channel]
+                      id:
+                        type: string
+                      title:
+                        type: string
+                      description:
+                        type: string
+                      author:
+                        type: string
+                        description: Channel title; for a playlist, the owning channel. Seeds itunes:author when the feed is added.
+                      artworkUrl:
+                        type: [string, 'null']
+                      videoCount:
+                        type: [integer, 'null']
+                      alreadyAdded:
+                        type: [string, 'null']
+                        description: Slug of the existing feed for this source, if any.
+                  rssMatches:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        title:
+                          type: string
+                        feedUrl:
+                          type: string
+                        artworkUrl:
+                          type: string
+        '400':
+          description: Not a YouTube playlist or channel URL
+        '404':
+          description: Source not found or private
+        '502':
+          description: The lookup failed upstream
+  /youtube/search:
+    get:
+      tags:
+        - YouTube
+      summary: Search YouTube playlists and channels by name
+      description: >-
+        Returns ranked playlist and channel candidates for a show name. Playlists the channel
+        owner marked as a podcast rank first. Uses the Data API when a key is set and yt-dlp
+        otherwise. Results are cached for 10 minutes. Returns enabled false with no lookup
+        when YouTube feeds are disabled.
+      operationId: searchYoutubeSources
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Show name to search for.
+      responses:
+        '200':
+          description: Ranked candidates
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  enabled:
+                    type: boolean
+                  results:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        kind:
+                          type: string
+                          enum: [playlist, channel]
+                        id:
+                          type: string
+                        title:
+                          type: string
+                        channelTitle:
+                          type: string
+                        videoCount:
+                          type: [integer, 'null']
+                        podcast:
+                          type: [boolean, 'null']
+                          description: True when YouTube marks the playlist as a podcast show. Null for channels and unknown status.
+                        artworkUrl:
+                          type: [string, 'null']
+                        url:
+                          type: string
+                          description: Public YouTube URL to paste into the Add feed lookup, for example https://www.youtube.com/playlist?list=PL...
+        '400':
+          description: Missing search query
+        '502':
+          description: The search failed upstream
+  /youtube/test-key:
+    post:
+      tags:
+        - YouTube
+      summary: Test a YouTube Data API key
+      description: Tests the supplied key, or the stored key when apiKey is omitted, against a public channel.
+      operationId: testYoutubeApiKey
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                apiKey:
+                  type: string
+      responses:
+        '200':
+          description: The key works
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  ok:
+                    type: boolean
+                  channelTitle:
+                    type: [string, 'null']
+        '400':
+          description: No key available or YouTube rejected it
+  /youtube/cookies:
+    post:
+      tags:
+        - YouTube
+      summary: Save YouTube cookies
+      description: Stores a Netscape-format cookies file used by yt-dlp. The content is never returned.
+      operationId: putYoutubeCookies
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [cookies]
+              properties:
+                cookies:
+                  type: string
+      responses:
+        '200':
+          description: Cookies status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/YoutubeCookiesStatus'
+        '400':
+          description: The text is not a valid cookies file
+    delete:
+      tags:
+        - YouTube
+      summary: Remove YouTube cookies
+      operationId: deleteYoutubeCookies
+      responses:
+        '200':
+          description: Cookies status after removal
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/YoutubeCookiesStatus'
+  /youtube/ytdlp/update:
+    post:
+      tags:
+        - YouTube
+      summary: Update yt-dlp now
+      description: Downloads the latest yt-dlp into the runtime copy. Limited to 6 requests per hour.
+      operationId: updateYtdlp
+      responses:
+        '200':
+          description: Update result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  updated:
+                    type: boolean
+                  version:
+                    type: [string, 'null']
+                  error:
+                    type: [string, 'null']
+        '503':
+          description: yt-dlp is not installed
 
   /podcast-search:
     get:
@@ -6951,6 +7417,13 @@ paths:
                   minimum: 1
                   description: Per-episode audio download cap in MB (no ceiling).
                   example: 500
+                localUploadMaxMb:
+                  type: integer
+                  minimum: 1
+                  maximum: 4096
+                  default: 1024
+                  description: Maximum size in MB of one local-feed upload request.
+                  example: 1024
                 llmProvider:
                   type: string
                   description: LLM provider for detection and verification; System One review is experimental. Chapters and Pattern Cleanup require a chat provider when enabled.
@@ -7932,6 +8405,9 @@ paths:
                         outputCostPerMtok:
                           type: number
                           description: Output cost per million tokens (USD)
+                        cacheReadCostPerMtok:
+                          type: [number, 'null']
+                          description: Cached-input cost per million tokens (USD), when the source publishes one
                         source:
                           type: string
                           description: Pricing data source (openrouter_api, pricepertoken, default, legacy)
@@ -8518,7 +8994,8 @@ paths:
         Downloads payload-free structured diagnostics for an optional UTC ISO
         8601 start/end range. The range is limited to 24 hours and the export
         omits prompts, transcripts, descriptions, responses, identifiers,
-        secrets, URLs, and exception text. Rate limited to 6/hour.
+        secrets, URLs, and exception text. Episode ratings and their notes
+        are included for the range. Rate limited to 6/hour.
       operationId: exportDiagnosticLog
       parameters:
         - name: start
@@ -8538,7 +9015,7 @@ paths:
             application/json:
               schema:
                 type: object
-                required: [events, truncated, start, end, coverage]
+                required: [events, truncated, episodeRatings, start, end, coverage]
                 properties:
                   events:
                     type: array
@@ -8546,6 +9023,24 @@ paths:
                       type: object
                   truncated:
                     type: boolean
+                  episodeRatings:
+                    type: array
+                    description: Episodes rated inside the range, newest first, at most 500.
+                    items:
+                      type: object
+                      properties:
+                        slug: { type: string }
+                        episodeId: { type: string }
+                        title: { type: [string, 'null'] }
+                        rating: { type: integer, minimum: 1, maximum: 5 }
+                        notes: { type: [string, 'null'] }
+                        ratedAt: { type: string, format: date-time }
+                        markers:
+                          type: object
+                          properties:
+                            cut: { type: integer }
+                            kept: { type: integer }
+                            held: { type: integer }
                   start:
                     type: string
                     format: date-time
@@ -8913,6 +9408,163 @@ paths:
                   health:
                     $ref: '#/components/schemas/WhisperHealthProbe'
 
+  /settings/youtube/sb-user-id:
+    get:
+      tags:
+        - Settings
+      summary: Reveal the stored SponsorBlock private user ID
+      description: >-
+        Returns the stored ID so it can be copied, for example into the SponsorBlock extension.
+        Returns 404 with error "not_configured" when none is stored. Limited to 10 requests per minute.
+      operationId: getSbUserId
+      responses:
+        '200':
+          description: The stored ID
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [sbUserId]
+                properties:
+                  sbUserId:
+                    type: string
+        '404':
+          description: No ID is stored (error "not_configured")
+  /settings/youtube/sb-user-id/generate:
+    post:
+      tags:
+        - Settings
+      summary: Generate a SponsorBlock private user ID
+      description: >-
+        Creates a random 48 character SponsorBlock private user ID and stores it encrypted.
+        Returns 409 with error "configured" when an ID is already stored; it cannot be regenerated
+        while one is stored. Returns 409 with error "provider_crypto_unavailable" when secret
+        encryption is unavailable, as PUT does. Limited to 10 requests per minute. Read the stored ID
+        with GET /settings/youtube/sb-user-id.
+      operationId: generateSbUserId
+      responses:
+        '200':
+          description: The new ID
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [sbUserId]
+                properties:
+                  sbUserId:
+                    type: string
+                    minLength: 48
+                    maxLength: 48
+        '409':
+          description: Error "configured" when an ID is already stored, or "provider_crypto_unavailable" when secret encryption is unavailable
+  /settings/youtube/reset:
+    post:
+      tags:
+        - Settings
+      summary: Reset YouTube settings to defaults
+      description: >-
+        Restores the YouTube tunables, proxy and extra yt-dlp arguments to their defaults.
+      operationId: resetYoutubeSettings
+      responses:
+        '200':
+          description: YouTube settings after the reset
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/YoutubeSettings'
+  /settings/youtube:
+    get:
+      tags:
+        - Settings
+      summary: Get YouTube feed settings
+      description: Global YouTube feed settings. The Data API key is write-only and reported as apiKeyConfigured.
+      operationId: getYoutubeSettings
+      responses:
+        '200':
+          description: YouTube settings
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/YoutubeSettings'
+    put:
+      tags:
+        - Settings
+      summary: Update YouTube feed settings
+      description: >-
+        Accepts any subset of the fields. Every value is validated before any is written.
+        apiKey set to an empty string or null clears the stored key. Returns 409 when a key is
+        supplied but secret encryption is unavailable.
+      operationId: updateYoutubeSettings
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                enabled:
+                  type: boolean
+                apiKey:
+                  type:
+                    - string
+                    - 'null'
+                sbSubmitEnabled:
+                  type: boolean
+                  description: Show the manual SponsorBlock submission review on YouTube episode pages. Nothing is ever sent automatically.
+                sbUserId:
+                  type:
+                    - string
+                    - 'null'
+                  minLength: 32
+                  maxLength: 200
+                  description: Private SponsorBlock user ID, 32 to 200 printable ASCII characters. Empty or null clears it. Returns 409 when secret encryption is unavailable.
+                processDelayMinutes:
+                  type: integer
+                  minimum: 0
+                  maximum: 1440
+                sbProbeAttempts:
+                  type: integer
+                  minimum: 0
+                  maximum: 48
+                sbProbeIntervalMinutes:
+                  type: integer
+                  minimum: 5
+                  maximum: 1440
+                sbWatchIntervalHours:
+                  type: integer
+                  minimum: 1
+                  maximum: 48
+                sbWatchMaxDays:
+                  type: integer
+                  minimum: 1
+                  maximum: 60
+                llmFallback:
+                  type: boolean
+                captionsAsTranscript:
+                  type: boolean
+                hidePrivate:
+                  type: boolean
+                transcribeFallback:
+                  type: boolean
+                proxyUrl:
+                  type: string
+                  description: Proxy for yt-dlp and YouTube Data API requests. http, https, socks4, socks5 and socks5h schemes.
+                ytdlpExtraArgs:
+                  type: string
+                  description: Extra command line arguments added before the app's own options on every yt-dlp call. Options that run or load other programs, change where files are written, read local files, alter the JSON output, update the binary or carry passwords are rejected; use long option names.
+                ytdlpAutoUpdate:
+                  type: boolean
+      responses:
+        '200':
+          description: Updated YouTube settings
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/YoutubeSettings'
+        '400':
+          description: A value is out of range or has the wrong type
+        '409':
+          description: Secret encryption is unavailable (error "provider_crypto_unavailable"), or sbUserId was sent while a generated ID is stored (error "generated")
   /settings/update-check:
     get:
       tags:
@@ -9660,6 +10312,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Error'
+        '413':
+          description: Upload exceeds the configured local upload size limit
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UploadTooLarge'
 
   /feeds/{slug}/import/scan:
     post:
@@ -12053,6 +12711,96 @@ components:
         example: 550e8400-e29b-41d4-a716-446655440000
 
   schemas:
+    YoutubeCookiesStatus:
+      type: object
+      properties:
+        set:
+          type: boolean
+        lines:
+          type: integer
+        updatedAt:
+          type: [string, 'null']
+    YoutubeSettings:
+      type: object
+      properties:
+        enabled:
+          type: boolean
+        apiKeyConfigured:
+          type: boolean
+        sbSubmitEnabled:
+          type: boolean
+        sbUserIdConfigured:
+          type: boolean
+          description: Whether a SponsorBlock user ID is stored. Read it with GET /settings/youtube/sb-user-id.
+        sbUserIdGenerated:
+          type: boolean
+          description: Whether the stored ID was generated by MinusPod. A generated ID cannot be cleared or replaced.
+        processDelayMinutes:
+          type: integer
+        sbProbeAttempts:
+          type: integer
+        sbProbeIntervalMinutes:
+          type: integer
+        sbWatchIntervalHours:
+          type: integer
+        sbWatchMaxDays:
+          type: integer
+        llmFallback:
+          type: boolean
+        captionsAsTranscript:
+          type: boolean
+        hidePrivate:
+          type: boolean
+        transcribeFallback:
+          type: boolean
+        proxyUrl:
+          type: string
+          description: Proxy for yt-dlp and YouTube Data API requests. http, https, socks4, socks5 and socks5h schemes.
+        ytdlpExtraArgs:
+          type: string
+          description: Extra command line arguments added before the app's own options on every yt-dlp call. Options that run or load other programs, change where files are written, read local files, alter the JSON output, update the binary or carry passwords are rejected; use long option names.
+        ytdlp:
+          type: object
+          properties:
+            autoUpdate:
+              type: boolean
+            version:
+              type:
+                - string
+                - 'null'
+            lastUpdateAt:
+              type:
+                - string
+                - 'null'
+            lastCheckAt:
+              type:
+                - string
+                - 'null'
+            lastError:
+              type:
+                - string
+                - 'null'
+            bakedVersion:
+              type:
+                - string
+                - 'null'
+        cookies:
+          type: object
+          properties:
+            set:
+              type: boolean
+            lines:
+              type: integer
+            updatedAt:
+              type:
+                - string
+                - 'null'
+        bounds:
+          type: object
+          additionalProperties:
+            type: array
+            items:
+              type: integer
     SystemOneTuning:
       type: object
       additionalProperties: false
@@ -12614,7 +13362,7 @@ components:
                 type: string
               feedType:
                 type: string
-                enum: [subscribed, local, recents]
+                enum: [subscribed, local, recents, youtube]
               settings:
                 type: object
                 additionalProperties: true
@@ -13551,7 +14299,7 @@ components:
           description: URL-safe identifier for the feed
         feedType:
           type: string
-          enum: [subscribed, local, recents]
+          enum: [subscribed, local, recents, youtube]
           description: >-
             "subscribed" (default) mirrors an upstream RSS feed; "local" is
             an archive-import feed MinusPod builds and serves itself, with
@@ -13584,7 +14332,7 @@ components:
           type:
             - string
             - 'null'
-          description: itunes:author. Local feeds only; always null for a subscribed feed (taken from the upstream RSS at render time, not stored per-feed).
+          description: itunes:author. Local and YouTube feeds; always null for a subscribed feed (taken from the upstream RSS at render time, not stored per-feed).
         explicit:
           type:
             - boolean
@@ -13958,6 +14706,12 @@ components:
             - boolean
             - 'null'
           description: Legacy per-feed cross-fetch flag. Use differentialFetchMode for new clients; null selects automatic DAI detection.
+        ratingAverage:
+          type: [number, 'null']
+          description: Average episode quality rating for the feed. Null when no episode is rated. Feed detail only.
+        ratingCount:
+          type: integer
+          description: Number of rated episodes in the feed. Feed detail only.
         daiLikely:
           type: boolean
           description: Hint that this feed likely uses dynamic ad insertion, based on recent enclosure URLs matching known DAI or prefix domains. Returned on the feed detail response.
@@ -14025,6 +14779,50 @@ components:
             - boolean
             - 'null'
           description: Per-feed override for retaining the pre-cut original audio. Null falls back to the global keepOriginalAudio setting; true always keeps it; false never does. Applies from the next episode processed.
+        ytProcessDelayMinutesOverride:
+          type: [integer, 'null']
+          minimum: 0
+          maximum: 1440
+          description: YouTube feeds only. Minutes to wait after a video is published before processing. Null follows the global setting.
+        ytProbeAttemptsOverride:
+          type: [integer, 'null']
+          minimum: 0
+          maximum: 48
+          description: YouTube feeds only. SponsorBlock lookup attempts. Null follows the global setting.
+        ytProbeIntervalMinutesOverride:
+          type: [integer, 'null']
+          minimum: 5
+          maximum: 1440
+          description: YouTube feeds only. Minutes between SponsorBlock lookup attempts. Null follows the global setting.
+        ytLlmFallbackOverride:
+          type: [boolean, 'null']
+          description: YouTube feeds only. Run LLM detection when SponsorBlock has no data. Null follows the global setting.
+        ytLlmOnTopOverride:
+          type: [boolean, 'null']
+          description: YouTube feeds only. Run LLM detection on top of SponsorBlock segments. Null follows the global setting.
+        ytCaptionsOverride:
+          type: [boolean, 'null']
+          description: YouTube feeds only. Use YouTube captions as the transcript. Null follows the global setting.
+        ytHidePrivateOverride:
+          type: [boolean, 'null']
+          description: YouTube feeds only. Hide private and deleted episodes from the listing. Null follows the global setting.
+        ytTranscribeOverride:
+          type: [boolean, 'null']
+          description: YouTube feeds only. Transcribe with the configured transcriber when captions are missing. Null follows the global setting.
+        youtubeIncludeShorts:
+          type: [boolean, 'null']
+          description: YouTube feeds only. Whether videos of 180 seconds or less are listed. Null follows the default.
+        youtubeSourceKind:
+          type: [string, 'null']
+          enum: [playlist, channel, null]
+          description: YouTube feeds only. Kind of the source.
+        youtubeSourceId:
+          type: [string, 'null']
+          description: YouTube feeds only. Playlist id or channel id.
+        youtubeSourceUrl:
+          type: [string, 'null']
+          format: uri
+          description: YouTube feeds only. Public YouTube page of the source.
         segmentCategoryActions:
           type:
             - object
@@ -14162,6 +14960,31 @@ components:
           type: string
         title:
           type: string
+        sponsorBlock:
+          type: [object, 'null']
+          description: SponsorBlock lookup progress for a YouTube episode. Null on other feed types.
+          properties:
+            state: { type: string }
+            attempts: { type: integer }
+            nextCheckAt: { type: [string, 'null'] }
+            segmentCount: { type: [integer, 'null'] }
+            note: { type: [string, 'null'] }
+            lastError: { type: [string, 'null'] }
+            submitAllowed:
+              type: boolean
+              description: True when the episode detail may offer manual SponsorBlock submission. Absent in list payloads.
+            submissions:
+              type: array
+              description: Outcomes of segments a person submitted to SponsorBlock for this episode.
+              items:
+                $ref: '#/components/schemas/SponsorBlockSubmission'
+        rating:
+          type: [object, 'null']
+          description: The person's quality rating for the episode. Null when unrated.
+          properties:
+            value: { type: integer, minimum: 1, maximum: 5 }
+            notes: { type: [string, 'null'] }
+            ratedAt: { type: string, format: date-time }
         status:
           type: string
           enum: [discovered, pending, processing, completed, failed, permanently_failed, deferred]
@@ -14877,6 +15700,34 @@ components:
         queuedEpisodes:
           type: integer
           description: Episodes waiting in the auto-process queue
+    EpisodeRating:
+      type: object
+      properties:
+        value: { type: integer, minimum: 1, maximum: 5 }
+        notes: { type: [string, 'null'] }
+        ratedAt: { type: string, format: date-time }
+
+    SponsorBlockSubmission:
+      type: object
+      description: Recorded outcome of one segment sent to SponsorBlock.
+      properties:
+        start: { type: number }
+        end: { type: number }
+        category: { type: string, enum: [sponsor, selfpromo] }
+        status: { type: string, enum: [submitted, duplicate, rejected, rate_limited, error] }
+        at: { type: string, format: date-time }
+        uuid: { type: [string, 'null'] }
+        detail: { type: string }
+
+    SponsorBlockSubmitResult:
+      type: object
+      required: [results]
+      properties:
+        results:
+          type: array
+          items:
+            $ref: '#/components/schemas/SponsorBlockSubmission'
+
     EpisodeProcessingRun:
       type: object
       description: One processing run of an episode, with its pipeline stats.
@@ -14909,6 +15760,12 @@ components:
           type: integer
         outputTokens:
           type: integer
+        cacheReadTokens:
+          type: integer
+          description: Run total from the ledger; 0 for a run without ledger rows.
+        cacheWriteTokens:
+          type: integer
+          description: Run total from the ledger; 0 for a run without ledger rows.
         llmCost:
           type: number
         hasLog:
@@ -15610,6 +16467,9 @@ components:
         outputCostPerMtok:
           type: [number, 'null']
           description: Output cost per million tokens (USD), present when pricing is known
+        cacheReadCostPerMtok:
+          type: [number, 'null']
+          description: Cached-input cost per million tokens (USD), present when pricing is known and a cache rate exists
         pricingSource:
           type: [string, 'null']
           description: Pricing source, including operator when a configured override applies
@@ -15627,6 +16487,10 @@ components:
           type: number
           minimum: 0
           description: Output price in USD per 1 million tokens
+        cacheReadCostPerMtok:
+          type: [number, 'null']
+          minimum: 0
+          description: Cached-input price in USD per 1 million tokens. Optional.
 
     WhisperModel:
       type: object
@@ -16453,6 +17317,27 @@ components:
               minimum: 1
             isDefault:
               type: boolean
+        localUploadMaxMb:
+          type: object
+          description: Maximum size in MB of one local-feed upload request (1 to 4096, default 1024).
+          properties:
+            value:
+              type: integer
+              minimum: 1
+              maximum: 4096
+            isDefault:
+              type: boolean
+        youtubeEnabled:
+          type: object
+          description: Whether YouTube feeds are enabled. Written through PUT /settings/youtube. Default false.
+          properties:
+            value:
+              type: boolean
+            isDefault:
+              type: boolean
+        youtubeApiKeyConfigured:
+          type: boolean
+          description: True when a YouTube Data API key is stored. The key itself is never returned.
         autoProcessEnabled:
           type: object
           properties:
@@ -17448,6 +18333,8 @@ components:
               type: integer
             maxAudioDownloadMb:
               type: integer
+            localUploadMaxMb:
+              type: integer
             providerRequestsPerMin:
               type: integer
             providerRequestsPerDay:
@@ -18370,7 +19257,8 @@ components:
             properties:
               service:
                 type: string
-                enum: [llm, whisper]
+                enum: [llm, whisper, sponsorblock]
+                description: sponsorblock counts YouTube episodes waiting on SponsorBlock, not offline-queue deferrals.
               held:
                 type: integer
               reachable:
@@ -18945,6 +19833,19 @@ components:
         dailyLimit: { type: string }
         unknownReserve: { type: string }
 
+    UploadTooLarge:
+      type: object
+      properties:
+        error:
+          type: string
+          example: File is too large. This server accepts up to 1024 MB per upload.
+        status:
+          type: integer
+          example: 413
+        maxUploadMb:
+          type: integer
+          description: The configured limit in MB.
+          example: 1024
     Error:
       type: object
       properties:

@@ -147,7 +147,7 @@ Controls available on each:
 
 | Control | Range | Notes |
 |---|---|---|
-| Temperature | 0.0 - 2.0 | 0.0 is fully reproducible. Keep detection and chapter boundaries low. |
+| Temperature | 0.0 - 2.0 | 0.0 is fully reproducible. Keep detection and chapter boundaries low. Not sent to Anthropic: API version 2026-10-21 removed temperature, so Anthropic stages run at the model default. |
 | Max tokens | 128 - 32768 | Response cap. Truncated JSON fails parsing; the salvage helper only recovers single-ad cases. |
 | Reasoning | Provider-aware | Older Anthropic models use a token budget (1024-65536 tokens). Adaptive-only Anthropic models, OpenAI, OpenRouter, and Ollama use an effort level (`none`, `low`, `medium`, `high`). |
 
@@ -163,7 +163,17 @@ Every tunable has a matching env var (`DETECTION_TEMPERATURE`, `VERIFICATION_MAX
 
 #### Ollama context window
 
-Ollama truncates prompts that exceed its context window without telling you. The default is often 2048 tokens, too small for a full-transcript pass, and detection fails silently. When the active provider is Ollama, Settings exposes a **Context window (num_ctx)** field; set it to your model's trained context (8192 or higher on most modern models). Env-var alias: `OLLAMA_NUM_CTX`.
+Ollama truncates prompts that exceed its context window without telling you. It keeps only the last half of the window, so the start of the prompt, the instructions included, is dropped and the model answers without them. The default is often 2048 tokens, too small for a full-transcript pass, and detection fails silently. When the active provider is Ollama, Settings exposes a **Context window (num_ctx)** field. Env-var alias: `OLLAMA_NUM_CTX`.
+
+Set it to **32768** or higher with the default window settings, and stay within your model's trained context. The largest prompts are:
+
+| Call | Prompt size with defaults |
+|---|---|
+| Chapter boundary detection (2700 s chapter windows) | 18k to 23k tokens |
+| Ad detection, 600 s window, fast-talking show | up to ~18k tokens |
+| Ad detection, 600 s window, typical show | 10k to 13k tokens |
+
+At 16384 every chapter call is cut and chapters degrade to a single chapter. A larger context needs more memory for the KV cache, so on memory-constrained hosts the alternative is smaller detection windows (below) and chapter windows.
 
 #### Detection window geometry
 
@@ -278,9 +288,13 @@ The active run and the latest attempted run are usually the same run. They diver
 
 ### JSON schema response format
 
-OpenAI-compatible endpoints only. When on, MinusPod asks the endpoint to enforce a JSON schema on detection, review, category repair, and trim-recovery responses instead of only asking for JSON, which cuts malformed replies. Off by default; the toggle is in **Settings > LLM Provider**.
+OpenAI-compatible and Ollama endpoints, whether the stage runs on Provider A or is routed to Provider B. When on, MinusPod asks the endpoint to enforce a JSON schema on detection, review, category repair, and trim-recovery responses instead of only asking for JSON, which cuts malformed replies. Off by default; the toggle is in **Settings > LLM Provider**.
 
-Support varies by model, not just by server. MinusPod probes each model the ad pipeline is configured to use, once, after the endpoint verifies, and stores one answer per model. Plain JSON mode is remembered the same way, so one model's rejection no longer speaks for the others on that endpoint. A model that rejects the schema falls back to plain JSON mode, and so does a model that passes the probe but rejects a real request. Check that your server implements `response_format` with `type: json_schema` before relying on it. Anthropic, OpenRouter, and Ollama call sites are unaffected by this toggle.
+Support varies by model, not just by server. MinusPod probes each model the ad pipeline is configured to use, once, after the endpoint verifies. Provider A and an enabled Provider B are both probed, and one answer is stored per model name, so two OpenAI-compatible endpoints that serve the same model name share it. Plain JSON mode is remembered the same way, so one model's rejection no longer speaks for the others on that endpoint. A model that rejects the schema falls back to plain JSON mode, and so does a model that passes the probe but rejects a real request. Check that your server implements `response_format` with `type: json_schema` before relying on it.
+
+With Ollama the schema goes out as the native `/api/chat` `format` field (Ollama 0.5 or later), which constrains decoding to it, so there is no probe. Turn it on for Ollama: in plain JSON mode a model cannot return the list of ads the prompt asks for, so it names its own key (`items`, `results`, `ad_spans`) or returns a single ad object, and detections under an unknown key or past the first ad in a window are lost.
+
+Anthropic and OpenRouter call sites are unaffected by this toggle.
 
 ### Cover art badge
 
@@ -387,7 +401,7 @@ The feed's **Episode filters** section has optional **Minimum (minutes)** and **
 
 Limits include their endpoints and use the publisher's RSS duration, before any download or ad removal. Episodes with missing, invalid, or zero duration stay eligible. The minimum cannot exceed the maximum.
 
-An episode outside the range skips automatic and just-in-time processing. **Skipped episodes** decides whether it stays in the served feed with original audio or is hidden. Manual reprocessing overrides duration, title, and description filters. Local feeds ignore these upstream filters.
+An episode outside the range skips automatic and just-in-time processing. **Skipped episodes** decides whether it stays in the served feed with original audio or is hidden. Manual reprocessing overrides duration, title, and description filters. Local feeds ignore these upstream filters. On YouTube feeds, videos of 180 seconds or less (Shorts) are skipped before these filters apply; see [YouTube Feeds](youtube-feeds.md#shorts-and-duration-filters).
 
 API: `minDurationSeconds` and `maxDurationSeconds` on `PATCH /api/v1/feeds/{slug}` accept finite, nonnegative numbers in seconds. Null clears a limit; omitted fields keep their saved values. Configuration Import / Export preserves both limits.
 
@@ -404,6 +418,29 @@ chapters, so nothing is copied. Episodes published before the feed existed
 stay out even when they are reprocessed. The modified OPML export lists it
 alongside your other feeds; the original export skips it, since it has no
 upstream URL.
+
+### YouTube
+
+Settings > YouTube configures [YouTube feeds](youtube-feeds.md). The feature is off until **Enable YouTube feeds** is on.
+
+| Setting (API field) | Default | Range | What it does |
+|---|---|---|---|
+| Enable YouTube feeds (`enabled`) | off | on or off | Master switch for lookup, listing and the SponsorBlock watcher |
+| YouTube Data API key (`apiKey`) | none | string | Optional. Write-only; the API reports `apiKeyConfigured` |
+| Processing delay (`processDelayMinutes`) | 60 | 0 to 1440 minutes | Wait after discovery before the first SponsorBlock check |
+| SponsorBlock probe attempts (`sbProbeAttempts`) | 6 | 0 to 48 | Lookups before the fallback or watch window |
+| Probe interval (`sbProbeIntervalMinutes`) | 30 | 5 to 1440 minutes | Gap between probes |
+| Watch interval (`sbWatchIntervalHours`) | 6 | 1 to 48 hours | Gap between checks in the watch window |
+| Watch ceiling (`sbWatchMaxDays`) | 7 | 1 to 60 days | Days after publish before the watch ends |
+| LLM fallback (`llmFallback`) | on | on or off | Run the LLM pipeline when no marks appear |
+| Use YouTube captions as the transcript (`captionsAsTranscript`) | on | on or off | Skip Whisper when captions exist |
+| Hide private and deleted episodes (`hidePrivate`) | on | on or off | Skip playlist entries the listing cannot see; turn off when the cookies account can watch them |
+| Transcribe when captions are missing (`transcribeFallback`) | off | on or off | Run the configured transcriber for videos with no captions; off keeps such videos on SponsorBlock marks only |
+| Update yt-dlp daily (`ytdlpAutoUpdate`) | on | on or off | Daily self-update of the data-volume copy |
+| Proxy URL (`proxyUrl`) | empty | up to 500 characters, http, https, socks4, socks5 or socks5h | Routes yt-dlp and YouTube Data API requests through a proxy |
+| Extra yt-dlp arguments (`ytdlpExtraArgs`) | empty | up to 1000 characters | Added before MinusPod's own options on every yt-dlp call; unsafe options are rejected |
+
+A YouTube feed overrides the delay, probe attempts, probe interval, LLM fallback, captions, private-video hiding, transcription fallback, and Shorts settings per feed, and adds a pass 1 detection switch, which runs the LLM detector in addition to SponsorBlock and cuts both sets of segments. Learned patterns run on every YouTube episode and learn from the SponsorBlock marks; Full reprocess and Re-detect ads force the LLM for that run. Null inherits the global value; 0 is a real value. The watch interval and ceiling are global only. API: `GET` and `PUT /api/v1/settings/youtube`. `POST /api/v1/settings/youtube/reset` restores the settings in this table; see [YouTube Feeds](youtube-feeds.md#yt-dlp) for what it keeps. Per-feed fields on `PATCH /api/v1/feeds/{slug}` are listed in [YouTube Feeds](youtube-feeds.md#per-feed-overrides).
 
 ### Per-feed retention
 
@@ -428,6 +465,10 @@ Settings > Security has an **Agents that skip processing** list, empty by defaul
 Matching is case-insensitive, and a bare pattern matches anywhere in the agent string. Start a pattern with `^` to anchor it to the beginning, which short strings like `atc/` need so they cannot match in the middle of an unrelated agent. Each entry is limited to 200 characters; blank or whitespace-only entries are dropped when saved. The [opawg/user-agents](https://github.com/opawg/user-agents) registry lists the real strings crawlers and podcast apps send, useful when picking a pattern.
 
 API: `jitBlockedUserAgents` (array of strings) on `PUT /api/v1/settings/ad-detection`.
+
+### Local upload size limit
+
+Caps the size of one local-feed upload request (a single episode or a batch of staged import files). Set it in Settings > Audio > Max upload size, or with `localUploadMaxMb` on `PUT /api/v1/settings/ad-detection`. Default 1024 MB, range 1 to 4096 MB. A reverse proxy or Cloudflare in front of the server may cap uploads lower than this setting; see [Upload size behind a proxy](DEPLOYMENT.md#upload-size-behind-a-proxy).
 
 ## Output audio
 

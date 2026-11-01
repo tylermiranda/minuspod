@@ -17,7 +17,7 @@ from config import (
 )
 
 from database.episodes import normalize_published_at
-from database.podcasts import is_local_feed, is_recents_feed, podping_declaration_columns
+from database.podcasts import is_local_feed, is_recents_feed, is_youtube_feed, podping_declaration_columns
 from database.queue import compute_queue_priority
 from chapter_notes import chapter_notes_for
 from local_feed_builder import rebuild_local_feed
@@ -25,6 +25,8 @@ from recents_feed import rebuild_recents_feed
 from utils.http import safe_url_for_log
 from utils.retry import calculate_backoff
 from utils.time import parse_iso_utc, utc_now_iso
+from youtube import settings as yt_settings
+from youtube.feed import rebuild_youtube_feed
 
 from slugify import slugify
 
@@ -256,6 +258,86 @@ def is_served_rss_stale(slug: str, podcast: dict | None, cached_rss: str | None)
     return False
 
 
+_EPOCH = datetime.min.replace(tzinfo=timezone.utc)
+YOUTUBE_ARTWORK_RETRY = timedelta(hours=24)
+_youtube_artwork_retry_at: dict[str, datetime] = {}
+
+
+def _fetch_youtube_source_artwork(slug, podcast, force):
+    """Pull the channel or playlist thumbnail; returns True when it was saved."""
+    if not yt_settings.enabled(db):
+        return False
+    from youtube import discovery
+    from youtube.urls import Source
+    info = discovery.resolve_source(db, Source(podcast['youtube_source_kind'], podcast['youtube_source_id']))
+    if not info.artwork_url:
+        return False
+    return storage.download_artwork(slug, [info.artwork_url], force=force)
+
+
+def _refresh_youtube_feed(slug, podcast, force, record_failure) -> RefreshOutcome:
+    """Discover videos, queue SponsorBlock waits, render the served RSS."""
+    from youtube import discovery, watch as yt_watch  # lazy: avoids an import cycle at startup
+    if not force and _refresh_coalesce.get(slug) is not None:
+        return RefreshOutcome(True, 'coalesced')
+    if not yt_settings.enabled(db):
+        rebuild_youtube_feed(slug, podcast)
+        _record_refresh_success(slug)
+        return RefreshOutcome(True, 'disabled', 0, 0)
+    _refresh_coalesce.set(slug, True)
+    db.update_podcast(slug, last_refresh_attempt_at=utc_now_iso())
+    try:
+        limit = db.get_max_episodes_for_podcast(slug, podcast=podcast)
+        resolved = yt_settings.resolve_feed(db, podcast)
+        try:
+            episodes = discovery.list_videos(db, podcast, limit, resolved)
+        except discovery.DiscoveryError as exc:
+            if record_failure:
+                _record_refresh_failure(slug, str(exc), podcast=podcast)
+            refresh_logger.warning(f"[{slug}] YouTube listing failed: {exc}")
+            status_service.complete_feed_refresh(slug, 0)
+            _refresh_coalesce.invalidate(slug)
+            return RefreshOutcome(False, 'fetch_failed', error=str(exc))
+        inserted, ep_statuses, _ = db.bulk_upsert_discovered_episodes(slug, episodes, return_state=True)
+        if inserted > 0:
+            refresh_logger.info(f"[{slug}] Discovered {inserted} new video(s)")
+        scheduled = 0
+        if db.is_auto_process_enabled_for_podcast(slug, podcast=podcast):
+            cutoff = datetime.now(timezone.utc) - timedelta(hours=db.get_auto_process_max_age_hours(podcast))
+            for ep in episodes:
+                if ep_statuses.get(ep['id']) not in (None, 'discovered'):
+                    continue
+                published = parse_iso_utc(ep.get('published'))
+                if not published or published < cutoff:
+                    continue
+                if episode_matches_feed_filters(ep, podcast):
+                    refresh_logger.info(f"[{slug}] Skipping video matched by feed filters: {ep.get('title')}")
+                    continue
+                if yt_watch.schedule_new_episode(db, slug, ep['id'], resolved):
+                    scheduled += 1
+        if scheduled:
+            refresh_logger.info(f"[{slug}] {scheduled} video(s) waiting for SponsorBlock")
+        if not podcast.get('artwork_cached') and datetime.now(timezone.utc) >= _youtube_artwork_retry_at.get(slug, _EPOCH):
+            try:
+                saved = _fetch_youtube_source_artwork(slug, podcast, force=False)
+            except Exception as e:
+                saved = False
+                refresh_logger.debug(f"[{slug}] YouTube source artwork fetch failed: {e}")
+            if saved:
+                _youtube_artwork_retry_at.pop(slug, None)
+            else:
+                _youtube_artwork_retry_at[slug] = datetime.now(timezone.utc) + YOUTUBE_ARTWORK_RETRY
+        rebuild_youtube_feed(slug, podcast)
+        _record_refresh_success(slug)
+        status_service.complete_feed_refresh(slug, 0)
+        return RefreshOutcome(True, 'refreshed', inserted, scheduled)
+    except Exception as e:
+        refresh_logger.error(f"[{slug}] YouTube refresh failed: {_scrub_query_strings(str(e))}")
+        status_service.remove_feed_refresh(slug)
+        _refresh_coalesce.invalidate(slug)
+        return RefreshOutcome(False, 'internal_error', error='Internal refresh error')
+
+
 def refresh_rss_feed(slug: str, feed_url: str, force: bool = False,
                       record_failure: bool = True):
     """Refresh RSS feed for a podcast.
@@ -279,6 +361,8 @@ def refresh_rss_feed(slug: str, feed_url: str, force: bool = False,
     if is_recents_feed(podcast):
         success = bool(rebuild_recents_feed(podcast))
         return RefreshOutcome(success, 'refreshed' if success else 'failed')
+    if is_youtube_feed(podcast):
+        return _refresh_youtube_feed(slug, podcast, force, record_failure)
 
     if not force and _refresh_coalesce.get(slug) is not None:
         refresh_logger.debug(f"[{slug}] Skipping refresh (recent attempt within coalesce window)")
@@ -838,6 +922,8 @@ def rebuild_served_rss(slug, podcast=None):
         return rebuild_local_feed(slug, podcast)
     if is_recents_feed(podcast):
         return rebuild_recents_feed(podcast)
+    if is_youtube_feed(podcast):
+        return rebuild_youtube_feed(slug, podcast)
     if not podcast or not podcast.get('source_url'):
         return False
     try:
@@ -861,9 +947,14 @@ def refresh_feed_artwork(slug, podcast=None):
     if not podcast or not podcast.get('source_url'):
         return False
     if is_local_feed(podcast):
-        # Local artwork is uploaded by the operator, never fetched upstream.
+        # Local artwork is uploaded, never re-fetched.
         return False
     try:
+        if is_youtube_feed(podcast):
+            _fetch_youtube_source_artwork(slug, podcast, force=True)
+            _youtube_artwork_retry_at.pop(slug, None)
+            storage.clear_watermark_cache(slug)
+            return rebuild_served_rss(slug, podcast)
         # Re-derive candidates from the live feed so a manual refresh can
         # recover from a preferred candidate that has started 404ing, not
         # just re-fetch the URL already on the row. Falls back to the

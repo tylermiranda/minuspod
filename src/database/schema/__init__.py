@@ -501,6 +501,9 @@ class SchemaMixin:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_llm_call_usage_logical "
             "ON llm_call_usage(logical_call_id)")
+        pricing_cols = self._get_table_columns(conn, 'model_pricing')
+        self._add_column_if_missing(
+            conn, 'model_pricing', 'cache_read_cost_per_mtok', 'REAL', pricing_cols)
 
         # -- Episodes table columns --
         self._add_episode_columns(conn)
@@ -679,6 +682,19 @@ class SchemaMixin:
             # cover is not retried until its backoff window elapses even
             # after a process restart.
             ('artwork_failure_state', 'TEXT'),
+            # YouTube feeds: source identity plus per-feed SponsorBlock
+            # overrides (NULL inherits the global setting).
+            ('youtube_source_kind', 'TEXT'),
+            ('youtube_source_id', 'TEXT'),
+            ('youtube_include_shorts', 'INTEGER'),
+            ('yt_process_delay_minutes_override', 'INTEGER'),
+            ('yt_probe_attempts_override', 'INTEGER'),
+            ('yt_probe_interval_minutes_override', 'INTEGER'),
+            ('yt_llm_fallback_override', 'INTEGER'),
+            ('yt_llm_on_top_override', 'INTEGER'),
+            ('yt_captions_override', 'INTEGER'),
+            ('yt_hide_private_override', 'INTEGER'),
+            ('yt_transcribe_override', 'INTEGER'),
         ]
         for col, definition in podcasts_migrations:
             self._add_column_if_missing(conn, 'podcasts', col, definition, pod_cols)
@@ -687,6 +703,28 @@ class SchemaMixin:
             episode_cols = self._get_table_columns(conn, 'episodes')
             self._add_column_if_missing(
                 conn, 'episodes', 'deletion_requested_at', 'TEXT', episode_cols)
+            for col, definition in (
+                    ('quality_rating', 'INTEGER'),
+                    ('quality_notes', 'TEXT'),
+                    ('quality_rated_at', 'TEXT')):
+                self._add_column_if_missing(conn, 'episodes', col, definition, episode_cols)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_episodes_quality_rated_at "
+                         "ON episodes(quality_rated_at) WHERE quality_rating IS NOT NULL")
+            for col, definition in (
+                    ('youtube_video_id', 'TEXT'),
+                    ('sb_state', 'TEXT'),
+                    ('sb_next_check_at', 'TEXT'),
+                    ('sb_attempts', 'INTEGER NOT NULL DEFAULT 0'),
+                    ('sb_segment_uuids', 'TEXT'),
+                    ('sb_last_error', 'TEXT'),
+                    ('sb_note', 'TEXT'),
+                    ('sb_submissions', 'TEXT'),
+                    ('yt_metadata_at', 'TEXT')):
+                self._add_column_if_missing(conn, 'episodes', col, definition, episode_cols)
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_episodes_sb_next_check "
+                         "ON episodes(sb_next_check_at) WHERE sb_next_check_at IS NOT NULL")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_episodes_sb_waiting "
+                         "ON episodes(sb_state) WHERE sb_state IN ('waiting','probing')")
 
         # -- audio_cue_templates table columns --
         act_cols = self._get_table_columns(conn, 'audio_cue_templates')
@@ -1907,6 +1945,14 @@ class SchemaMixin:
             conn.rollback()
             logger.error(f"search index plain-text re-strip failed: {e}")
 
+        try:
+            self._run_youtube_drop_private_placeholders(conn)
+            self._run_youtube_drop_private_placeholders(
+                conn, 'youtube_drop_private_placeholders_failed', ('failed', 'permanently_failed'))
+        except Exception as e:
+            conn.rollback()
+            logger.error(f"youtube private placeholder cleanup failed: {e}")
+
         # Per-boot, not schema_migrations-gated: seeds an absent model row
         # from OPENAI_MODEL, run after the clear above so a stale default is
         # removed and reseeded in the same boot.
@@ -2809,6 +2855,28 @@ class SchemaMixin:
             logger.info("search-index-reindex: skipped, auto-populate already rebuilt it this boot")
         else:
             logger.info(f"search-index-reindex: complete, {count} row(s) indexed")
+
+    def _run_youtube_drop_private_placeholders(self, conn, name='youtube_drop_private_placeholders',
+                                               statuses=('discovered',)):
+        """One-shot delete of YouTube rows in the given statuses titled with their bare video id."""
+        if conn.execute("SELECT 1 FROM schema_migrations WHERE name = ?", (name,)).fetchone():
+            return
+        rows = conn.execute(
+            "SELECT e.id, e.episode_id, p.slug FROM episodes e JOIN podcasts p ON p.id = e.podcast_id "  # noqa: S608
+            f"WHERE e.status IN ({','.join('?' * len(statuses))}) AND e.title = e.youtube_video_id "
+            "AND (e.description IS NULL OR e.description = '') AND p.feed_type = 'youtube' "
+            "AND e.processed_at IS NULL",
+            statuses
+        ).fetchall()
+        if rows:
+            conn.executemany("DELETE FROM episodes WHERE id = ?", [(r['id'],) for r in rows])
+            if self._table_exists(conn, 'search_index'):
+                pairs = [(r['episode_id'], r['slug']) for r in rows]
+                for start in range(0, len(pairs), _COLLAPSE_BATCH_ROWS):
+                    self._delete_indexed_episodes(conn, pairs[start:start + _COLLAPSE_BATCH_ROWS])
+            logger.info(f"youtube-private-placeholders: removed {len(rows)} placeholder episode(s)")
+        conn.execute("INSERT OR IGNORE INTO schema_migrations (name) VALUES (?)", (name,))
+        conn.commit()
 
     def _run_reindex_search_plain_text(self, conn, already_rebuilt: bool = False,
                                        name: str = 'search_index_plain_text_2_100_12') -> bool:

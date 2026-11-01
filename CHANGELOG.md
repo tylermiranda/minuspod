@@ -9,7 +9,319 @@ Alongside the standard sections, a "Breaking" section marks changes
 that require operator action; these are surfaced at the top of stable
 release notes.
 
-## [Unreleased]
+## [2.101.11] - 2026-10-31
+
+### Added
+
+- Add feed searches YouTube by show name when YouTube feeds are on.
+  Playlists and channels appear under the directory results, playlists
+  marked as podcast shows rank higher with a Podcast badge, and choosing
+  one opens the lookup card with its RSS directory matches. Works with or
+  without a Data API key.
+- YouTube episodes can send ads to SponsorBlock by hand. SponsorBlock forbids
+  automated submissions, so nothing is ever sent on its own. A setting and a
+  private user ID enable a per-episode review where every segment starts
+  unchecked and each outcome is recorded.
+- Settings > YouTube can generate a SponsorBlock private user ID for people
+  without the browser extension. The stored ID is hidden by default with
+  Show and Copy buttons, and cannot be regenerated while one is stored.
+- Episodes take a 1 to 5 star quality rating with notes below 5. Five stars
+  confirms every cut ad segment without a recut. Feeds show the average, and
+  the diagnostics download includes the ratings and notes for its range.
+- The transcript dialog's search can show one or three neighbouring segments
+  around each match, jump to a match inside the full transcript, and step
+  through matches with Previous and Next or Enter.
+- The YouTube watcher notices when the SponsorBlock API stops answering
+  and checks it until it is back. While it is unreachable, YouTube episodes waiting on it are held with no downloads or
+  attempts counted, SponsorBlock submissions are refused, and the status bar
+  shows SponsorBlock as unreachable. Other feeds keep processing.
+
+### Changed
+
+- Docker build: A SECURITY_SRC=stub build argument skips the patched security
+  package builds and uses stock Ubuntu packages, for faster local development builds.
+  Published images keep the default.
+- Docker build: Patched security packages are built once per patch change by
+  CI into the ttlequals0/minuspod-security-packages image (amd64 and arm64) and
+  both app Dockerfiles copy them by pinned digest, so release and local builds
+  no longer compile them. A weekly check opens an issue when a pinned package
+  falls behind Ubuntu, and a monthly run rebuilds the image with fresh build
+  dependencies and opens a pin PR.
+
+## [2.101.10] - 2026-10-31
+
+### Fixed
+
+- Anthropic requests failed with HTTP 400 "temperature: Extra inputs are not permitted" after the SDK bump to 2.1.0. That SDK uses API version 2026-10-21, which removed temperature on every model. The native Anthropic client no longer sends it, and the self-heal path recognizes the new error text on proxy routes (#926).
+- System One tuneables saved correctly, but the Settings page and the Troubleshooting configuration download always showed the shipped defaults. The form stayed dirty after a save and the unsaved-changes warning fired. The settings payload now reads saved profiles (#917).
+- System One HTTP errors now include the upstream error message, so a provider rejecting a request (for example a cap on questions per request) is visible in the logs (#917).
+
+### Changed
+
+- The "Questions per API request" help text and docs note that some third-party endpoints cap questions per request and that detection sends one question per transcript segment (#917).
+
+## [2.101.9] - 2026-10-30
+
+### Fixed
+
+- Episode player controls stay centered and fit narrow screens at every playback speed. Audio and chapter failures offer retry actions, and seeking waits for media metadata.
+- Collapsed episode descriptions expand when a link receives keyboard focus, so focused links remain visible.
+- YouTube settings show failed loads and field errors, preserve unsaved edits, and prevent overlapping saves, resets, cookie changes, and key tests.
+- Feed metadata survives background refreshes. Artwork uploads report progress and errors. Numeric YouTube overrides validate their bounds and save explicit values that match the global default.
+- YouTube feed creation honors advanced feed options, discards stale lookup results, and uses source-specific reprocessing descriptions.
+
+### Changed
+
+- The design guide documents responsive player controls, independent drafts, failure states, and browser checks with restored data. Button and detection-card examples match the shared recipes.
+
+## [2.101.8] - 2026-10-30
+
+### Added
+
+- The episode page has a built-in audio player with chapter navigation and the current chapter title, skip back 15 s and forward 30 s, playback speed remembered per browser, and keyboard shortcuts. The episode description now sits under the player and collapses to a few lines with a Show more button.
+
+### Changed
+
+- lucide-react 1.62.0.
+
+## [2.101.7] - 2026-10-30
+
+### Fixed
+
+- The YouTube metadata backfill skips a row whose feed was deleted mid-batch
+  instead of logging an error for the whole batch.
+- SponsorBlock marks named only by a category label no longer reach text-pattern
+  creation, which rejected them with warnings.
+
+### Changed
+
+- Listed videos that already carry a description and an exact publish time are
+  not revisited by the metadata backfill.
+
+## [2.101.6] - 2026-10-30
+
+### Added
+
+- Settings > YouTube has a Reset to defaults action for its tunables, daily update toggle, proxy and extra arguments. The feature switch, Data API key and cookies file are kept.
+
+### Changed
+
+- Settings > YouTube lists the proxy and extra-argument fields first and keeps the yt-dlp version, daily update toggle and Update now button together below them.
+
+## [2.101.5] - 2026-10-30
+
+### Fixed
+
+- The metadata backfill gives up on a video after three failed lookups
+  instead of retrying forever.
+- The placeholder cleanup also removes placeholders whose processing attempt
+  failed.
+- Deleting a feed also removes its pending rows from the processing queue, so
+  a removed feed cannot be picked up for processing again.
+
+## [2.101.4] - 2026-10-30
+
+### Added
+
+- An Extra yt-dlp arguments setting under Settings > YouTube adds options
+  such as a rate limit to every yt-dlp call. Options that run programs, move
+  files, read local files, change the JSON output or update the binary are
+  rejected.
+- A Proxy URL setting under Settings > YouTube routes yt-dlp and YouTube Data
+  API requests through an HTTP or SOCKS proxy.
+- A YouTube feed can hold a single video: paste a watch, youtu.be, live or
+  shorts URL on Add feed and the feed serves that one episode. The preview
+  card shows the source kind as Video.
+
+### Fixed
+
+- Private and deleted playlist entries no longer appear as episodes titled
+  with a bare video id.
+- A one-shot cleanup removes the placeholder episodes those
+  entries already created.
+- Processing stats record the chapters stage when publisher chapters are
+  preserved, and show a SponsorBlock lookup stage on YouTube runs.
+
+### Changed
+
+- The YouTube playlist listing sends the cookies file and hides private and
+  deleted episodes by default. A global "Hide private and deleted episodes"
+  setting with a per-feed override lists them instead, titled "Private episode"
+  until the real title is known.
+- SponsorBlock-only runs skip audio analysis, since marks are cut as given
+  and nothing reads the signals. The stats table shows the stage as skipped.
+
+## [2.101.3] - 2026-10-30
+
+### Changed
+
+- A YouTube feed lists every discovered episode with its upload date, up to
+  the feed's episode cap. The first play of an unprocessed episode starts
+  processing, as on subscribed and local feeds. Turn on "Only expose
+  processed episodes" for the feed to list finished episodes only.
+
+### Fixed
+
+- Processed YouTube episodes appear in the combined Recents feed and the
+  Recents list, like subscribed and local episodes.
+- YouTube publish times stored as midnight are upgraded to the video's
+  exact time by the metadata backfill, which also reads release timestamps.
+
+## [2.101.2] - 2026-10-30
+
+### Fixed
+
+- YouTube episode descriptions and exact publish times are filled for
+  episodes that were only discovered, not downloaded. A background pass reads
+  the metadata of up to 10 episodes per refresh cycle without downloading
+  audio, so a feed added without an API key fills in over the first hour.
+- A reprocess that reuses the retained original audio of a YouTube episode
+  fetches the captions again instead of losing them, and a saved transcript is
+  never wiped when the run cannot regenerate it.
+- The known-sponsor hint no longer fails with a missing database when the
+  reviewer is its first caller.
+- The feed page action row keeps Delete on screen while Refresh is pending at
+  phone widths.
+
+### Changed
+
+- YouTube episodes with SponsorBlock marks also run the learned ad
+  patterns (audio fingerprints and text patterns) with the LLM off, and the
+  marks themselves are learned as patterns after the cut. A pattern hit that
+  overlaps a mark gives way to the mark. The LLM runs only without marks or
+  with Pass 1 detection on.
+- On a YouTube feed, Full reprocess and Re-detect ads force pass 1 LLM
+  detection for that episode even when marks exist. The episode and dashboard
+  menus say which mode runs marks, patterns and the LLM pass.
+
+## [2.101.1] - 2026-10-30
+
+### Fixed
+
+- SponsorBlock-only runs no longer invoke the LLM reviewer, so community
+  timestamps are cut as given instead of being nudged.
+- YouTube episode descriptions and exact publish times are filled from the
+  video metadata at download when the listing had none (feeds listed with
+  yt-dlp carry no descriptions until then).
+- YouTube caption transcripts drop speaker-change markers and bracketed
+  sound cues.
+- The feed URL copy button shares the action row with Reprocess, Refresh
+  and Delete at phone widths.
+- The YouTube feed panel keeps the same spacing as its neighbours.
+
+### Added
+
+- Transcribe when captions are missing: an optional transcription fallback
+  for YouTube feeds (global toggle with a per-feed override, off by
+  default). With it off, a video without captions is cut from SponsorBlock
+  marks only, and once SponsorBlock gives up with no marks it is served
+  unmodified.
+- YouTube feeds take their author from the source and let you edit author,
+  explicit and categories, so the served channel carries the iTunes tags.
+
+## [2.101.0] - 2026-10-29
+
+### Added
+
+- YouTube feeds (#898). Add a playlist or channel from the Add feed page and
+  MinusPod turns it into a podcast feed. SponsorBlock community marks are the
+  cut source by default, with a configurable processing delay, probe loop and
+  watch window before the LLM pipeline takes over (or instead of it, per feed).
+  Video captions become the transcript when present, creator chapters are
+  kept, and every knob lives in Settings > YouTube with per-feed overrides.
+  Each processed video's thumbnail is cached for per-episode artwork, and feed
+  artwork can be uploaded or refreshed from the source. Off by default.
+- yt-dlp 2026.10.26 ships in both images (baked floor) and self-updates daily
+  on the data volume, with an Update now button and an optional global
+  cookies file for yt-dlp.
+
+### Changed
+
+- Dockerfiles install Deno, the JavaScript runtime yt-dlp needs for YouTube.
+
+### Security
+
+- Dependency bumps folded in: lucide-react 1.61.0, react-router 8.5.0,
+  wavesurfer.js 8.0.3, vite 8.3.5, @testing-library/user-event 14.6.8,
+  soupsieve 3.0.4, actions/setup-python 7.1.0, docker/login-action 4.7.0
+  (#902, #903, #905, #906, #907, #908, #909, #910).
+
+## [2.100.26] - 2026-10-28
+
+### Added
+
+- The local upload size limit is now a setting (Settings > Audio > Max upload
+  size, or `localUploadMaxMb` in the API; default 1 GB, range 1 to 4096 MB).
+  The server's own 413 response names the limit, and the docs explain the
+  Cloudflare and nginx body-size caps that can sit in front of it (#920).
+
+### Fixed
+
+- A known ad always cuts. A marker backed by a fingerprint match, a sponsor
+  text pattern, a defined pattern, a sponsor with an active pattern, a
+  confirmation or a reviewer verdict now owns any audio it shares with a
+  keep-category marker. Kept audio never carves it, and a verification catch
+  naming a known sponsor is no longer dropped for lying inside a kept span.
+  Before, an outro pattern whose end was only an average-length estimate could
+  swallow the start of a fingerprinted sponsor read, and every later stage
+  deferred to that estimate. The operator's per-category keep still applies to
+  markers of that category.
+- Ollama: the JSON schema response format toggle now applies to Ollama, which
+  sends the detection schema as the native `/api/chat` `format` (no probe).
+  In plain JSON mode a model cannot return the ad list the prompt asks for:
+  gemma4 answered with one bare ad object per window or picked its own key
+  (`items`, `results`, `ad_spans`), so a window's second and later ads, or all
+  of them, were lost. Detection windows now send a per-addressing-mode schema
+  that requires the fields the prompt requires and caps free text, since an
+  enforcing decoder otherwise skips category and end_text and can loop inside
+  a string until max_tokens.
+- JSON schema responses require what the prompt requires. The per-mode
+  detection schema now also requires `start_text`, the reviewer schema
+  requires `is_ad` and `reason` on every item, and the trim-recovery schema
+  requires both nullable edges, so an enforcing decoder cannot drop the
+  verdict or an edge quote.
+
+### Changed
+
+- Docs: Parakeet is now the recommended local transcription backend. The
+  `WHISPER_BACKEND` default is unchanged.
+
+- CI runs pytest on all runner cores with pytest-xdist. Two run-log tests
+  that log a lone surrogate now route it to the recorder without the root
+  logger, since xdist cannot send that text back from a worker, and a
+  prefetch test waits for the lookahead before changing the chunk size.
+  Tests share one database, so a fixture now reverts any setting a test
+  leaves behind and the missing-stack transcriber tests reset the model
+  singleton; the suite passes under every xdist distribution mode.
+
+## [2.100.24] - 2026-10-27
+
+### Fixed
+- A stage routed to an OpenAI-compatible Provider B now gets the opted-in JSON
+  schema response format. The gate read the global provider type instead of
+  the routed one, the same fault #914 fixed for the reasoning field. The
+  format probes also only ran on Provider A, so Provider B models never had
+  an answer. Both slots are probed now, at startup and when either changes.
+- A stage routed to Provider B sends that provider's reasoning field. The
+  OpenAI-compatible client chose the reasoning shape from the global
+  provider, so an OpenRouter Provider B behind a TypeSafe Provider A got no
+  reasoning field at all, and the "retry with reasoning disabled" fallback
+  sent the same request again. Reasoning models then spent the whole output
+  budget and chapter generation failed.
+
+## [2.100.23] - 2026-10-26
+
+### Added
+- `utils/segments.py` helpers for validating, normalizing and joining word-timed segments.
+- Stats: cache read and write tokens on model usage, per-run totals and
+  contributing calls. A cache hit rate (reads over input) shows on the model
+  usage table, the contributing calls panel, the per-run phase breakdown and
+  the LLM token tile (#897).
+- Pricing: `model_pricing` stores a cache read rate from the OpenRouter API or
+  LiteLLM, filled in from a later source when the primary one lacks it.
+  Operator overrides accept `cacheReadCostPerMtok`, and the Settings pricing
+  form has an optional cached input field. Estimated costs on OpenAI-compatible
+  and OpenRouter rows bill cached input at that rate (#897).
 
 ### Changed
 - README rewritten as a short overview: one-line feature bullets that link
@@ -25,6 +337,11 @@ release notes.
   a bump on every release.
 
 ### Fixed
+- Ollama: a call whose prompt Ollama silently truncated to fit num_ctx now fails instead of returning an answer written without the instructions. The native client compares `prompt_eval_count` with num_ctx/2 and the prompt's own size estimate. The error names num_ctx, a lost detection window is counted under the new `context_overflow` loss class, and a chapter run degraded by it says so in its degradation reason. (#893)
+- Docs: the Ollama context window advice now recommends 32768 or higher. Chapter prompts with the default 2700 s windows run 18k to 23k tokens, so the old "8192 or higher" advice left every chapter call truncated. (#893)
+- Transcript text built from word timings no longer renders split Whisper tokens as
+  "AT &T .com"; words are normalized (merged, space-prefixed, sorted) as soon as a
+  backend returns them (#899).
 - OpenAPI: the per-episode cost runs endpoint and the processing-admission
   pause endpoint are documented, and descriptions drop dash asides, version
   history and two stale README pointers.

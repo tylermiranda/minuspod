@@ -7,11 +7,13 @@ from email.utils import parsedate_to_datetime
 from typing import ClassVar
 
 from database.maintenance import _chunked
+from database.podcasts import RECENTS_MEMBER_FEED_TYPES
 # Shared with the stats mixin so both agree on what counts as processed.
 from database.stats import _PROCESSED_EPISODE_EXISTS_SQL
 from utils.constants import EpisodeStatus
 from utils.text import is_timezone_drift, normalize_title_for_match
 from utils.time import ISO_FORMAT, parse_iso_utc, utc_now, utc_now_iso
+from utils.youtube_fields import MIDNIGHT_ONLY, PLACEHOLDER_TITLES
 
 logger = logging.getLogger(__name__)
 
@@ -135,6 +137,10 @@ def _remove_from_fuzzy_index(fuzzy_index: dict, row: dict | None) -> None:
             break
     if not bucket:
         fuzzy_index.pop(key, None)
+
+
+class PodcastNotFoundError(ValueError):
+    """Raised when a write targets a podcast that no longer exists."""
 
 
 class EpisodeMixin:
@@ -354,7 +360,7 @@ class EpisodeMixin:
         # Get podcast ID
         podcast = self.get_podcast_by_slug(slug)
         if not podcast:
-            raise ValueError(f"Podcast not found: {slug}")
+            raise PodcastNotFoundError(f"Podcast not found: {slug}")
 
         podcast_id = podcast['id']
 
@@ -387,7 +393,7 @@ class EpisodeMixin:
                                'low_yield_rerun_at', 'reprocess_source',
                                'season_number', 'p20_item_json',
                                'pending_recut_at', 'chapters_regen_error',
-                               'processed_size_bytes'):
+                               'processed_size_bytes', 'yt_metadata_at'):
                         fields.append(f"{key} = ?")
                         values.append(value)
                     elif key == 'tags':
@@ -471,6 +477,41 @@ class EpisodeMixin:
         )
         row = cursor.fetchone()
         return row['id'] if row else None
+
+    def set_episode_rating(self, slug: str, episode_id: str, rating: int | None,
+                           notes: str | None = None) -> bool:
+        """Store or (rating None) clear the quality rating, notes and stamp."""
+        db_id = self._get_episode_db_id(slug, episode_id)
+        if not db_id:
+            return False
+        conn = self.get_connection()
+        conn.execute(
+            "UPDATE episodes SET quality_rating = ?, quality_notes = ?, quality_rated_at = ? WHERE id = ?",
+            (rating, notes if rating is not None else None,
+             utc_now_iso() if rating is not None else None, db_id))
+        conn.commit()
+        return True
+
+    def get_feed_rating_summary(self, slug: str) -> tuple[float | None, int]:
+        """(average, count) of the quality ratings across one feed's episodes."""
+        row = self.get_connection().execute(
+            """SELECT AVG(e.quality_rating) AS average, COUNT(e.quality_rating) AS n
+               FROM episodes e JOIN podcasts p ON e.podcast_id = p.id
+               WHERE p.slug = ? AND e.quality_rating IS NOT NULL""", (slug,)).fetchone()
+        return (row['average'], row['n']) if row['n'] else (None, 0)
+
+    def get_rated_episodes(self, start_iso: str, end_iso: str, limit: int) -> list[dict]:
+        """Episodes rated inside [start_iso, end_iso], newest rating first."""
+        rows = self.get_connection().execute(
+            """SELECT p.slug, e.episode_id, e.title, e.quality_rating, e.quality_notes,
+                      e.quality_rated_at, ed.ad_markers_json
+               FROM episodes e
+               JOIN podcasts p ON e.podcast_id = p.id
+               LEFT JOIN episode_details ed ON e.id = ed.episode_id
+               WHERE e.quality_rating IS NOT NULL
+                 AND e.quality_rated_at >= ? AND e.quality_rated_at <= ?
+               ORDER BY e.quality_rated_at DESC LIMIT ?""", (start_iso, end_iso, limit)).fetchall()
+        return [dict(r) for r in rows]
 
     def get_episode_state(self, slug: str, episode_id: str) -> dict | None:
         """Just the fields a caller needs to decide whether to act on an episode."""
@@ -1173,12 +1214,11 @@ class EpisodeMixin:
         )
         return [dict(row) for row in cursor.fetchall()]
 
-    # Membership of the recents feed (#721): processed episodes across
-    # subscribed and local feeds published on or after the cutoff. Publish
-    # date only: a backlog episode processed later keeps its old date.
+    # Recents feed membership (#721): processed episodes of member feed types published on or after
+    # the cutoff. Publish date only; type list is constants, not user input.
     _RECENTS_WHERE = ("FROM episodes e JOIN podcasts p ON p.id = e.podcast_id "
                       "WHERE e.status = 'processed' AND e.processed_file IS NOT NULL "
-                      "AND p.feed_type IN ('subscribed', 'local') "
+                      "AND p.feed_type IN (" + ", ".join(f"'{t}'" for t in RECENTS_MEMBER_FEED_TYPES) + ") "
                       "AND e.published_at IS NOT NULL AND e.published_at >= ?")
     _RECENTS_SOURCE_COLS = ("p.slug AS source_slug, "
                             "COALESCE(NULLIF(p.title_override, ''), NULLIF(p.title, ''), p.slug) AS source_title, "
@@ -1457,6 +1497,7 @@ class EpisodeMixin:
         podcast_id = podcast['id']
         inserted = 0
         skipped = 0
+        stamp_now = utc_now_iso() if podcast.get('feed_type') == 'youtube' else None
 
         normalized = []
         for episode in episodes:
@@ -1495,7 +1536,7 @@ class EpisodeMixin:
                 newly_inserted_pairs = []
                 for ep in chunk:
                     row_inserted, row_skipped = self._upsert_one_discovered_episode(
-                        conn, podcast_id, slug, ep, existing_by_id, title_date_map, fuzzy_index)
+                        conn, podcast_id, slug, ep, existing_by_id, title_date_map, fuzzy_index, stamp_now)
                     inserted += row_inserted
                     skipped += row_skipped
                     if row_inserted:
@@ -1594,7 +1635,7 @@ class EpisodeMixin:
         return best
 
     def _upsert_one_discovered_episode(
-            self, conn, podcast_id, slug, ep, existing_by_id, title_date_map, fuzzy_index):
+            self, conn, podcast_id, slug, ep, existing_by_id, title_date_map, fuzzy_index, stamp_now=None):
         """Upsert one discovered episode. Returns an (inserted, skipped) delta.
 
         Lock errors propagate so the whole batch fails and the caller retries the
@@ -1655,8 +1696,8 @@ class EpisodeMixin:
                    (podcast_id, episode_id, original_url, title, description,
                     artwork_url, episode_number, published_at, rss_duration,
                     upstream_chapters_url, upstream_transcript_url,
-                    upstream_transcript_type, tags, status)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'discovered')
+                    upstream_transcript_type, tags, youtube_video_id, yt_metadata_at, status)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'discovered')
                    ON CONFLICT(podcast_id, episode_id) DO UPDATE SET
                     episode_number = COALESCE(excluded.episode_number, episodes.episode_number),
                     published_at = COALESCE(excluded.published_at, episodes.published_at),
@@ -1669,7 +1710,8 @@ class EpisodeMixin:
                     title = CASE WHEN COALESCE(episodes.title, '') = '' THEN excluded.title ELSE episodes.title END,
                     description = CASE WHEN COALESCE(episodes.description, '') = '' THEN excluded.description ELSE episodes.description END,
                     artwork_url = COALESCE(episodes.artwork_url, excluded.artwork_url),
-                    tags = CASE WHEN COALESCE(episodes.tags, '[]') = '[]' THEN excluded.tags ELSE episodes.tags END
+                    tags = CASE WHEN COALESCE(episodes.tags, '[]') = '[]' THEN excluded.tags ELSE episodes.tags END,
+                    youtube_video_id = COALESCE(episodes.youtube_video_id, excluded.youtube_video_id)
                    WHERE episodes.episode_number IS NOT COALESCE(episodes.episode_number, excluded.episode_number)
                       OR episodes.published_at IS NOT COALESCE(episodes.published_at, excluded.published_at)
                       OR episodes.rss_duration IS NOT COALESCE(episodes.rss_duration, excluded.rss_duration)
@@ -1681,7 +1723,8 @@ class EpisodeMixin:
                       OR episodes.title IS NOT CASE WHEN COALESCE(episodes.title, '') = '' THEN excluded.title ELSE episodes.title END
                       OR episodes.description IS NOT CASE WHEN COALESCE(episodes.description, '') = '' THEN excluded.description ELSE episodes.description END
                       OR episodes.artwork_url IS NOT COALESCE(episodes.artwork_url, excluded.artwork_url)
-                      OR episodes.tags IS NOT CASE WHEN COALESCE(episodes.tags, '[]') = '[]' THEN excluded.tags ELSE episodes.tags END""",
+                      OR episodes.tags IS NOT CASE WHEN COALESCE(episodes.tags, '[]') = '[]' THEN excluded.tags ELSE episodes.tags END
+                      OR episodes.youtube_video_id IS NOT COALESCE(episodes.youtube_video_id, excluded.youtube_video_id)""",
                 (
                     podcast_id,
                     ep['id'],
@@ -1696,6 +1739,10 @@ class EpisodeMixin:
                     ep.get('upstream_transcript_url'),
                     ep.get('upstream_transcript_type'),
                     tags_json,
+                    ep.get('video_id'),
+                    stamp_now if stamp_now and ep.get('description') and iso_published
+                    and not MIDNIGHT_ONLY.match(iso_published)
+                    and ep.get('title') not in PLACEHOLDER_TITLES.values() else None,
                 )
             )
             if ep['id'] not in existing_by_id:

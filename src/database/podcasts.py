@@ -66,14 +66,27 @@ def is_local_feed(podcast: dict | None) -> bool:
 # Combined feed of recent processed episodes (#721): one row, fixed slug.
 RECENTS_SLUG = 'recents'
 
+FEED_TYPES = ('subscribed', 'local', 'recents', 'youtube')
+# Recents membership is an allow-list so a new feed type stays out of the public feed until classified.
+RECENTS_MEMBER_FEED_TYPES = ('subscribed', 'local', 'youtube')
+
 
 def has_upstream(podcast) -> bool:
     """Subscribed feeds have an upstream RSS to fetch; local and recents feeds do not."""
     return bool(podcast) and podcast.get('feed_type', 'subscribed') not in ('local', 'recents')
 
 
+def has_upstream_audio(podcast) -> bool:
+    """True when the enclosure can be fetched from the source again."""
+    return (podcast or {}).get('feed_type', 'subscribed') not in ('local', 'recents', 'youtube')
+
+
 def is_recents_feed(podcast: dict | None) -> bool:
     return bool(podcast) and podcast.get('feed_type') == 'recents'
+
+
+def is_youtube_feed(podcast: dict | None) -> bool:
+    return bool(podcast) and podcast.get('feed_type') == 'youtube'
 
 
 def recents_cutoff(podcast: dict) -> str:
@@ -375,6 +388,11 @@ class PodcastMixin:
                 'audio_replacement_sound_override', 'audio_mp3_stream_copy_override',
                 'p20_channel_json', 'author', 'explicit', 'categories',
                 'artwork_failure_state',
+                'youtube_source_kind', 'youtube_source_id', 'youtube_include_shorts',
+                'yt_process_delay_minutes_override', 'yt_probe_attempts_override',
+                'yt_probe_interval_minutes_override', 'yt_llm_fallback_override',
+                'yt_llm_on_top_override', 'yt_captions_override', 'yt_hide_private_override',
+                'yt_transcribe_override',
             ):
                 fields.append(f"{key} = ?")
                 values.append(value)
@@ -596,6 +614,11 @@ class PodcastMixin:
         conn.execute(
             "UPDATE pattern_cleanup_deleted_actions SET podcast_slug = NULL WHERE podcast_slug = ?",
             (slug,))
+
+        # Explicit: the cascade only fires when foreign_keys is on for the connection.
+        conn.execute(
+            "DELETE FROM auto_process_queue WHERE podcast_id IN "
+            "(SELECT id FROM podcasts WHERE slug = ?)", (slug,))
 
         cursor = conn.execute(
             "DELETE FROM podcasts WHERE slug = ?", (slug,)

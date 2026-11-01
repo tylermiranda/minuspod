@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import shutil
+import threading
 import time
 from urllib.parse import urlparse
 
@@ -54,6 +55,7 @@ from llm_capabilities import chapters_capability_error
 # Module import (not `from rss_parser import RSSParser`) so tests patching
 # rss_parser.RSSParser take effect at call time.
 import rss_parser
+import run_context
 import run_log
 from storage import _detect_image_mime
 from utils.constants import EpisodeStatus
@@ -65,8 +67,11 @@ from utils.paths import RECENTS_ARTWORK_PATH
 from utils.text import truncate
 from api.episodes.core import _episode_base_json
 from api.episodes.common import _job_state
-from database.podcasts import (EPISODE_STATUSES, RECENTS_SLUG, PodcastMixin, has_upstream, is_local_feed,
-                               is_recents_feed, recents_cutoff)
+from database.podcasts import (EPISODE_STATUSES, RECENTS_SLUG, PodcastMixin, has_upstream, has_upstream_audio, is_local_feed,
+                               is_recents_feed, is_youtube_feed, recents_cutoff)
+from youtube import urls as yt_urls
+from youtube.feed import source_link as youtube_source_link
+from youtube.settings import enabled as youtube_enabled, validate_yt_int
 from podping_listener import feed_url_domain
 from utils.time import utc_now_iso
 from utils.url import validate_url, SSRFError
@@ -923,6 +928,7 @@ def _apply_p20_merge(base: dict, cleaned: dict) -> dict:
 # PATCH fields that only make sense on a local feed (no upstream RSS to
 # derive title/author/explicit/categories/p20 extras from).
 _LOCAL_ONLY_FIELDS = ('title', 'author', 'explicit', 'categories', 'p20')
+_YT_EDITABLE = frozenset({'author', 'explicit', 'categories'})
 
 
 def _validate_local_categories(value):
@@ -1008,6 +1014,18 @@ def _podcast_base_json(podcast, feed_url, db, global_actions=None) -> dict:
         'onlyExposeProcessedEpisodes': _deserialize_nullable_bool(podcast.get('only_expose_processed_episodes')),
         'retentionDaysOverride': podcast.get('retention_days_override'),
         'keepOriginalAudioOverride': _deserialize_nullable_bool(podcast.get('keep_original_audio_override')),
+        'youtubeSourceKind': podcast.get('youtube_source_kind'),
+        'youtubeSourceId': podcast.get('youtube_source_id'),
+        'youtubeSourceUrl': youtube_source_link(podcast) if is_youtube_feed(podcast) else None,
+        'youtubeIncludeShorts': _deserialize_nullable_bool(podcast.get('youtube_include_shorts')),
+        'ytProcessDelayMinutesOverride': podcast.get('yt_process_delay_minutes_override'),
+        'ytProbeAttemptsOverride': podcast.get('yt_probe_attempts_override'),
+        'ytProbeIntervalMinutesOverride': podcast.get('yt_probe_interval_minutes_override'),
+        'ytLlmFallbackOverride': _deserialize_nullable_bool(podcast.get('yt_llm_fallback_override')),
+        'ytLlmOnTopOverride': _deserialize_nullable_bool(podcast.get('yt_llm_on_top_override')),
+        'ytCaptionsOverride': _deserialize_nullable_bool(podcast.get('yt_captions_override')),
+        'ytHidePrivateOverride': _deserialize_nullable_bool(podcast.get('yt_hide_private_override')),
+        'ytTranscribeOverride': _deserialize_nullable_bool(podcast.get('yt_transcribe_override')),
     }
 
 
@@ -1035,7 +1053,7 @@ def _podping_coverage(podcast, enabled, host_is_active):
     about this feed) or the feed has no upstream that could ping. The UI only distinguishes received from everything
     else; the finer states are here for API consumers and diagnostics.
     """
-    if not enabled or not has_upstream(podcast):
+    if not enabled or not has_upstream_audio(podcast):
         return None
     if podcast.get('podping_uses') == 0:
         return 'declined'
@@ -1403,6 +1421,81 @@ def _add_local_feed(data, db):
         return error_response('Failed to add local feed', 500)
 
 
+def _add_youtube_feed(data, db):
+    """Create a YouTube playlist, channel or video feed; its first listing runs in the background after the response."""
+    if not youtube_enabled(db):
+        return error_response('YouTube feeds are disabled in Settings', 400)
+    kind = data.get('sourceKind')
+    source_id = str(data.get('sourceId') or '').strip()
+    if kind == 'video':
+        valid = bool(yt_urls.VIDEO_ID.match(source_id))
+    else:
+        parsed = yt_urls.parse(source_id)
+        valid = kind in ('playlist', 'channel') and parsed is not None and (parsed.kind, parsed.id) == (kind, source_id)
+    if not valid:
+        return error_response('sourceKind must be playlist, channel or video with a valid sourceId', 400)
+    title = data.get('title')
+    if not isinstance(title, str) or not title.strip():
+        return error_response('title is required', 400)
+    title = title.strip()
+    slug = (data.get('slug') or '').strip() or make_slug(title)
+    if not slug or not is_valid_slug(slug) or slug == RECENTS_SLUG:
+        return error_response(f'Invalid slug "{slug}"', 400)
+    if db.get_podcast_by_slug(slug):
+        return error_response(f'Feed with slug "{slug}" already exists', 409)
+    canonical = yt_urls.canonical_source_url(kind, source_id)
+    if any(p['source_url'] == canonical for p in db.get_podcast_feed_urls()):
+        return error_response('This YouTube source is already added', 409)
+    include_shorts = None
+    if 'includeShorts' in data:
+        include_shorts, err = _normalize_cue_bool_override(data['includeShorts'], 'includeShorts')
+        if err:
+            return error_response(err, 400)
+    description = data.get('description')
+    if description is not None and not isinstance(description, str):
+        return error_response('description must be a string', 400)
+    author = data.get('author')
+    if author is not None and not isinstance(author, str):
+        return error_response('author must be a string', 400)
+    max_ep = None
+    if 'maxEpisodes' in data:
+        max_ep, err = _normalize_max_episodes(data['maxEpisodes'], False)
+        if err:
+            return error_response(err, 400)
+    try:
+        feed_url = _public_feed_url(slug, get_feed_auth_key(db))
+        channel_json = {'medium': 'podcast', 'locked': 'yes', 'guid': compute_feed_guid(feed_url)}
+        updates = {'youtube_source_kind': kind, 'youtube_source_id': source_id,
+                   'youtube_include_shorts': include_shorts, 'p20_channel_json': json.dumps(channel_json)}
+        if description is not None:
+            updates['description'] = description
+        if author and author.strip():
+            updates['author'] = author.strip()
+        auto_process = _serialize_auto_process(data.get('autoProcessOverride'))
+        if auto_process is not None:
+            updates['auto_process_override'] = auto_process
+        if max_ep is not None:
+            updates['max_episodes'] = max_ep
+        if 'onlyExposeProcessedEpisodes' in data:
+            updates['only_expose_processed_episodes'] = _serialize_nullable_bool(
+                data['onlyExposeProcessedEpisodes'])
+        with db.transaction() as conn:
+            db.create_podcast(slug, canonical, title, feed_type='youtube', conn=conn)
+            db.update_podcast(slug, conn=conn, **updates)
+        if data.get('artworkUrl'):
+            get_storage().download_artwork(slug, [data['artworkUrl']])
+        from main_app.feeds import invalidate_feed_cache, refresh_single_feed
+        invalidate_feed_cache()
+        threading.Thread(target=run_context.run_in_worker_thread(refresh_single_feed), args=(slug,),
+                         daemon=True).start()
+        logger.info(f"Created new YouTube feed: {slug}")
+        return json_response({'slug': slug, 'feedType': 'youtube', 'feedUrl': feed_url,
+                              'message': 'YouTube feed created successfully'}, 201)
+    except Exception:
+        logger.exception("Failed to add YouTube feed")
+        return error_response('Failed to add YouTube feed', 500)
+
+
 @api.route('/feeds', methods=['POST'])
 @limiter.limit("3 per minute")
 @log_request
@@ -1418,6 +1511,8 @@ def add_feed():
         return _add_recents_feed(data, get_database())
     if data and data.get('feedType') == 'local':
         return _add_local_feed(data, get_database())
+    if data and data.get('feedType') == 'youtube':
+        return _add_youtube_feed(data, get_database())
 
     if not data or 'sourceUrl' not in data:
         logger.warning("Missing sourceUrl in POST /feeds request")
@@ -1862,10 +1957,13 @@ def get_feed(slug):
     dai_likely = is_likely_dai_feed(
         [e.get('original_url') for e in recent_episodes])
 
+    rating_average, rating_count = db.get_feed_rating_summary(slug)
     return json_response({
         **_podcast_base_json(podcast, feed_url, db),
         **_podcast_listing_fields(podcast, _podping_context_for_feed(db)),
         'description': podcast.get('description'),
+        'ratingAverage': rating_average,
+        'ratingCount': rating_count,
         'daiLikely': dai_likely,
         'websiteUrl': podcast.get('website_url'),
         'networkIdOverride': podcast.get('network_id_override'),
@@ -1881,6 +1979,47 @@ def get_feed(slug):
             dai_likely=dai_likely,
         ),
     })
+
+
+_YT_INT_OVERRIDES = (
+    ('ytProcessDelayMinutesOverride', 'yt_process_delay_minutes_override', 'processDelayMinutes'),
+    ('ytProbeAttemptsOverride', 'yt_probe_attempts_override', 'sbProbeAttempts'),
+    ('ytProbeIntervalMinutesOverride', 'yt_probe_interval_minutes_override', 'sbProbeIntervalMinutes'),
+)
+_YT_BOOL_OVERRIDES = (
+    ('ytLlmFallbackOverride', 'yt_llm_fallback_override'),
+    ('ytLlmOnTopOverride', 'yt_llm_on_top_override'),
+    ('ytCaptionsOverride', 'yt_captions_override'),
+    ('ytHidePrivateOverride', 'yt_hide_private_override'),
+    ('ytTranscribeOverride', 'yt_transcribe_override'),
+    ('youtubeIncludeShorts', 'youtube_include_shorts'),
+)
+
+
+def _youtube_override_updates(podcast, data, updates):
+    """Validate YouTube-only PATCH fields into updates; returns an error string or None."""
+    keys = {f[0] for f in _YT_INT_OVERRIDES} | {f[0] for f in _YT_BOOL_OVERRIDES}
+    present = keys & set(data)
+    if not present:
+        return None
+    if not is_youtube_feed(podcast):
+        return f"{', '.join(sorted(present))} only editable on YouTube feeds"
+    staged = {}
+    for api_field, db_field, bound_key in _YT_INT_OVERRIDES:
+        if api_field not in data:
+            continue
+        value = data[api_field]
+        err = validate_yt_int(api_field, value, bound_key)
+        if err:
+            return err
+        staged[db_field] = value
+    for api_field, db_field in _YT_BOOL_OVERRIDES:
+        if api_field in data:
+            staged[db_field], err = _normalize_cue_bool_override(data[api_field], api_field)
+            if err:
+                return err
+    updates.update(staged)
+    return None
 
 
 @api.route('/feeds/<slug>', methods=['PATCH'])
@@ -1922,10 +2061,15 @@ def update_feed(slug):
     # are only meaningful for a local feed (no upstream RSS to derive them
     # from), so a subscribed feed 400s rather than silently accepting a value
     # a refresh would immediately overwrite or ignore.
+    youtube_editable = _YT_EDITABLE if is_youtube_feed(podcast) else frozenset()
     for field in _LOCAL_ONLY_FIELDS:
-        if field in data and has_upstream(podcast):
+        if field in data and has_upstream(podcast) and field not in youtube_editable:
             return error_response(
                 f'field {field} is only editable on local feeds', 400)
+
+    yt_error = _youtube_override_updates(podcast, data, updates)
+    if yt_error:
+        return error_response(yt_error, 400)
 
     if 'title' in data:
         title_val = data['title']
@@ -2254,6 +2398,8 @@ def update_feed(slug):
     if 'sourceUrl' in data and not (
             isinstance(data['sourceUrl'], str)
             and data['sourceUrl'].strip() == podcast['source_url']):
+        if is_youtube_feed(podcast):
+            return error_response('sourceUrl is fixed for YouTube feeds', 400)
         new_url, url_err = _validate_source_url(
             data['sourceUrl'], podcast={**podcast, **updates})
         if url_err:
@@ -2731,7 +2877,7 @@ def get_artwork(slug):
 @limiter.limit("60 per minute")
 @log_request
 def upload_feed_artwork(slug):
-    """Upload cover art for a local or recents feed.
+    """Upload cover art for a local, recents or YouTube feed.
 
     Subscribed feeds get their artwork from the upstream RSS
     <itunes:image>/<image> on refresh, so a direct upload here would just be
@@ -2741,8 +2887,8 @@ def upload_feed_artwork(slug):
     podcast = db.get_podcast_by_slug(slug)
     if not podcast:
         return error_response('Feed not found', 404)
-    if has_upstream(podcast):
-        return error_response('Artwork upload is only available for local and recents feeds', 400)
+    if has_upstream_audio(podcast):
+        return error_response('Artwork upload is only available for local, recents and YouTube feeds', 400)
 
     upload = request.files.get('file')
     if upload is None:

@@ -10,6 +10,7 @@ from typing import Any
 from collections.abc import Callable
 
 from config import (
+    PRICING_OVERRIDE_OPTIONAL, PRICING_OVERRIDE_REQUIRED,
     AUTO_PROCESS_MAX_AGE_HOURS_BOUNDS, AUTO_PROCESS_MAX_AGE_HOURS_DEFAULT,
     normalize_model_key, ENV_BACKED_SETTINGS, resolve_env_backed_default,
     coerce_bool_setting, get_env_backed_int,
@@ -28,6 +29,7 @@ from config import (
     AD_REVIEWER_PARALLEL_ADS_DEFAULT,
     MAX_ARTWORK_BYTES_MIN, MAX_ARTWORK_BYTES_MAX, MAX_RSS_BYTES_MIN,
     MAX_AUDIO_DOWNLOAD_MB_MIN,
+    LOCAL_UPLOAD_MAX_MB_MIN, LOCAL_UPLOAD_MAX_MB_MAX, LOCAL_UPLOAD_MAX_MB_DEFAULT,
     MIN_CONTENT_BETWEEN_ADS_SECONDS,
     MAX_AD_DURATION, MAX_AD_DURATION_CONFIRMED, MAX_AD_DURATION_WINDOW,
     REVIEW_MAX_BOUNDARY_SHIFT_DEFAULT,
@@ -54,8 +56,20 @@ from secrets_crypto import (
     SECRET_SETTING_KEYS,
 )
 from utils.time import is_valid_timezone
+from youtube import settings as yt_settings
 
 logger = logging.getLogger(__name__)
+
+
+def _rate_or_none(value) -> float | None:
+    """Float for a finite non-negative number, else None (bools rejected)."""
+    if isinstance(value, bool):
+        return None
+    try:
+        rate = float(value)
+    except (TypeError, ValueError):
+        return None
+    return rate if math.isfinite(rate) and rate >= 0 else None
 
 
 def _valid_notification_timezone(tz: str) -> bool:
@@ -221,6 +235,7 @@ class SettingSpec:
                     deliberately not resettable; do not flip these to True
                     without checking the original exclusion rationale.
     in_ad_reset:    member of the bulk POST /settings/ad-detection/reset list.
+    in_youtube_reset: member of the POST /settings/youtube/reset list.
     payload_key:    camelCase name in the GET /settings 'defaults' block
                     (None = absent from that block).
     payload_kind:   coercion for the defaults block: str|bool|int|float.
@@ -245,6 +260,7 @@ class SettingSpec:
     seeded: bool = False
     resettable: bool = True
     in_ad_reset: bool = False
+    in_youtube_reset: bool = False
     payload_key: str | None = None
     payload_kind: str = 'str'
     payload_factory: Callable[[], Any] | None = None
@@ -724,7 +740,7 @@ SETTINGS_REGISTRY: dict[str, SettingSpec] = {
         default='false', seeded=True, resettable=False,
         payload_key='omitTemperature', payload_kind='bool'),
     # Operator opt-in (#693): send response_format json_schema to
-    # OpenAI-compatible endpoints after a passing provider-level probe.
+    # OpenAI-compatible and Ollama endpoints after a passing provider-level probe.
     'llm_json_schema_enabled': SettingSpec(
         default='false', seeded=True, resettable=False,
         payload_key='llmJsonSchemaEnabled', payload_kind='bool'),
@@ -823,6 +839,29 @@ SETTINGS_REGISTRY: dict[str, SettingSpec] = {
     'max_audio_download_mb': SettingSpec(
         env_backed=True, in_ad_reset=True, payload_key='maxAudioDownloadMb',
         payload_factory=_payload_max_audio_download_mb),
+    'local_upload_max_mb': SettingSpec(
+        default=str(LOCAL_UPLOAD_MAX_MB_DEFAULT), seeded=True,
+        validator=_int_in_range((LOCAL_UPLOAD_MAX_MB_MIN, LOCAL_UPLOAD_MAX_MB_MAX)),
+        payload_key='localUploadMaxMb', payload_kind='int'),
+    # YouTube feeds (#898)
+    **{db_key: SettingSpec(default=str(yt_settings.DEFAULTS[db_key]), seeded=True, in_youtube_reset=True,
+                           validator=_int_in_range(yt_settings.BOUNDS[camel]))
+       for camel, db_key in yt_settings.INT_KEYS.items()},
+    **{db_key: SettingSpec(default=str(default).lower(), seeded=True, validator=_one_of('true', 'false'),
+                           in_youtube_reset=db_key != 'youtube_enabled',
+                           **({'payload_key': 'youtubeEnabled', 'payload_kind': 'bool'}
+                              if db_key == 'youtube_enabled' else {}))
+       for db_key, default in yt_settings.DEFAULTS.items() if isinstance(default, bool)},
+    'youtube_ytdlp_extra_args': SettingSpec(
+        default=yt_settings.DEFAULTS['youtube_ytdlp_extra_args'], seeded=True, in_youtube_reset=True,
+        validator=yt_settings.extra_args_valid),
+    'youtube_proxy_url': SettingSpec(
+        default=yt_settings.DEFAULTS['youtube_proxy_url'], seeded=True, in_youtube_reset=True,
+        validator=yt_settings.proxy_url_valid),
+    'youtube_ytdlp_version': SettingSpec(resettable=False),
+    'youtube_ytdlp_last_update_at': SettingSpec(resettable=False),
+    'youtube_ytdlp_last_check_at': SettingSpec(resettable=False),
+    'youtube_ytdlp_last_error': SettingSpec(resettable=False),
     # Manual per-provider request-rate limits (#747); 0 = unlimited.
     'provider_requests_per_min': SettingSpec(
         env_backed=True, payload_key='providerRequestsPerMin', payload_kind='int'),
@@ -985,6 +1024,10 @@ del _slot, _provider, _defaults
 # Ordered key list for POST /settings/ad-detection/reset.
 AD_RESET_SETTING_KEYS = tuple(
     key for key, spec in SETTINGS_REGISTRY.items() if spec.in_ad_reset)
+
+# Ordered key list for POST /settings/youtube/reset.
+YOUTUBE_RESET_SETTING_KEYS = tuple(
+    key for key, spec in SETTINGS_REGISTRY.items() if spec.in_youtube_reset)
 
 
 def _validate_registry():
@@ -1191,7 +1234,7 @@ class SettingsMixin:
             }
         return settings
 
-    def get_model_pricing_overrides(self) -> dict[str, dict[str, float]]:
+    def get_model_pricing_overrides(self) -> dict[str, dict[str, float | None]]:
         """Return valid operator pricing overrides keyed by model ID."""
         raw = self.get_setting('model_pricing_overrides')
         if not raw:
@@ -1210,28 +1253,20 @@ class SettingsMixin:
             if not isinstance(model_id, str) or not model_id.strip() \
                     or not isinstance(rates, dict):
                 continue
-            input_rate = rates.get('inputCostPerMtok')
-            output_rate = rates.get('outputCostPerMtok')
-            if isinstance(input_rate, bool) or isinstance(output_rate, bool):
+            entry = {f: _rate_or_none(rates.get(f)) for f in PRICING_OVERRIDE_REQUIRED}
+            if None in entry.values():
                 continue
-            try:
-                input_rate = float(input_rate)
-                output_rate = float(output_rate)
-            except (TypeError, ValueError):
-                continue
-            if (not math.isfinite(input_rate) or not math.isfinite(output_rate)
-                    or input_rate < 0 or output_rate < 0):
-                continue
-            overrides[model_id] = {
-                'inputCostPerMtok': input_rate,
-                'outputCostPerMtok': output_rate,
-            }
+            for field in PRICING_OVERRIDE_OPTIONAL:
+                rate = _rate_or_none(rates.get(field))
+                if rate is not None:
+                    entry[field] = rate
+            overrides[model_id] = entry
         return overrides
 
     def get_model_pricing_override(
             self, model_id: str,
-            overrides: dict[str, dict[str, float]] | None = None,
-    ) -> dict[str, float] | None:
+            overrides: dict[str, dict[str, float | None]] | None = None,
+    ) -> dict[str, float | None] | None:
         """Resolve an exact or normalized operator override for a model."""
         if overrides is None:
             overrides = self.get_model_pricing_overrides()
@@ -1516,7 +1551,7 @@ class SettingsMixin:
             cursor = conn.execute(
                 """SELECT match_key, raw_model_id, display_name,
                           input_cost_per_mtok, output_cost_per_mtok,
-                          source, updated_at
+                          cache_read_cost_per_mtok, source, updated_at
                    FROM model_pricing WHERE source = ?
                    ORDER BY display_name""",
                 (source,)
@@ -1525,7 +1560,7 @@ class SettingsMixin:
             cursor = conn.execute(
                 """SELECT match_key, raw_model_id, display_name,
                           input_cost_per_mtok, output_cost_per_mtok,
-                          source, updated_at
+                          cache_read_cost_per_mtok, source, updated_at
                    FROM model_pricing ORDER BY display_name"""
             )
         return [
@@ -1535,6 +1570,7 @@ class SettingsMixin:
                 'displayName': row['display_name'],
                 'inputCostPerMtok': row['input_cost_per_mtok'],
                 'outputCostPerMtok': row['output_cost_per_mtok'],
+                'cacheReadCostPerMtok': row['cache_read_cost_per_mtok'],
                 'source': row['source'],
                 'updatedAt': row['updated_at'],
             }
@@ -1594,16 +1630,19 @@ class SettingsMixin:
             conn.execute(
                 """INSERT INTO model_pricing
                        (model_id, match_key, raw_model_id, display_name,
-                        input_cost_per_mtok, output_cost_per_mtok, source)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)
+                        input_cost_per_mtok, output_cost_per_mtok,
+                        cache_read_cost_per_mtok, source)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(match_key) DO UPDATE SET
                      raw_model_id = excluded.raw_model_id,
                      display_name = excluded.display_name,
                      input_cost_per_mtok = excluded.input_cost_per_mtok,
                      output_cost_per_mtok = excluded.output_cost_per_mtok,
+                     cache_read_cost_per_mtok = excluded.cache_read_cost_per_mtok,
                      source = excluded.source,
                      updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')""",
                 (m['raw_model_id'], m['match_key'], m['raw_model_id'], m['display_name'],
-                 m['input_cost_per_mtok'], m['output_cost_per_mtok'], row_source)
+                 m['input_cost_per_mtok'], m['output_cost_per_mtok'],
+                 m.get('cache_read_cost_per_mtok'), row_source)
             )
         conn.commit()

@@ -12,7 +12,7 @@ MinusPod is a self-hosted server that removes ads from podcasts before you ever 
 
 A tour of the web UI. More videos, portrait cuts and the files themselves in [docs/videos](docs/videos/README.md).
 
-https://github.com/user-attachments/assets/3c64b0eb-5b52-457a-bd94-17b7ecdeef2c
+https://github.com/user-attachments/assets/26e4f083-a398-44b4-ad22-e6f753e03f52
 
 ## Features
 
@@ -38,6 +38,10 @@ https://github.com/user-attachments/assets/3c64b0eb-5b52-457a-bd94-17b7ecdeef2c
 - [Podcasting 2.0](docs/podcasting-2.0.md) tags regenerated: transcripts, chapters, AI-content disclosure, value-for-value passed through
 - Podping listener refreshes a feed seconds after the host announces an episode
 - OPML import and export, podcast search from Add feed, an optional cover-art badge, a combined Recents feed, and [local feeds](docs/local-feeds.md) built from your own audio files
+
+**YouTube**
+- Turn a YouTube playlist or channel into a podcast feed: audio through yt-dlp, the video's captions as the transcript, chapters, artwork and descriptions. [YouTube feeds](docs/youtube-feeds.md)
+- Community [SponsorBlock](https://sponsor.ajay.app/) marks are cut as given and learned as patterns. The LLM steps in only when a video has no marks, or on top of them per feed. Off by default.
 
 **Web UI and administration**
 - Feed, episode, queue, search, pattern, sponsor, history, stats, and settings views. Installs as an app on iOS, Android, macOS, and Windows. [Web interface](docs/web-interface.md)
@@ -100,7 +104,7 @@ Open `http://localhost:8000/ui/`, set an application password, and add a feed. T
 | [Podcasting 2.0](docs/podcasting-2.0.md) | What is emitted, regenerated, and stripped |
 | [Glossary](docs/glossary.md) | Every term the app uses |
 
-The [full docs index](docs/README.md) covers the rest: audio cues, community patterns, Pattern Cleanup, System One, failover, local feeds, download history, configuration import and export, deployment, releasing, and the [LLM benchmark report](benchmarks/llm/results/report.md).
+The [full docs index](docs/README.md) covers the rest: audio cues, community patterns, Pattern Cleanup, System One, failover, local feeds, YouTube feeds, download history, configuration import and export, deployment, releasing, and the [LLM benchmark report](benchmarks/llm/results/report.md).
 
 ## Contributing
 
@@ -109,6 +113,8 @@ Bug reports, feature requests, and pull requests are welcome. Open an issue firs
 ## Disclaimer
 
 This tool is for personal use only. Only use it with podcasts you have permission to modify or where such modification is permitted under applicable laws. Respect content creators and their terms of service.
+
+YouTube feeds download audio with yt-dlp. That can conflict with YouTube's terms of service; the feature is off by default and is yours to enable.
 
 ## License
 

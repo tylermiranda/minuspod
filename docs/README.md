@@ -7,7 +7,7 @@ Full documentation for MinusPod. Start with the [project README](../README.md) f
 - [Installation](installation.md) - requirements, Whisper/Parakeet sizing, resource measurement, quick start, CPU-only image, Intel hybrid CPU tuning
 - [Environment Variables](environment-variables.md) - every env var, grouped by how often you touch it
 - [LLM Providers](llm-providers.md) - Claude Code wrapper, Ollama (local/cloud), OpenRouter, recommended models, pricing
-- [Transcription](transcription.md) - faster-whisper and Parakeet backends, choosing between them, GPU compute types, remote APIs (whisper.cpp, Groq, OpenAI), language, timeouts
+- [Transcription](transcription.md) - Parakeet (recommended) and faster-whisper backends, choosing between them, GPU compute types, remote APIs (whisper.cpp, Groq, OpenAI), language, timeouts
 - [Finding Feeds & Usage](feeds-and-usage.md) - podcast search, finding RSS feeds, Audiobookshelf
 - [Web Interface](web-interface.md) - the management UI, ad editor workflow, screenshots
 - [How It Works & Detection Pipeline](how-it-works.md) - the transcription -> detection -> cut pipeline, verification pass, sliding windows, processing queue, validation, pattern learning, audio analysis
@@ -22,6 +22,7 @@ Full documentation for MinusPod. Start with the [project README](../README.md) f
 - [Failover](failover.md) - standby LLM provider and transcriber, triggers, health probes, recovery, manual control, API
 - [Download History](download-history.md) - the History Downloads tab: what is recorded, filters, optional geo lookup, retention, privacy, API
 - [Local Feeds](local-feeds.md) - build a feed from your own audio files: creation, uploads, bulk archive import, naming scheme, JSON sidecar schema
+- [YouTube Feeds](youtube-feeds.md) - turn a playlist or channel into a feed: SponsorBlock-first processing, captions, yt-dlp lifecycle, cookies
 - [Configuration Import / Export](configuration-import-export.md) - export and restore global settings and selected feed configuration
 - [Intel GPU Transcription (OpenVINO)](transcription-openvino.md) - offload Whisper to an Intel GPU via OpenVINO Model Server
 - [API & Webhooks](api-and-webhooks.md) - REST endpoints, webhook events, payload templates, signing

@@ -27,6 +27,7 @@ import PodpingBadge from '../components/PodpingBadge';
 import { feedDisplayTitle, feedHasUpstream, deleteStopsProcessingMessage } from '../utils/feedTitle';
 import FeedSettingsPanel from './feeds/FeedSettingsPanel';
 import LocalFeedPanel from './feeds/LocalFeedPanel';
+import YouTubeFeedPanel from './feeds/YouTubeFeedPanel';
 import FeedStatsCards from './feeds/FeedStatsCards';
 import PodcastAdDistributionPanel from './feeds/PodcastAdDistributionPanel';
 import RecentsFeedPanel from './feeds/RecentsFeedPanel';
@@ -40,14 +41,19 @@ import { focusRing, inputBase, selectBase } from '../components/fieldStyles';
 import { badgeBase, tint } from '../components/badgeStyles';
 import { pageTitle, cardTitle, sectionPad } from '../components/pageStyles';
 import { iconTarget, iconVisual } from '../components/rowActionStyles';
+import { reprocessMenuCopy, reprocessModeKey } from '../utils/reprocessMenu';
 
-function reprocessModeLabel(mode: string): string {
+function reprocessModeLabel(mode: string, feedType?: string): string {
   if (mode === 'full') return 'Full reprocess';
   if (mode === 'llm') return 'Re-detect ads';
-  return 'Patterns + AI';
+  return feedType === 'youtube' ? 'SponsorBlock and patterns' : 'Patterns + AI';
 }
 
-function reprocessModeDescription(mode: string): string {
+function reprocessModeDescription(mode: string, feedType?: string): string {
+  if (feedType === 'youtube') {
+    const copy = reprocessMenuCopy(feedType);
+    return copy[reprocessModeKey(mode)].tooltip;
+  }
   if (mode === 'full') return 'Fresh analysis without pattern database';
   if (mode === 'llm') return 'Reuses saved transcripts (skips re-transcription); re-cuts audio';
   return 'Uses learned patterns for faster ad detection';
@@ -74,7 +80,8 @@ function ResultStatsGrid({ queued, skipped, queuedLabel }: {
   );
 }
 
-function reprocessModeVerb(mode: string): string {
+function reprocessModeVerb(mode: string, feedType?: string): string {
+  if (feedType === 'youtube') return mode === 'reprocess' ? 'SponsorBlock and pattern' : 'pass 1 LLM';
   if (mode === 'full') return 'full AI';
   if (mode === 'llm') return 'transcript-reuse';
   return 'pattern-assisted';
@@ -506,6 +513,8 @@ function FeedDetail() {
     />
   );
 
+  const copy = reprocessMenuCopy(feed.feedType);
+
   return (
     <div>
       <div className="flex items-center justify-between gap-3 mb-4">
@@ -610,6 +619,9 @@ function FeedDetail() {
             )}
             <div className="mt-4 flex flex-wrap gap-4 text-sm text-muted-foreground">
               <span>{feed.episodeCount} episodes</span>
+              {!!feed.ratingCount && feed.ratingAverage != null && (
+                <span>Rating: {feed.ratingAverage.toFixed(1)} average over {feed.ratingCount} rated</span>
+              )}
               {feed.lastRefreshed && (
                 <span>Updated {formatDateTime(feed.lastRefreshed)}</span>
               )}
@@ -629,8 +641,8 @@ function FeedDetail() {
           </div>
         </div>
 
-        <div className="mt-6 pt-4 border-t border-border flex flex-wrap gap-2 sm:gap-4 items-center justify-between">
-          <div className="flex items-center gap-2 min-w-0">
+        <div className="mt-6 pt-4 border-t border-border grid grid-cols-2 min-[360px]:flex gap-2 sm:gap-4 items-center sm:flex-wrap sm:justify-between">
+          <div className="flex items-center gap-2 min-w-0 shrink-0 sm:shrink">
             <span className="hidden sm:inline text-sm text-muted-foreground shrink-0">Feed URL</span>
             <code className="hidden sm:block text-sm bg-secondary px-2 py-1 rounded truncate min-w-0">
               {feed.feedUrl}
@@ -641,30 +653,26 @@ function FeedDetail() {
             <CopyButton
               text={feed.feedUrl}
               label="Copy feed URL"
-              className={`px-2 py-2 sm:px-0 sm:py-0 sm:p-1.5 gap-2 ${btnSecondary} sm:bg-transparent sm:text-muted-foreground sm:hover:bg-accent`}
+              className={`max-[359px]:w-full px-2 py-2 sm:px-0 sm:py-0 sm:p-1.5 gap-2 ${btnSecondary} sm:bg-transparent sm:text-muted-foreground sm:hover:bg-accent`}
               copiedClassName="text-success bg-success/10 sm:bg-transparent"
               labelClassName="hidden sm:inline text-sm"
             />
           </div>
-          {/* Wraps rather than overflowing: every child is whitespace-nowrap, so
-              without this the group keeps its intrinsic width and pushes the last
-              button through the card's padding on a narrow screen. No
-              items-center, so the buttons keep flex's default stretch and the
-              icon-only delete stays the same height as the labelled ones. */}
-          <div className="flex flex-wrap justify-end gap-2">
+          {/* Below sm: one row (copy first), a 2x2 grid under 360 px; from sm it wraps so nowrap buttons never overflow. */}
+          <div className="contents min-[360px]:flex min-[360px]:flex-1 min-w-0 gap-2 [&>div]:flex-1 sm:flex-none sm:flex-wrap sm:justify-end sm:[&>div]:flex-none">
             {!isRecents && (
             <DropdownMenu
-              triggerLabel={reprocessAllMutation.isPending ? 'Queuing...' : (
-                <><span className="sm:hidden">Reprocess</span><span className="hidden sm:inline">Reprocess all</span></>
-              )}
-              triggerClassName={`${btnBase} ${btnSecondary}`}
+              triggerLabel={
+                <><span className="sm:hidden">Reprocess</span><span className="hidden sm:inline">{reprocessAllMutation.isPending ? 'Queuing...' : 'Reprocess all'}</span></>
+              }
+              triggerClassName={`${btnBase} ${btnSecondary} w-full sm:w-auto`}
               disabled={reprocessAllMutation.isPending}
               title="Reprocess all processed episodes"
               align="left"
               items={[
                 {
-                  title: 'Patterns + AI',
-                  subtitle: 'Use learned patterns for faster detection',
+                  title: reprocessModeLabel('reprocess', feed.feedType),
+                  subtitle: copy.reprocess.subtitle,
                   onClick: () => {
                     setSelectedReprocessMode('reprocess');
                     setShowReprocessConfirm(true);
@@ -672,7 +680,7 @@ function FeedDetail() {
                 },
                 {
                   title: 'Full reprocess',
-                  subtitle: 'Fresh analysis without patterns, AI only',
+                  subtitle: copy.full.subtitle,
                   onClick: () => {
                     setSelectedReprocessMode('full');
                     setShowReprocessConfirm(true);
@@ -680,7 +688,7 @@ function FeedDetail() {
                 },
                 {
                   title: 'Re-detect ads',
-                  subtitle: 'Keep transcripts, skip re-transcription',
+                  subtitle: copy.redetect.subtitle,
                   onClick: () => {
                     setSelectedReprocessMode('llm');
                     setShowReprocessConfirm(true);
@@ -691,10 +699,10 @@ function FeedDetail() {
             )}
             {feedHasUpstream(feed) && (
               <DropdownMenu
-                triggerLabel={refreshMutation.isPending ? 'Refreshing...' : (
-                  <><span className="sm:hidden">Refresh</span><span className="hidden sm:inline">Refresh feed</span></>
-                )}
-                triggerClassName={`${btnBase} ${btnPrimary}`}
+                triggerLabel={
+                  <><span className="sm:hidden">Refresh</span><span className="hidden sm:inline">{refreshMutation.isPending ? 'Refreshing...' : 'Refresh feed'}</span></>
+                }
+                triggerClassName={`${btnBase} ${btnPrimary} w-full sm:w-auto`}
                 disabled={refreshMutation.isPending}
                 title="Refresh feed"
                 items={[
@@ -715,7 +723,7 @@ function FeedDetail() {
             <button
               onClick={handleDeleteFeed}
               disabled={deleteMutation.isPending}
-              className={`${btnBase} ${btnDestructive}`}
+              className={`${btnBase} ${btnDestructive} shrink-0 max-[359px]:w-full`}
               title="Delete feed"
               aria-label="Delete feed"
             >
@@ -726,6 +734,9 @@ function FeedDetail() {
         </div>
       </div>
 
+      {refreshMutation.isPending && <p role="status" className="mb-4 text-sm text-muted-foreground">Refreshing feed...</p>}
+      {reprocessAllMutation.isPending && <p role="status" className="mb-4 text-sm text-muted-foreground">Queuing episodes...</p>}
+
       {slug && !isRecents && <FeedStatsCards feed={feed} slug={slug} />}
 
       {slug && isRecents && <RecentsFeedPanel feed={feed} slug={slug} />}
@@ -733,6 +744,7 @@ function FeedDetail() {
       {slug && !isRecents && <FeedSettingsPanel key={slug} feed={feed} slug={slug} />}
 
       {slug && feed.feedType === 'local' && <LocalFeedPanel feed={feed} slug={slug} />}
+      {slug && feed.feedType === 'youtube' && <YouTubeFeedPanel key={`youtube-${slug}`} feed={feed} slug={slug} />}
 
       {slug && !isRecents && <PodcastAdDistributionPanel slug={slug} />}
 
@@ -941,15 +953,17 @@ function FeedDetail() {
           <div className="p-4">
             <div className="mb-4 p-3 rounded-lg bg-accent/50">
               <p className="text-sm font-medium text-foreground">
-                Mode: {reprocessModeLabel(selectedReprocessMode)}
+                Mode: {reprocessModeLabel(selectedReprocessMode, feed.feedType)}
               </p>
               <p className="text-xs text-muted-foreground mt-1">
-                {reprocessModeDescription(selectedReprocessMode)}
+                {reprocessModeDescription(selectedReprocessMode, feed.feedType)}
               </p>
             </div>
             <p className="text-sm text-muted-foreground mb-4">
               {selectedReprocessMode === 'llm'
                 ? 'This will queue all processed episodes that have a saved transcript. The transcript is reused (no re-transcription); audio is re-analyzed and re-cut. Episodes without a transcript are skipped.'
+                : feed.feedType === 'youtube'
+                ? 'This will queue all processed episodes. SponsorBlock marks and captions are refreshed, and audio is re-cut using this mode.'
                 : 'This will queue all processed episodes for reprocessing. Existing processed audio files will be deleted and episodes will be re-transcribed and re-analyzed.'}
             </p>
             <p className="text-sm text-warning">
@@ -975,12 +989,12 @@ function FeedDetail() {
         >
           <div className="p-4">
             <p className="text-xs text-muted-foreground mb-4">
-              Mode: {reprocessModeLabel(reprocessResult.mode)}
+              Mode: {reprocessModeLabel(reprocessResult.mode, feed.feedType)}
             </p>
             <ResultStatsGrid queued={reprocessResult.queued} skipped={reprocessResult.skipped} queuedLabel="Queued" />
             {reprocessResult.queued > 0 && (
               <p className="text-sm text-muted-foreground">
-                {reprocessResult.queued} episodes have been queued for {reprocessModeVerb(reprocessResult.mode)} reprocessing. They will be processed in the background.
+                {reprocessResult.queued} episodes have been queued for {reprocessModeVerb(reprocessResult.mode, feed.feedType)} reprocessing. They will be processed in the background.
               </p>
             )}
           </div>

@@ -37,7 +37,7 @@ from config import (
     coerce_bool_setting,
 )
 
-from database.podcasts import is_local_feed
+from database.podcasts import has_upstream_audio, is_youtube_feed
 from llm_client import (
     start_episode_token_tracking, get_effective_provider,
 )
@@ -65,6 +65,7 @@ audio_logger = logging.getLogger('podcast.audio')
 
 from main_app.episode_context import EpisodeContext
 from main_app.pipeline import common, transcribe, signals, detect, review, cuts, keep_rules, verify, publish, finalize, admission, failure, recut
+from main_app.pipeline import sponsorblock as sb_stage
 # Stage modules resolve every singleton through this module (pipeline.shared).
 from main_app import (db, storage, transcriber, ad_detector, audio_processor,
                       status_service, shutdown_event)
@@ -185,7 +186,7 @@ def _process_episode_background(slug, episode_id, original_url, title, podcast_n
                 still_owned, replacement_published = (
                     _cleanup_cancelled_processing_output(
                         slug, episode_id, run_id, queue, episode_at_start,
-                        keep_original=is_local_feed(podcast_row)))
+                        keep_original=not has_upstream_audio(podcast_row)))
             except Exception as cleanup_err:
                 audio_logger.warning(f"[{slug}:{episode_id}] Failed to clean up partial file: {cleanup_err}")
                 still_owned = queue.owns(run_id, allow_cancel_requested=True)
@@ -362,8 +363,13 @@ def process_episode(slug: str, episode_id: str, episode_url: str,
     # detections, no download/transcribe/detect/LLM. Branches before the full
     # pipeline; preconditions are enforced by the reprocess API.
     if reprocess_mode == 'recut':
-        return recut._recut_episode(slug, episode_id, episode_title, podcast_name,
+        recut_ok = recut._recut_episode(slug, episode_id, episode_title, podcast_name,
                               episode_description, start_time, cancel_event)
+        if recut_ok:
+            recut_podcast = db.get_podcast_by_slug(slug)
+            if is_youtube_feed(recut_podcast):
+                sb_stage.stamp_recut(slug, episode_id, recut_podcast)
+        return recut_ok
 
     podcast_settings = db.get_podcast_by_slug(slug)
     podcast_description = (podcast_settings or {}).get('description') or None
@@ -391,7 +397,8 @@ def process_episode(slug: str, episode_id: str, episode_url: str,
 
     # Skip ad detection (#538): episodes still get transcription, chapters,
     # and a transcript, but the detection stages and the cut are skipped.
-    skip_detection = processing_mode == PROCESSING_MODE_SKIP_DETECTION
+    detection_mode = 'skip' if processing_mode == PROCESSING_MODE_SKIP_DETECTION else 'normal'
+    skip_detection = detection_mode == 'skip'
 
     # Skip verification (#599): pass 1 still runs and cuts, the second LLM
     # sweep over its output does not.
@@ -533,13 +540,46 @@ def process_episode(slug: str, episode_id: str, episode_url: str,
         # transcription is skipped or an existing transcript is reused.
         transcriber.last_transcription_stats = None
         transcribe_outcome = {}
+        yt_run = None
+        if is_youtube_feed(podcast_settings):
+            yt_run = sb_stage.acquire(slug, episode_id, episode_url, podcast_settings,
+                                      episode_data, reprocess_mode)
+            run_stats['sponsorblock'] = {'mode': yt_run.mode, 'segments': len(yt_run.markers),
+                                         'note': yt_run.note}
+            if yt_run.mode == 'sponsorblock' and not yt_run.segments:
+                if storage.get_transcript(slug, episode_id):
+                    # Reuse the saved transcript; forcing would wipe one we cannot regenerate.
+                    force_transcription = False
+                else:
+                    skip_transcription_active = True
+                    run_stats['transcription_skipped'] = True
+        if yt_run is not None and yt_run.mode == 'passthrough':
+            served = recut._passthrough_episode(
+                slug, episode_id, episode_url, episode_title, podcast_name,
+                episode_description, episode_artwork_url, episode_published_at,
+                start_time, episode_data, cancel_event=cancel_event,
+                podcast=podcast_settings, preacquired_audio=yt_run.audio_path)
+            if served:
+                sb_stage.after_success(slug, episode_id, yt_run, episode_data)
+            return served
+        if yt_run is not None and yt_run.mode == 'sponsorblock':
+            detection_mode = 'sponsorblock'
+            run_stats['verification_skipped'] = True
+        sponsorblock_only = detection_mode == 'sponsorblock'
+        llm_off = cue_only or sponsorblock_only
+        detection_off = detection_mode == 'skip'
+        # SponsorBlock-only marks are cut as given; nothing reads the signals.
+        audio_analysis_skipped = sponsorblock_only and not cue_only
+        run_stats['audio_analysis_skipped'] = audio_analysis_skipped
         try:
             audio_path, segments = transcribe._download_and_transcribe(
                 slug, episode_id, episode_url,
                 skip_transcription=skip_transcription_active,
                 podcast=podcast_settings,
                 force_transcription=force_transcription,
-                outcome=transcribe_outcome)
+                outcome=transcribe_outcome,
+                preacquired_audio=yt_run.audio_path if yt_run else None,
+                preloaded_segments=yt_run.segments if yt_run else None)
         finally:
             # Recorded even when _download_and_transcribe raises (OOM
             # exhaustion): the failure handler's history row still gets the
@@ -549,11 +589,13 @@ def process_episode(slug: str, episode_id: str, episode_url: str,
             transcription_stats = transcriber.last_transcription_stats
             if transcription_stats is not None:
                 run_stats['transcription'] = dict(transcription_stats)
+        run_stats['transcript_source'] = transcribe_outcome.get(
+            'transcript_source', 'none' if skip_transcription_active else 'whisper')
         _check_cancel(cancel_event, slug, episode_id)
 
         # Stage 1a: upstream transcript differential (best effort, bounded fetch).
         transcript_spans = []
-        if not skip_detection:
+        if not detection_off:
             transcript_diff = signals._run_transcript_diff(
                 slug, episode_id, episode_data, segments, run_stats, podcast=podcast_settings,
                 segments_reused=transcribe_outcome.get('segments_reused', False))
@@ -579,7 +621,7 @@ def process_episode(slug: str, episode_id: str, episode_url: str,
         # Both stages want the original's template cues; audio analysis owns
         # the scan and the differential waits for its result.
         primary_cue_future = Future()
-        if not skip_detection:
+        if not detection_off:
             # Stamp from the main thread BEFORE the worker starts: all status
             # stamps stay on the main thread, so the pass1 ordering 22 -> 25
             # is monotonic and an abandoned worker never stamps another job.
@@ -616,9 +658,9 @@ def process_episode(slug: str, episode_id: str, episode_url: str,
             # analysis crash must still release the waiting differential.
             try:
                 _check_cancel(cancel_event, slug, episode_id)
-                # Stage 2: Audio analysis (ad-cue detection; nothing to feed
-                # when detection is skipped)
-                if not skip_detection:
+                if not (audio_analysis_skipped or detection_off):
+                    # Stage 2: Audio analysis (ad-cue detection; nothing to feed
+                    # when detection is skipped)
                     with common._measure_run_stage('audio_analysis'):
                         audio_analysis_result = signals._run_audio_analysis(
                             slug, episode_id, audio_path, segments,
@@ -693,13 +735,9 @@ def process_episode(slug: str, episode_id: str, episode_url: str,
                 db, podcast_id)
             # Snapshot for this run: a correction saved mid-run applies on the next run.
             user_corrections = detect._load_user_corrections(slug, episode_id, db)
-            if skip_detection:
-                # Stages 3-4 skipped: no prior, no detection, no validation.
-                # Stage 4 in particular must not run on the empty list because
-                # _apply_heuristic_rolls inside it adds pre/post-roll and
-                # VAD-gap cuts even then, breaking this mode's nothing-is-cut
-                # contract. Detection stats (stage_hits, detected) are not
-                # recorded for stages that never ran.
+            if detection_off:
+                # 'skip' mode: stages 3-4 never run, and stage 4 would still add roll and VAD-gap
+                # cuts on the empty list. Detection stats are not recorded.
                 audio_logger.info(
                     f"[{slug}:{episode_id}] Ad detection skipped (per-feed setting)")
                 # Markers and assets left by an earlier detection run describe
@@ -739,6 +777,10 @@ def process_episode(slug: str, episode_id: str, episode_url: str,
                 segment_actions = db.resolve_segment_actions(slug, podcast=podcast_settings)
                 recut._log_segment_action_map(slug, episode_id, segment_actions, podcast_settings)
 
+                if sponsorblock_only:
+                    audio_logger.info(
+                        f"[{slug}:{episode_id}] Pattern-only detection (SponsorBlock marks, LLM off)")
+
                 # Stage 3: First-pass detection
                 _reserve_provider()
                 provider_attempted = True
@@ -755,7 +797,7 @@ def process_episode(slug: str, episode_id: str, episode_url: str,
                         # None = resolve fresh from the DB at detection time, so a
                         # detection_mode toggle during download/transcription is honored.
                         keep_content=None,
-                        skip_llm=cue_only,
+                        skip_llm=llm_off,
                         force_create_from_pairs=cue_only,
                         strict_pair_roles=cue_only,
                         episode_duration=episode_duration,
@@ -840,7 +882,7 @@ def process_episode(slug: str, episode_id: str, episode_url: str,
                         keep_ads=keep_ads,
                         cue_only_safety=cue_only_safety,
                         cue_unproven_template_ids=cue_unproven_ids,
-                        apply_heuristic_rolls=not cue_only,
+                        apply_heuristic_rolls=not llm_off,
                         segment_actions=segment_actions,
                         corrections=user_corrections,
                         transcript_spans=transcript_spans,
@@ -861,9 +903,15 @@ def process_episode(slug: str, episode_id: str, episode_url: str,
                     ads_to_remove = [ad for ad in ads_to_remove
                                      if id(ad) not in late_keep_ids]
                     keep_ads = keep_ads + late_keep_ads
+
+                if yt_run and yt_run.markers:
+                    ads_to_remove, all_ads_with_validation, keep_ads, dropped = sb_stage.merge_marks(
+                        yt_run, ads_to_remove, all_ads_with_validation, keep_ads, segment_actions)
+                    first_pass_count += len(yt_run.markers) - dropped
+                    run_stats['detected'] = first_pass_count
             _check_cancel(cancel_event, slug, episode_id)
 
-            # cue_only skips this outright: the mode promises zero LLM calls.
+            # cue_only and SponsorBlock-only skip this: neither mode makes LLM calls.
             # Otherwise a no-op when enable_ad_review is off (the default).
             ads_to_remove = detect._exclude_opening_ads(ads_to_remove, opening_exclusion_seconds)
             all_ads_with_validation = detect._exclude_opening_ads(all_ads_with_validation, opening_exclusion_seconds)
@@ -872,7 +920,7 @@ def process_episode(slug: str, episode_id: str, episode_url: str,
             user_trim_ranges = user_trimmed_keep_ranges(user_corrections[1] or [])
             pass1_user_rejects = review._pass1_user_rejects(user_corrections[0], user_trim_ranges)
             pass1_hard = [*keep_ads, *pass1_user_rejects]
-            if not cue_only:
+            if detection_mode == 'normal' and not cue_only:
                 with common._measure_run_stage('refine_validate'):
                     ads_to_remove, all_ads_with_validation = review._run_ad_reviewer(
                         slug, episode_id, podcast_id, ads_to_remove,
@@ -902,26 +950,28 @@ def process_episode(slug: str, episode_id: str, episode_url: str,
                 # Kept markers bypass validation and cut-ad learning.
                 keep_rules._learn_from_kept_ads(slug, episode_id, keep_ads, segments, audio_path)
 
-            # Terminal start snap to the splice point; reviewer-locked starts stay put.
-            ads_to_remove = cuts._snap_terminal_starts(
-                slug, episode_id, ads_to_remove, all_ads_with_validation,
-                segments, audio_analysis_result, episode_duration,
-                podcast_name=podcast_name
-            )
+            # Community timestamps are authoritative: no boundary sweeps on SponsorBlock-only cuts.
+            if not sponsorblock_only:
+                # Terminal start snap to the splice point; reviewer-locked starts stay put.
+                ads_to_remove = cuts._snap_terminal_starts(
+                    slug, episode_id, ads_to_remove, all_ads_with_validation,
+                    segments, audio_analysis_result, episode_duration,
+                    podcast_name=podcast_name
+                )
 
-            # Tail completion: content-based end sweep that never extends a reviewer-locked end.
-            ads_to_remove = cuts._complete_cut_tails(
-                slug, episode_id, ads_to_remove, all_ads_with_validation,
-                segments, podcast_name=podcast_name
-            )
+                # Tail completion: content-based end sweep that never extends a reviewer-locked end.
+                ads_to_remove = cuts._complete_cut_tails(
+                    slug, episode_id, ads_to_remove, all_ads_with_validation,
+                    segments, podcast_name=podcast_name
+                )
 
-            # A transcript-guided tail extension can stop before an
-            # untranscribed sonic logo. Strong forward splice evidence closes
-            # that final gap without crossing speech or another marker.
-            ads_to_remove = cuts._snap_completed_cut_tails_to_splice(
-                slug, episode_id, ads_to_remove, all_ads_with_validation,
-                segments, audio_analysis_result, podcast_name=podcast_name
-            )
+                # A transcript-guided tail extension can stop before an
+                # untranscribed sonic logo. Strong forward splice evidence closes
+                # that final gap without crossing speech or another marker.
+                ads_to_remove = cuts._snap_completed_cut_tails_to_splice(
+                    slug, episode_id, ads_to_remove, all_ads_with_validation,
+                    segments, audio_analysis_result, podcast_name=podcast_name
+                )
 
             # Human-approved trim bounds are the final boundary authority.
             # Run after every automated reviewer and tail mutation so neither
@@ -997,7 +1047,7 @@ def process_episode(slug: str, episode_id: str, episode_url: str,
                 m for m in all_ads_with_validation
                 if is_keep_like(m.get('action_applied'))
             ]
-            verification_skipped = skip_detection or skip_second_pass or cue_only
+            verification_skipped = detection_off or skip_second_pass or llm_off
             if skip_second_pass and not skip_detection:
                 audio_logger.info(
                     f"[{slug}:{episode_id}] Verification pass skipped (configured setting)")
@@ -1104,7 +1154,7 @@ def process_episode(slug: str, episode_id: str, episode_url: str,
             # Stage 7: Generate assets. Uses the RENDERED cut lists (one
             # replacement beep per span), not the UI ad list: gap-merged
             # pass-2 ads share a single beep in the audio.
-            if skip_detection:
+            if detection_off:
                 _reserve_provider()
                 provider_attempted = True
             with common._measure_run_stage('assets'):
@@ -1201,6 +1251,8 @@ def process_episode(slug: str, episode_id: str, episode_url: str,
                                ads_held=held_count, ads_not_cut=not_cut_count,
                                on_persisted=_mark_markers_published)
 
+            if yt_run:
+                sb_stage.after_success(slug, episode_id, yt_run, episode_data)
             _fire_post_completion_actions()
 
             common._publish_status('complete_job', slug, episode_id)

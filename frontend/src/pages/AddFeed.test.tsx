@@ -3,7 +3,7 @@
  * local form fields, and the addLocalFeed submit path.
  */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { render, screen, waitFor } from '@testing-library/react';
+import { act, render, screen, waitFor } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { MemoryRouter } from 'react-router';
@@ -17,6 +17,7 @@ vi.mock('react-router', async (importOriginal) => ({
 }));
 
 const mockAddFeed = vi.fn();
+const mockAddYoutubeFeed = vi.fn();
 const mockAddLocalFeed = vi.fn();
 const mockAddRecentsFeed = vi.fn();
 const mockUploadFeedArtwork = vi.fn();
@@ -26,6 +27,7 @@ const mockGetFeedsResponse = vi.fn();
 vi.mock('../api/feeds', () => ({
   addRecentsFeed: (...a: unknown[]) => mockAddRecentsFeed(...a),
   addFeed: (...a: unknown[]) => mockAddFeed(...a),
+  addYoutubeFeed: (...a: unknown[]) => mockAddYoutubeFeed(...a),
   addLocalFeed: (...a: unknown[]) => mockAddLocalFeed(...a),
   uploadFeedArtwork: (...a: unknown[]) => mockUploadFeedArtwork(...a),
   importOpml: (...a: unknown[]) => mockImportOpml(...a),
@@ -38,6 +40,14 @@ vi.mock('../api/feeds', () => ({
 const mockSearchPodcasts = vi.fn();
 vi.mock('../api/podcastSearch', () => ({
   searchPodcasts: (...a: unknown[]) => mockSearchPodcasts(...a),
+}));
+
+const mockPreviewYouTube = vi.fn();
+const mockSearchYouTube = vi.fn();
+vi.mock('../api/youtube', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../api/youtube')>()),
+  previewYouTube: (...a: unknown[]) => mockPreviewYouTube(...a),
+  searchYouTube: (...a: unknown[]) => mockSearchYouTube(...a),
 }));
 
 const mockGetSettings = vi.fn();
@@ -55,6 +65,7 @@ const defaultSettings = {
   podcastIndexApiKeyConfigured: false,
   podcastSearchProvider: { value: 'itunes', isDefault: true },
   podcastSearchReady: true,
+  youtubeEnabled: { value: false, isDefault: true },
 };
 
 function renderAddFeed(settings: unknown = defaultSettings) {
@@ -109,7 +120,7 @@ describe('AddFeed: mode toggle', () => {
 
     await user.click(screen.getByRole('button', { name: 'Enter RSS URL' }));
 
-    expect(screen.getByLabelText('Podcast RSS Feed URL')).toBeDefined();
+    expect(screen.getByLabelText('RSS or YouTube URL')).toBeDefined();
     expect(screen.queryByLabelText('Search podcasts')).toBeNull();
   });
 });
@@ -144,7 +155,7 @@ describe('AddFeed: podcast search gating', () => {
     });
 
     await user.click(screen.getByRole('button', { name: 'Enter RSS URL' }));
-    await user.type(screen.getByLabelText('Podcast RSS Feed URL'), 'https://example.com/feed.xml');
+    await user.type(screen.getByLabelText('RSS or YouTube URL'), 'https://example.com/feed.xml');
 
     await new Promise((r) => setTimeout(r, 500));
     expect(mockSearchPodcasts).not.toHaveBeenCalled();
@@ -152,7 +163,7 @@ describe('AddFeed: podcast search gating', () => {
 
   it('falls back to the URL-only label until settings report a provider', async () => {
     renderAddFeed(new Promise(() => {}));
-    expect(screen.getByLabelText('Podcast RSS Feed URL')).toBeDefined();
+    expect(screen.getByLabelText('RSS or YouTube URL')).toBeDefined();
     expect(screen.queryByText('Configure PodcastIndex API credentials')).toBeNull();
   });
 
@@ -167,7 +178,7 @@ describe('AddFeed: podcast search gating', () => {
       expect(screen.getByText(/Configure PodcastIndex API credentials/)).toBeDefined();
     });
 
-    await user.type(screen.getByLabelText('Podcast RSS Feed URL'), 'daily');
+    await user.type(screen.getByLabelText('RSS or YouTube URL'), 'daily');
     await new Promise((r) => setTimeout(r, 500));
     expect(mockSearchPodcasts).not.toHaveBeenCalled();
   });
@@ -376,7 +387,7 @@ describe('AddFeed: podcast search', () => {
     await waitFor(() => {
       expect(screen.getByText(/Configure PodcastIndex API credentials/)).toBeDefined();
     });
-    expect(screen.getByLabelText('Podcast RSS Feed URL')).toBeDefined();
+    expect(screen.getByLabelText('RSS or YouTube URL')).toBeDefined();
   });
 });
 
@@ -402,5 +413,210 @@ describe('Recents feed mode', () => {
     renderAddFeed();
     await screen.findByRole('button', { name: 'Subscribe to feed' });
     await waitFor(() => expect(screen.queryByRole('button', { name: 'Create recents feed' })).toBeNull());
+  });
+});
+
+describe('YouTube lookup', () => {
+  const INPUT = /rss or youtube url/i;
+  const PLAYLIST = 'https://www.youtube.com/playlist?list=PLbh0Jamvptwfp_qc439PLuyKJ-tWUt222';
+  const enabled = { ...defaultSettings, youtubeEnabled: { value: true, isDefault: false } };
+  const preview = {
+    enabled: true,
+    source: { kind: 'channel', id: 'UCabcdefghijklmnopqrstuv', title: 'The Daily Tech Show', description: 'desc',
+              artworkUrl: null, videoCount: 412, alreadyAdded: null },
+    rssMatches: [{ title: 'Daily Tech RSS', feedUrl: 'https://feeds.example.com/dts.xml', artworkUrl: '' }],
+  };
+
+  async function typeUrl(text: string, settings: unknown = enabled) {
+    renderAddFeed(settings);
+    await userEvent.click(await screen.findByRole('button', { name: 'Enter RSS URL' }));
+    const input = await screen.findByLabelText(INPUT);
+    await userEvent.type(input, text);
+    return input;
+  }
+
+  it('relabels the button and shows the preview with an RSS alternative', async () => {
+    mockPreviewYouTube.mockResolvedValue(preview);
+    mockAddYoutubeFeed.mockResolvedValue({ slug: 'the-daily-tech-show', feedType: 'youtube', feedUrl: 'x' });
+    await typeUrl('https://www.youtube.com/@dailytech');
+    await userEvent.click(screen.getByRole('button', { name: /look up/i }));
+    expect(await screen.findByText('The Daily Tech Show')).toBeDefined();
+    expect(screen.getByText('Channel')).toBeDefined();
+    expect(screen.getByText(/412 videos/)).toBeDefined();
+    expect(screen.getByRole('heading', { name: /or add by rss feed/i })).toBeDefined();
+    expect(screen.getByText('Daily Tech RSS')).toBeDefined();
+    expect(screen.queryByText(/may not be a podcast rss feed/i)).toBeNull();
+    await userEvent.click(screen.getByRole('button', { name: /add youtube feed/i }));
+    await waitFor(() => expect(mockAddYoutubeFeed).toHaveBeenCalledWith({
+      sourceKind: 'channel', sourceId: 'UCabcdefghijklmnopqrstuv', title: 'The Daily Tech Show',
+      description: 'desc', artworkUrl: null, includeShorts: false, slug: undefined,
+      autoProcessOverride: null, maxEpisodes: undefined, onlyExposeProcessedEpisodes: null }));
+    await waitFor(() => expect(mockNavigate).toHaveBeenCalledWith('/feeds/the-daily-tech-show'));
+  });
+
+  it('links to the existing feed when the source is already added', async () => {
+    mockPreviewYouTube.mockResolvedValue({ ...preview, source: { ...preview.source, alreadyAdded: 'dts' } });
+    await typeUrl(PLAYLIST);
+    await userEvent.click(screen.getByRole('button', { name: /look up/i }));
+    const link = await screen.findByRole('link', { name: /already added, open feed/i });
+    expect(link.getAttribute('href')).toBe('/feeds/dts');
+    expect(screen.queryByRole('button', { name: /add youtube feed/i })).toBeNull();
+  });
+
+  it('aborts an in-flight lookup when the input changes', async () => {
+    let signal: AbortSignal | undefined;
+    mockPreviewYouTube.mockImplementation((_url: string, sig: AbortSignal) => {
+      signal = sig;
+      return new Promise(() => {});
+    });
+    const input = await typeUrl(PLAYLIST);
+    await userEvent.click(screen.getByRole('button', { name: /look up/i }));
+    await waitFor(() => expect(signal).toBeDefined());
+    expect(signal?.aborted).toBe(false);
+    await userEvent.type(input, 'x');
+    expect(signal?.aborted).toBe(true);
+  });
+
+  it('discards a lookup result that arrives after the input changed', async () => {
+    let complete!: (value: typeof preview) => void;
+    mockPreviewYouTube.mockImplementation(() => new Promise((resolve) => { complete = resolve; }));
+    const input = await typeUrl(PLAYLIST);
+    await userEvent.click(screen.getByRole('button', { name: /look up/i }));
+    await userEvent.type(input, 'x');
+    await act(async () => complete(preview));
+    expect(screen.queryByText('The Daily Tech Show')).toBeNull();
+  });
+
+  it('passes the advanced options when adding a YouTube source', async () => {
+    mockPreviewYouTube.mockResolvedValue(preview);
+    mockAddYoutubeFeed.mockResolvedValue({ slug: 'the-daily-tech-show', feedType: 'youtube', feedUrl: 'x' });
+    await typeUrl(PLAYLIST);
+    await userEvent.click(screen.getByText('Advanced options'));
+    await userEvent.selectOptions(screen.getByLabelText('Auto-process'), 'disable');
+    await userEvent.type(screen.getByLabelText('Max episodes in feed'), '50');
+    await userEvent.selectOptions(screen.getByLabelText('Only expose processed episodes in feed'), 'enable');
+    await userEvent.click(screen.getByRole('button', { name: /look up/i }));
+    await userEvent.click(await screen.findByRole('button', { name: /add youtube feed/i }));
+    await waitFor(() => expect(mockAddYoutubeFeed).toHaveBeenCalledWith(expect.objectContaining({
+      autoProcessOverride: false, maxEpisodes: 50, onlyExposeProcessedEpisodes: true,
+    })));
+  });
+
+  it('labels a single video and omits the video count', async () => {
+    mockPreviewYouTube.mockResolvedValue({
+      enabled: true, rssMatches: [],
+      source: { kind: 'video', id: 'abc123def45', title: 'One Video', description: '', author: 'Example Channel',
+                artworkUrl: null, videoCount: 1, alreadyAdded: null },
+    });
+    mockAddYoutubeFeed.mockResolvedValue({ slug: 'one-video', feedType: 'youtube', feedUrl: 'x' });
+    await typeUrl('https://youtu.be/abc123def45');
+    await userEvent.click(screen.getByRole('button', { name: /look up/i }));
+    expect(await screen.findByText('One Video')).toBeDefined();
+    expect(screen.getByText('Video')).toBeDefined();
+    expect(screen.queryByText(/1 videos/)).toBeNull();
+    await userEvent.click(screen.getByRole('button', { name: /add youtube feed/i }));
+    await waitFor(() => expect(mockAddYoutubeFeed).toHaveBeenCalledWith(
+      expect.objectContaining({ sourceKind: 'video', sourceId: 'abc123def45' })));
+  });
+
+  it('points at Settings when YouTube is disabled', async () => {
+    const input = await typeUrl(PLAYLIST, defaultSettings);
+    expect(await screen.findByText(/youtube feeds are turned off/i)).toBeDefined();
+    expect(screen.getByRole('link', { name: 'Settings' }).getAttribute('href')).toBe('/settings#youtube');
+    expect(input.getAttribute('aria-describedby')).toContain('youtube-disabled');
+    expect((screen.getByRole('button', { name: /look up/i }) as HTMLButtonElement).disabled).toBe(true);
+    expect(mockPreviewYouTube).not.toHaveBeenCalled();
+  });
+
+  it('shows a not-found error from the preview', async () => {
+    mockPreviewYouTube.mockRejectedValue(new Error('Playlist not found or private'));
+    await typeUrl(PLAYLIST);
+    await userEvent.click(screen.getByRole('button', { name: /look up/i }));
+    expect((await screen.findByRole('alert')).textContent).toMatch(/not found or private/i);
+  });
+
+  it('keeps the Add feed button for a plain RSS URL', async () => {
+    await typeUrl('https://example.com/feed.xml');
+    expect(screen.getByRole('button', { name: 'Add feed' })).toBeDefined();
+    expect(screen.queryByRole('button', { name: /look up/i })).toBeNull();
+  });
+
+  it.each([
+    ['https://youtu.be/abc123def45', true],
+    ['https://www.youtube.com/watch?v=abc123def45', true],
+    ['https://example.com/feed.xml', false],
+    ['https://www.youtube.com/@x', true],
+    ['https://music.youtube.com/playlist?list=PLabcdefghijkl', true],
+    ['PLbh0Jamvptwfp_qc439PLuyKJ-tWUt222', true],
+    ['UCabcdefghijklmnopqrstuv', true],
+    ['@dailytech', true],
+  ])('classifies %s as YouTube input: %s', async (text, expected) => {
+    await typeUrl(text);
+    expect(!!screen.queryByRole('button', { name: /look up/i })).toBe(expected);
+  });
+});
+
+describe('YouTube name search', () => {
+  const INPUT = /search podcasts/i;
+  const enabled = { ...defaultSettings, youtubeEnabled: { value: true, isDefault: false } };
+  const SLOW = { timeout: 3000 }; // outlasts the 900 ms YouTube debounce
+  const makeYoutubeResult = (overrides: Record<string, unknown> = {}) => ({
+    kind: 'playlist', id: 'PLpod', title: 'Daily Tech Playlist', channelTitle: 'Acme Channel', videoCount: 120,
+    podcast: true, artworkUrl: null, url: 'https://www.youtube.com/playlist?list=PLpod', ...overrides,
+  });
+  const podcastResult = makeYoutubeResult();
+  const plainResult = makeYoutubeResult({
+    kind: 'channel', id: 'UCplain', title: 'Daily Tech Channel', videoCount: null, podcast: null,
+    url: 'https://www.youtube.com/channel/UCplain',
+  });
+
+  beforeEach(() => {
+    mockSearchPodcasts.mockResolvedValue([
+      { id: 1, title: 'The Daily Tech Show', description: '', artworkUrl: '', feedUrl: 'https://example.com/feed.xml', author: 'Acme', link: '' },
+    ]);
+  });
+
+  it('renders the group with a Podcast badge only on podcast results', async () => {
+    mockSearchYouTube.mockResolvedValue([podcastResult, plainResult]);
+    renderAddFeed(enabled);
+    await userEvent.type(await screen.findByLabelText(INPUT), 'daily');
+
+    expect(await screen.findByText('Daily Tech Playlist', undefined, SLOW)).toBeDefined();
+    expect(mockSearchYouTube).toHaveBeenCalledWith('daily', expect.any(AbortSignal));
+    expect(screen.getByRole('heading', { name: 'YouTube' })).toBeDefined();
+    expect(screen.getAllByText('Podcast')).toHaveLength(1);
+    expect(screen.getByText('120 videos')).toBeDefined();
+    expect(screen.getByText('Daily Tech Channel')).toBeDefined();
+  });
+
+  it('looks up the result url through the preview', async () => {
+    mockSearchYouTube.mockResolvedValue([podcastResult]);
+    mockPreviewYouTube.mockResolvedValue({ enabled: true, source: null, rssMatches: [] });
+    renderAddFeed(enabled);
+    await userEvent.type(await screen.findByLabelText(INPUT), 'daily');
+    await userEvent.click(await screen.findByRole('button', { name: /look up daily tech playlist/i }, SLOW));
+
+    await waitFor(() => {
+      expect(mockPreviewYouTube).toHaveBeenCalledWith(podcastResult.url, expect.any(AbortSignal));
+    });
+  });
+
+  it('keeps directory results when the YouTube search fails', async () => {
+    mockSearchYouTube.mockRejectedValue(new Error('YouTube lookup failed'));
+    renderAddFeed(enabled);
+    await userEvent.type(await screen.findByLabelText(INPUT), 'daily');
+
+    expect(await screen.findByText('YouTube lookup failed', undefined, SLOW)).toBeDefined();
+    expect(await screen.findByText('The Daily Tech Show')).toBeDefined();
+  });
+
+  it('renders nothing when YouTube feeds are disabled', async () => {
+    mockSearchYouTube.mockResolvedValue([podcastResult]);
+    renderAddFeed();
+    await userEvent.type(await screen.findByLabelText(INPUT), 'daily');
+
+    expect(await screen.findByText('The Daily Tech Show')).toBeDefined();
+    expect(mockSearchYouTube).not.toHaveBeenCalled();
+    expect(screen.queryByRole('heading', { name: 'YouTube' })).toBeNull();
   });
 });

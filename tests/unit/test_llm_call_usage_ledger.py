@@ -11,14 +11,24 @@ import pytest
 from config import normalize_model_key
 
 
-def _seed_price(db, model_id, input_cost, output_cost):
-    db.upsert_fetched_pricing([{
+def _seed_price(db, model_id, input_cost, output_cost, cache_read=None):
+    row = {
         'match_key': normalize_model_key(model_id),
         'raw_model_id': model_id,
         'display_name': model_id,
         'input_cost_per_mtok': input_cost,
         'output_cost_per_mtok': output_cost,
-    }], source='litellm')
+    }
+    if cache_read is not None:
+        row['cache_read_cost_per_mtok'] = cache_read
+    db.upsert_fetched_pricing([row], source='litellm')
+
+
+def _rate_snapshot(db, attempt_id):
+    row = db.get_connection().execute(
+        "SELECT rate_snapshot FROM llm_call_usage WHERE attempt_id = ?",
+        (attempt_id,)).fetchone()
+    return json.loads(row['rate_snapshot'])
 
 
 def _begin(db, model_id, provider_key='anthropic'):
@@ -405,6 +415,47 @@ class TestFinalizeLlmAttempt:
             "SELECT cost_source FROM llm_call_usage WHERE attempt_id = ?", (attempt_id,)
         ).fetchone()
         assert row['cost_source'] == 'estimated'
+
+    def test_openai_cached_tokens_bill_at_the_cache_read_rate(self, temp_db):
+        _seed_price(temp_db, 'gpt-cached', 2.0, 8.0, cache_read=0.5)
+        attempt_id = _begin(temp_db, 'gpt-cached', provider_key='openai')
+
+        cost = temp_db.finalize_llm_attempt(
+            attempt_id, state='success', returned_model='gpt-cached',
+            input_tokens=1_000_000, output_tokens=0, cache_read_tokens=400_000)
+
+        # 600k at 2.0 + 400k at 0.5
+        assert Decimal(str(cost)) == Decimal('1.4')
+        assert _rate_snapshot(temp_db, attempt_id) == {
+            'inputCostPerMtok': 2.0, 'outputCostPerMtok': 8.0, 'cacheReadCostPerMtok': 0.5}
+
+    def test_openai_cached_tokens_without_a_cache_rate_bill_at_the_input_rate(self, temp_db):
+        _seed_price(temp_db, 'gpt-plain', 2.0, 8.0)
+        attempt_id = _begin(temp_db, 'gpt-plain', provider_key='openai')
+        cost = temp_db.finalize_llm_attempt(
+            attempt_id, state='success', returned_model='gpt-plain',
+            input_tokens=1_000_000, output_tokens=0, cache_read_tokens=400_000)
+        assert Decimal(str(cost)) == Decimal('2')
+        assert 'cacheReadCostPerMtok' not in _rate_snapshot(temp_db, attempt_id)
+
+    def test_cache_reads_above_input_clamp_the_uncached_share_at_zero(self, temp_db):
+        _seed_price(temp_db, 'gpt-odd', 2.0, 0.0, cache_read=0.5)
+        attempt_id = _begin(temp_db, 'gpt-odd', provider_key='openai')
+        cost = temp_db.finalize_llm_attempt(
+            attempt_id, state='success', returned_model='gpt-odd',
+            input_tokens=100_000, output_tokens=0, cache_read_tokens=150_000)
+        # 0 uncached + 100k clamped reads at 0.5
+        assert Decimal(str(cost)) == Decimal('0.05')
+        assert _rate_snapshot(temp_db, attempt_id)['cacheReadCostPerMtok'] == 0.5
+
+    def test_anthropic_cache_math_ignores_the_catalog_cache_rate(self, temp_db):
+        _seed_price(temp_db, 'claude-sonnet-4-6', 2.0, 8.0, cache_read=0.01)
+        attempt_id = _begin(temp_db, 'claude-sonnet-4-6')
+        cost = temp_db.finalize_llm_attempt(
+            attempt_id, state='success', returned_model='claude-sonnet-4-6',
+            input_tokens=1_000_000, output_tokens=0, cache_read_tokens=400_000)
+        # anthropic path: 1.0 + 0.4 * (0.1 - 1) = 0.64 Mtok at 2.0
+        assert Decimal(str(cost)) == Decimal('1.28')
 
 
 class TestGetRunUsageTotals:

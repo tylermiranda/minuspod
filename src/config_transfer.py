@@ -16,6 +16,7 @@ import email_service
 import webhook_service
 from community_sync import DEFAULT_CRON as COMMUNITY_SYNC_DEFAULT_CRON
 from config import (
+    PRICING_OVERRIDE_OPTIONAL, PRICING_OVERRIDE_REQUIRED,
     PODCAST_SEARCH_PROVIDERS, STAGE_TUNABLE_PAYLOAD_KEYS,
     SYSTEMONE_TUNABLE_DEFAULTS, SYSTEMONE_TUNABLE_PROFILE_KEYS,
     PROCESSING_MODE_CUE_ONLY, cue_only_missing_roles_for_feed,
@@ -29,6 +30,7 @@ from db_backup_service import (
     DEFAULT_CRON as DB_BACKUP_DEFAULT_CRON,
     KEEP_COUNT_MAX, KEEP_COUNT_MIN, validate_backup_dest,
 )
+from database.podcasts import FEED_TYPES
 from database.settings import SETTINGS_REGISTRY, registry_default
 from systemone.tuning import SystemOneSettingsError, merge_profile, profile_from_snapshot
 from fx_rates import FxRateError, get_usd_rate
@@ -36,6 +38,7 @@ from llm_route import SAME_AS_DETECTION, VALID_SLOTS
 from pattern_cleanup import BATCH_SIZE_RANGE, UNUSED_DAYS_RANGE
 from podping_listener import get_podping_nodes, normalize_podping_nodes
 from rss_parser import _feed_trust
+from youtube.settings import validate_yt_int
 from rate_limit_hold import clear_hold_for_provider_change
 from secrets_crypto import SECRET_SETTING_KEYS, decrypt, is_available, is_ciphertext
 from utils.cron import is_valid_expression
@@ -53,6 +56,11 @@ EXCLUDED_SETTINGS = frozenset({
     'pattern_cleanup_schedule_anchor', 'provider_budget_fx_fetched_at',
     'provider_budget_fx_source_date', 'provider_budget_fx_rate',
     'provider_crypto_salt', 'provider_config_revision', 'config_transfer_revision',
+    # yt-dlp runtime status is instance state, not configuration
+    'youtube_ytdlp_version', 'youtube_ytdlp_last_update_at',
+    'youtube_ytdlp_last_check_at', 'youtube_ytdlp_last_error',
+    # proxy URL may embed credentials
+    'youtube_proxy_url',
 })
 EXTRA_SETTINGS = frozenset({
     'model_pricing_overrides', 'retention_days', 'original_retention_days',
@@ -117,6 +125,17 @@ BOOLEAN_EXTRA_SETTINGS = frozenset({
     'update_patterns_from_reviewer_adjustments', 'email_enabled', 'db_backup_enabled',
 })
 
+YT_INT_COLUMNS = {
+    'yt_process_delay_minutes_override': 'processDelayMinutes',
+    'yt_probe_attempts_override': 'sbProbeAttempts',
+    'yt_probe_interval_minutes_override': 'sbProbeIntervalMinutes',
+}
+YOUTUBE_BOOL_COLUMNS = (
+    'youtube_include_shorts', 'yt_llm_fallback_override', 'yt_llm_on_top_override',
+    'yt_captions_override', 'yt_hide_private_override', 'yt_transcribe_override',
+)
+_YOUTUBE_COLUMN_ORDER = ('youtube_source_kind', 'youtube_source_id', *YOUTUBE_BOOL_COLUMNS, *YT_INT_COLUMNS)
+YOUTUBE_COLUMNS = frozenset(_YOUTUBE_COLUMN_ORDER)
 FEED_COLUMNS = (
     'title', 'description', 'source_url', 'network_id', 'dai_platform',
     'network_id_override', 'audio_analysis_override', 'auto_process_override',
@@ -143,7 +162,10 @@ FEED_COLUMNS = (
     'keep_original_audio_override', 'user_tags', 'author', 'explicit',
     'audio_replacement_sound_override', 'audio_mp3_stream_copy_override',
     'categories', 'p20_channel_json',
+    *_YOUTUBE_COLUMN_ORDER,
 )
+YOUTUBE_SOURCE_RE = re.compile(r'youtube://(playlist|channel|video)/[A-Za-z0-9_-]+')
+YOUTUBE_ID_RE = re.compile(r'[A-Za-z0-9_-]+')
 FEED_JSON_COLUMNS = frozenset({
     'segment_category_actions', 'title_skip_patterns', 'description_skip_patterns',
     'user_tags', 'categories', 'p20_channel_json',
@@ -157,6 +179,7 @@ FEED_BOOL_COLUMNS = frozenset({
     'differential_fetch_enabled',
     'keep_original_audio_override',
     'audio_replacement_sound_override', 'audio_mp3_stream_copy_override',
+    *YOUTUBE_BOOL_COLUMNS,
 })
 
 
@@ -376,9 +399,12 @@ def export_config(db, app_version):
     for row in rows:
         columns = FEED_COLUMNS
         if row['feed_type'] != 'local':
-            columns = tuple(column for column in columns if column not in {
-                'author', 'explicit', 'categories', 'p20_channel_json',
-            })
+            local_only = {'author', 'explicit', 'categories'}
+            if row['feed_type'] != 'youtube':
+                local_only.add('p20_channel_json')
+            columns = tuple(column for column in columns if column not in local_only)
+        if row['feed_type'] != 'youtube':
+            columns = tuple(column for column in columns if column not in YOUTUBE_COLUMNS)
         if row['feed_type'] == 'recents':
             columns = ('title', 'description', 'source_url')
         feeds.append({
@@ -447,7 +473,7 @@ def _validate_document(document):
         if slug in seen:
             raise ConfigTransferError('File contains duplicate feed slugs')
         seen.add(slug)
-        if feed_type not in ('subscribed', 'local', 'recents'):
+        if feed_type not in FEED_TYPES:
             raise ConfigTransferError(f'Unsupported feed type for {slug}')
         fields = feed.get('settings', {})
         if set(fields) - set(FEED_COLUMNS):
@@ -475,8 +501,19 @@ def _validate_document(document):
             raise ConfigTransferError(f'Recents feed {slug} contains unsupported settings')
         if feed_type == 'recents' and fields.get('source_url') != 'recents://':
             raise ConfigTransferError(f'Recents feed {slug} has an invalid identity')
-        if feed_type != 'local' and set(fields) & {
-                'author', 'explicit', 'categories', 'p20_channel_json'}:
+        if feed_type == 'youtube':
+            if not isinstance(source_url, str) or not YOUTUBE_SOURCE_RE.fullmatch(source_url):
+                raise ConfigTransferError(f'YouTube feed {slug} has an invalid identity')
+            yt_kind, yt_id = fields.get('youtube_source_kind'), fields.get('youtube_source_id')
+            if (yt_kind not in ('playlist', 'channel', 'video') or not isinstance(yt_id, str)
+                    or not YOUTUBE_ID_RE.fullmatch(yt_id) or source_url != f'youtube://{yt_kind}/{yt_id}'):
+                raise ConfigTransferError(
+                    f'Feed {slug} has a YouTube source that does not match its source_url')
+        if feed_type != 'youtube' and not YOUTUBE_COLUMNS.isdisjoint(fields):
+            raise ConfigTransferError(f'Feed {slug} contains YouTube-only settings')
+        if feed_type != 'local' and set(fields) & (
+                {'author', 'explicit', 'categories'}
+                | (set() if feed_type == 'youtube' else {'p20_channel_json'})):
             raise ConfigTransferError(f'Feed {slug} contains local-only metadata')
     for key, value in settings.items():
         if key in PORTABLE_SETTINGS:
@@ -598,9 +635,12 @@ def _validate_setting_value(key, value):
                 continue
             if not isinstance(rates, dict):
                 raise ConfigTransferError('model_pricing_overrides contains an invalid model')
-            if set(rates) != {'inputCostPerMtok', 'outputCostPerMtok'}:
+            if not PRICING_OVERRIDE_REQUIRED <= set(rates) <= (
+                    PRICING_OVERRIDE_REQUIRED | PRICING_OVERRIDE_OPTIONAL):
                 raise ConfigTransferError('model_pricing_overrides contains invalid rate fields')
-            for rate in rates.values():
+            for field, rate in rates.items():
+                if field in PRICING_OVERRIDE_OPTIONAL and rate is None:
+                    continue
                 if (isinstance(rate, bool) or not isinstance(rate, (int, float))
                         or not math.isfinite(rate) or rate < 0):
                     raise ConfigTransferError('model_pricing_overrides rates must be finite and non-negative')
@@ -898,7 +938,7 @@ def build_preview(db, document, scope, selected_feeds=None):
                 raise ConfigTransferError(f'Feed source conflict for {slug}')
             updated.append(slug)
         source = feed.get('settings', {}).get('source_url', '')
-        if feed['feedType'] == 'subscribed':
+        if feed['feedType'] in ('subscribed', 'youtube'):
             duplicate = db.get_connection().execute(
                 'SELECT slug FROM podcasts WHERE source_url = ? AND slug != ? LIMIT 1',
                 (source, slug),
@@ -977,6 +1017,14 @@ def _validated_feed_updates(db, podcast, payload, feed_type, *, confirmed_ceilin
             if not isinstance(value, list) or any(not isinstance(tag, str) for tag in value):
                 raise ConfigTransferError('user_tags must be an array of strings or null')
             value = _canonical_json(value)
+        elif key in YT_INT_COLUMNS:
+            error = validate_yt_int(key, value, YT_INT_COLUMNS[key])
+            if error:
+                raise ConfigTransferError(error)
+        elif key in YOUTUBE_BOOL_COLUMNS:
+            value, error = feed_api._normalize_cue_bool_override(value, key)
+            if error:
+                raise ConfigTransferError(error)
         elif key in ('cue_create_from_pairs_override', 'cue_cut_matches_override',
                      'differential_fetch_enabled',
                      'keep_original_audio_override', 'audio_replacement_sound_override',
@@ -1350,7 +1398,7 @@ def apply_config(db, document, scope, selected_feeds, preview_token):
                         'SELECT slug FROM podcasts WHERE source_url = ? AND slug != ? LIMIT 1',
                         (source_url, slug),
                     ).fetchone()
-                    if feed['feedType'] == 'subscribed' and duplicate_source:
+                    if feed['feedType'] in ('subscribed', 'youtube') and duplicate_source:
                         raise ConfigTransferError('Source URL already belongs to another feed')
                     updates = _validated_feed_updates(
                         db, dict(current_row) if current_row else None,
@@ -1363,7 +1411,7 @@ def apply_config(db, document, scope, selected_feeds, preview_token):
                         title = updates.pop('title', None)
                         source_url = updates.pop('source_url', f'local://{slug}')
                         db.create_podcast(slug, source_url, title, feed['feedType'], conn=conn)
-                        if feed['feedType'] == 'local' and 'p20_channel_json' not in updates:
+                        if feed['feedType'] in ('local', 'youtube') and 'p20_channel_json' not in updates:
                             from api.feeds import _apply_p20_merge, _public_feed_url
                             feed_url = _public_feed_url(slug, db.get_setting('feed_auth_key'))
                             channel = _apply_p20_merge(

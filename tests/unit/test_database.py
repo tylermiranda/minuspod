@@ -33,6 +33,22 @@ class TestPodcastOperations:
         assert podcast['source_url'] == source_url
         assert podcast['title'] == title
 
+    def test_delete_podcast_removes_its_queue_rows(self, temp_db):
+        """Deleting a podcast drops its queue rows and keeps other feeds' rows."""
+        gone_id = temp_db.create_podcast('gone-feed', 'https://example.com/a.xml', 'Gone')
+        kept_id = temp_db.create_podcast('kept-feed', 'https://example.com/b.xml', 'Kept')
+        conn = temp_db.get_connection()
+        for pid in (gone_id, kept_id):
+            conn.execute(
+                "INSERT INTO auto_process_queue (podcast_id, episode_id, original_url) "
+                "VALUES (?, 'ep1', 'https://example.com/ep.mp3')", (pid,))
+        conn.commit()
+
+        assert temp_db.delete_podcast('gone-feed')
+
+        rows = conn.execute("SELECT podcast_id FROM auto_process_queue").fetchall()
+        assert [r[0] for r in rows] == [kept_id]
+
     def test_podcast_unique_slug(self, temp_db):
         """Duplicate slugs should raise an error."""
         slug = 'unique-podcast'
@@ -870,6 +886,44 @@ class TestTokenUsage:
         rate = temp_db._resolve_model_rate(conn, 'claude-haiku-4-5-20251001')
         assert rate[:2] == (1.0, 5.0)
 
+    def test_resolve_rate_returns_cache_read_rate_when_catalog_has_one(self, temp_db):
+        temp_db.upsert_fetched_pricing([{
+            'match_key': 'cachedmodel', 'raw_model_id': 'cached-model',
+            'display_name': 'cached-model', 'input_cost_per_mtok': 2.0,
+            'output_cost_per_mtok': 8.0, 'cache_read_cost_per_mtok': 0.5,
+        }], source='litellm')
+        conn = temp_db.get_connection()
+        rate = temp_db._resolve_model_rate(conn, 'cached-model')
+        assert rate[:3] == (2.0, 8.0, 0.5)
+
+    def test_resolve_rate_negative_catalog_cache_rate_resolves_to_none(self, temp_db):
+        temp_db.upsert_fetched_pricing([{
+            'match_key': 'negcache', 'raw_model_id': 'neg-cache',
+            'display_name': 'neg-cache', 'input_cost_per_mtok': 2.0,
+            'output_cost_per_mtok': 8.0, 'cache_read_cost_per_mtok': 0.5,
+        }], source='litellm')
+        conn = temp_db.get_connection()
+        conn.execute("UPDATE model_pricing SET cache_read_cost_per_mtok = -1 WHERE match_key = 'negcache'")
+        conn.commit()
+        assert temp_db._resolve_model_rate(conn, 'neg-cache').cache_read_per_mtok is None
+
+    def test_resolve_rate_cache_rate_is_none_when_unknown(self, temp_db):
+        conn = temp_db.get_connection()
+        assert temp_db._resolve_model_rate(conn, 'claude-haiku-4-5-20251001')[2] is None
+
+    def test_override_cache_rate_is_optional(self, temp_db):
+        temp_db.merge_model_pricing_overrides({
+            'legacy-override': {'inputCostPerMtok': 1.0, 'outputCostPerMtok': 2.0},
+            'cached-override': {'inputCostPerMtok': 1.0, 'outputCostPerMtok': 2.0,
+                                'cacheReadCostPerMtok': 0.1},
+            'bad-override': {'inputCostPerMtok': 1.0, 'outputCostPerMtok': 2.0,
+                             'cacheReadCostPerMtok': -1},
+        })
+        conn = temp_db.get_connection()
+        assert temp_db._resolve_model_rate(conn, 'legacy-override') == (1.0, 2.0, None, 'override')
+        assert temp_db._resolve_model_rate(conn, 'cached-override') == (1.0, 2.0, 0.1, 'override')
+        assert temp_db._resolve_model_rate(conn, 'bad-override') == (1.0, 2.0, None, 'override')
+
     def test_resolve_rate_prefix_match_close_length(self, temp_db):
         """Prefix match works when stored key covers >= 80% of lookup key length."""
         conn = temp_db.get_connection()
@@ -1250,6 +1304,22 @@ class TestBulkUpsertDiscoveredEpisodes:
             ep = temp_db.get_episode(slug, f'ep-{i}')
             assert ep is not None
             assert ep['status'] == 'discovered'
+
+    def test_bulk_upsert_stamps_yt_metadata_at_only_for_exact_described_youtube_rows(self, temp_db):
+        temp_db.create_podcast('yt', 'youtube://playlist/PL1', 'Test', feed_type='youtube')
+        temp_db.create_podcast('rss', 'https://example.com/rss.xml', 'Test')
+        full = self._make_episode('ep-full', published='2026-10-20T10:30:00Z')
+        temp_db.bulk_upsert_discovered_episodes('yt', [
+            full,
+            self._make_episode('ep-midnight', title='Midnight', published='2026-10-20T00:00:00Z'),
+            {**full, 'id': 'ep-nodesc', 'title': 'No desc', 'description': ''},
+            {**full, 'id': 'ep-placeholder', 'title': 'Private episode'}])
+        temp_db.bulk_upsert_discovered_episodes('rss', [full])
+        assert temp_db.get_episode('yt', 'ep-full')['yt_metadata_at']
+        assert temp_db.get_episode('yt', 'ep-midnight')['yt_metadata_at'] is None
+        assert temp_db.get_episode('yt', 'ep-nodesc')['yt_metadata_at'] is None
+        assert temp_db.get_episode('yt', 'ep-placeholder')['yt_metadata_at'] is None
+        assert temp_db.get_episode('rss', 'ep-full')['yt_metadata_at'] is None
 
     def test_bulk_upsert_does_not_overwrite_existing_status(self, temp_db):
         slug = 'bulk-no-overwrite'

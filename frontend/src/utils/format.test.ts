@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { formatDurationHoursMinutes, keyLabel, formatPercent, formatElapsed, sentenceCase } from './format';
+import { formatDurationHoursMinutes, keyLabel, formatPercent, formatElapsed, sentenceCase, cacheHit, formatTimestamp } from './format';
 
 describe('formatDurationHoursMinutes', () => {
   it.each([
@@ -58,5 +58,36 @@ describe('sentenceCase', () => {
   it('upper-cases the first letter only', () => {
     expect(sentenceCase('queued (offline)')).toBe('Queued (offline)');
     expect(sentenceCase('')).toBe('');
+  });
+});
+
+describe('cacheHit', () => {
+  it('reports reads over input as a whole percent', () => {
+    const hit = cacheHit(800, 100, 1000);
+    expect(hit.text).toBe('80%');
+    expect(hit.title).toMatch(/^800 read, 100 write of /);
+  });
+  it('caps the rate at 100% when reads exceed input', () => {
+    expect(cacheHit(1500, 0, 1000).text).toBe('100%');
+  });
+  it('is blank without input or without cache traffic', () => {
+    expect(cacheHit(10, 0, 0)).toEqual({ text: '' });
+    expect(cacheHit(0, 0, 1000)).toEqual({ text: '' });
+  });
+});
+
+describe('formatTimestamp', () => {
+  it.each([
+    [0, '0:00'],
+    [5.9, '0:05'],
+    [65, '1:05'],
+    [3599, '59:59'],
+    [3600, '1:00:00'],
+    [3725, '1:02:05'],
+    [-4, '0:00'],
+    [NaN, '0:00'],
+    [Infinity, '0:00'],
+  ])('formats %s as %s', (s, expected) => {
+    expect(formatTimestamp(s)).toBe(expected);
   });
 });

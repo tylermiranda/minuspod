@@ -109,7 +109,7 @@ const phaseRun: EpisodeProcessingRun = {
     {
       phaseKey: 'detection', invokingPass: 1, provider: 'anthropic',
       configuredModel: 'claude-3-5-sonnet', returnedModel: 'claude-3-5-sonnet',
-      inputTokens: 3000, outputTokens: 500, cacheReadTokens: 0, cacheWriteTokens: 0,
+      inputTokens: 3000, outputTokens: 500, cacheReadTokens: 1500, cacheWriteTokens: 0,
       reasoningTokens: 0, costUsd: '0.03', costSource: 'provider_reported',
     },
     {
@@ -236,6 +236,34 @@ describe('ProcessingRunsTable', () => {
     expect(withoutValue.getByText('Chapters').nextSibling?.textContent).toBe('Unavailable');
   });
 
+  it('shows the SponsorBlock lookup row only when the run recorded it', () => {
+    const withLookup: EpisodeProcessingRun = {
+      ...statsRun,
+      runNumber: 9,
+      stats: {
+        ...statsRun.stats!,
+        timings: { ...statsRun.stats!.timings, sponsorblockSeconds: 2 },
+      },
+    };
+    const present = renderTable([withLookup]);
+    fireEvent.click(present.getByRole('button', { name: /show phase breakdown for run #9/i }));
+    expect(present.getByText('SponsorBlock lookup').nextSibling?.textContent).toBe('2s');
+
+    const absent = renderTable([statsRun]);
+    fireEvent.click(absent.getByRole('button', { name: /show phase breakdown for run #2/i }));
+    expect(absent.queryByText('SponsorBlock lookup')).toBeNull();
+  });
+
+  it('labels audio analysis as skipped on a marks-only run', () => {
+    const run: EpisodeProcessingRun = {
+      ...statsRun,
+      stats: { ...statsRun.stats!, audioAnalysisSkipped: true },
+    };
+    const table = renderTable([run]);
+    fireEvent.click(table.getByRole('button', { name: /show phase breakdown for run #2/i }));
+    expect(table.getByText('Audio analysis').nextSibling?.textContent).toBe('Skipped');
+  });
+
   it('marks a skip-detection run instead of showing zero stage hits', () => {
     const table = renderTable([skipDetectionRun]);
     expect(table.getByText('(no ad detection)')).toBeTruthy();
@@ -291,6 +319,8 @@ describe('ProcessingRunsTable: phase breakdown', () => {
     fireEvent.click(table.getByRole('button', { name: /show phase breakdown for run #6/i }));
     // Each phase appears once in this run, so the "(pass N)" suffix is omitted.
     expect(table.getByText('Detection')).toBeTruthy();
+    expect(table.getByText('50%')).toBeTruthy();
+    expect(table.queryByText(/ r \//)).toBeNull();
     expect(table.getByText('Verification')).toBeTruthy();
     expect(table.queryByText('Detection (pass 1)')).toBeNull();
     expect(table.queryByText('Verification (pass 2)')).toBeNull();

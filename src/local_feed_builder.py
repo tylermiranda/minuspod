@@ -26,6 +26,7 @@ from main_app.shared_state import invalidate_episode_lookup_cache
 from rss_parser import RSS_RENDER_VERSION
 from utils.episode_paths import episode_public_url, published_episode_version
 from utils.feed_guid import compute_feed_guid
+from utils.json_fields import load_json_list
 from utils.time import utc_now_iso
 
 logger = logging.getLogger('podcast.feed')
@@ -57,16 +58,6 @@ def _load_json_dict(raw: str | None) -> dict:
         return parsed if isinstance(parsed, dict) else {}
     except (TypeError, ValueError):
         return {}
-
-
-def _load_json_list(raw: str | None) -> list:
-    if not raw:
-        return []
-    try:
-        parsed = json.loads(raw)
-        return parsed if isinstance(parsed, list) else []
-    except (TypeError, ValueError):
-        return []
 
 
 def _emit_pc2_items(lines: list, tag: str, items, attr_keys: tuple) -> None:
@@ -218,6 +209,7 @@ def _append_local_episode_item(lines: list, slug: str, ep: dict, base: str,
     enclosure_url = episode_public_url(base, slug, ep_id, version=version,
                                        key=feed_auth_key)
     length_attr, duration = _enclosure_audio_metadata(slug, ep, storage_)
+    duration = duration or ep.get('rss_duration')
     lines.append(f'  <enclosure url="{enclosure_url}" type="audio/mpeg"{length_attr} />')
 
     if duration:
@@ -253,7 +245,8 @@ def _append_local_episode_item(lines: list, slug: str, ep: dict, base: str,
     lines.append('</item>')
 
 
-def build_local_feed_xml(podcast: dict, episodes: list[dict], *, storage, db) -> str:
+def build_local_feed_xml(podcast: dict, episodes: list[dict], *, storage, db,
+                         channel_link: str | None = None) -> str:
     """Render a local feed's RSS from DB rows only. No upstream fetch."""
     slug = podcast['slug']
     base = rss_parser._resolved_base_url()
@@ -262,7 +255,7 @@ def build_local_feed_xml(podcast: dict, episodes: list[dict], *, storage, db) ->
     channel_json = _load_json_dict(podcast.get('p20_channel_json'))
 
     title = podcast.get('title') or slug
-    channel_link = f"{base}/{slug}"
+    channel_link = channel_link or f"{base}/{slug}"
     description = podcast.get('description') or ''
     # 'auto' is a Whisper transcription-language pin, not an RSS language
     # code -- it must never leak into <language>.
@@ -280,7 +273,7 @@ def build_local_feed_xml(podcast: dict, episodes: list[dict], *, storage, db) ->
     if explicit is not None:
         lines.append(f'<itunes:explicit>{"true" if explicit else "false"}</itunes:explicit>')
 
-    for category in _load_json_list(podcast.get('categories')):
+    for category in load_json_list(podcast.get('categories')):
         if category:
             lines.append(f'<itunes:category text="{rss_parser._escape_xml(str(category))}" />')
 
@@ -324,7 +317,8 @@ def build_local_feed_xml(podcast: dict, episodes: list[dict], *, storage, db) ->
     return '\n'.join(lines)
 
 
-def _fetch_local_feed_episodes(db_, podcast_id: int, limit: int | None) -> list[dict]:
+def _fetch_local_feed_episodes(db_, podcast_id: int, limit: int | None,
+                               processed_only: bool = False) -> list[dict]:
     """Episodes of a local feed, newest first, regardless of status --
     unprocessed episodes still need an (unversioned) enclosure so the first
     play triggers JIT. get_episodes() enforces an offset and a status filter
@@ -333,9 +327,11 @@ def _fetch_local_feed_episodes(db_, podcast_id: int, limit: int | None) -> list[
     ``limit`` is None or 0 for "every episode" (a local feed's default --
     there is no upstream to reconcile against, so nothing caps it unless the
     operator sets one) or a positive int to keep only the newest N.
+    ``processed_only`` keeps only episodes with a published file (YouTube feeds), including ones being reprocessed.
     """
     conn = db_.get_connection()
-    query = ("SELECT * FROM episodes WHERE podcast_id = ? "
+    served = "AND processed_file IS NOT NULL " if processed_only else ""
+    query = (f"SELECT * FROM episodes WHERE podcast_id = ? {served}"  # noqa: S608
              "ORDER BY COALESCE(published_at, created_at) DESC")
     params = [podcast_id]
     if limit:

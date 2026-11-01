@@ -1,3 +1,11 @@
+ARG BASE_APP_IMAGE=ubuntu:26.04
+
+# Patched packages image, pinned by digest; scripts/bump_security_packages.sh rewrites both lines.
+# patch-inputs-hash: 0586002b8159c406
+ARG SECURITY_PACKAGES_IMAGE=ttlequals0/minuspod-security-packages@sha256:6cd21e5bb8a80a1c667446c968693ec53801fcfc76f44ed6037a141a901c0115
+# SECURITY_SRC=stub uses stock Ubuntu packages (local use only).
+ARG SECURITY_SRC=image
+
 # Stage 1: Build frontend
 FROM node:26-alpine@sha256:e71ac5e964b9201072425d59d2e876359efa25dc96bb1768cb73295728d6e4ea AS frontend-builder
 
@@ -24,77 +32,20 @@ RUN mkdir -p /app/static/ui/swagger \
           node_modules/swagger-ui-dist/swagger-ui-standalone-preset.js \
           /app/static/ui/swagger/
 
-# Build patched media packages with Ubuntu's full build recipes.
-FROM ubuntu:26.04 AS media-security-dependencies
-ENV DEBIAN_FRONTEND=noninteractive
-RUN sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/ubuntu.sources \
-    && apt-get update \
-    && apt-get build-dep -y --no-install-recommends ffmpeg libass srt libsndfile \
-    && apt-get install -y --no-install-recommends python3 ca-certificates devscripts quilt
-FROM media-security-dependencies AS media-security-builder
-COPY scripts/build_media_security_packages.py /build/scripts/
-COPY scripts/media-security/ /build/scripts/media-security/
-RUN python3 /build/scripts/build_media_security_packages.py
-
-# Build core libraries independently from the media package cache.
-FROM ubuntu:26.04 AS core-security-dependencies
-ENV DEBIAN_FRONTEND=noninteractive
-RUN sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/ubuntu.sources \
-    && apt-get update \
-    && apt-get build-dep -y --no-install-recommends -P nobiarch glibc pcre2 \
-    && apt-get install -y --no-install-recommends python3 ca-certificates devscripts quilt
-FROM core-security-dependencies AS core-security-builder
-COPY scripts/build_media_security_packages.py /build/scripts/
-COPY scripts/core-security/ /build/scripts/core-security/
-RUN python3 /build/scripts/build_media_security_packages.py --input-dir /build/scripts/core-security
-
-# Build ancillary libraries as an unprivileged package builder.
-FROM ubuntu:26.04 AS misc-security-dependencies
-ENV DEBIAN_FRONTEND=noninteractive
-RUN sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/ubuntu.sources \
-    && apt-get update \
-    && apt-get build-dep -y --no-install-recommends cjson glib2.0 \
-    && apt-get install -y --no-install-recommends python3 ca-certificates devscripts quilt
-FROM misc-security-dependencies AS misc-security-builder
-COPY scripts/build_media_security_packages.py /build/scripts/
-COPY scripts/misc-security/ /build/scripts/misc-security/
-RUN install -d -o ubuntu -g ubuntu /work/media-security /out
-USER ubuntu
-RUN python3 /build/scripts/build_media_security_packages.py --input-dir /build/scripts/misc-security
-
-# Build the patched graphics and video libraries separately.
-FROM ubuntu:26.04 AS graphics-security-dependencies
-ENV DEBIAN_FRONTEND=noninteractive
-RUN sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/ubuntu.sources \
-    && apt-get update \
-    && apt-get build-dep -y --no-install-recommends cairo x264 \
-    && apt-get install -y --no-install-recommends python3 ca-certificates devscripts quilt
-FROM graphics-security-dependencies AS graphics-security-builder
-COPY scripts/build_media_security_packages.py /build/scripts/
-COPY scripts/graphics-security/ /build/scripts/graphics-security/
-RUN python3 /build/scripts/build_media_security_packages.py --input-dir /build/scripts/graphics-security
-
-# Build patched utilities with unprivileged package tests.
-FROM ubuntu:26.04 AS aux-security-dependencies
-ENV DEBIAN_FRONTEND=noninteractive
-RUN sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/ubuntu.sources \
-    && apt-get update \
-    && apt-get build-dep -y --no-install-recommends p11-kit bubblewrap tar libxrender \
-    && apt-get install -y --no-install-recommends \
-        python3 ca-certificates devscripts quilt gtk-doc-tools dh-exec bison xutils-dev libselinux1-dev
-FROM aux-security-dependencies AS aux-security-builder
-COPY scripts/build_media_security_packages.py /build/scripts/
-COPY scripts/aux-security/ /build/scripts/aux-security/
-RUN install -d -o ubuntu -g ubuntu /work/media-security /out
-USER ubuntu
-RUN python3 /build/scripts/build_media_security_packages.py --input-dir /build/scripts/aux-security
+# Stage 2: Patched security packages (published image, or stock-package stub)
+FROM ${SECURITY_PACKAGES_IMAGE} AS security-image
+FROM ${BASE_APP_IMAGE} AS security-stub-tree
+RUN for family in core media misc graphics aux; do mkdir -p /out/$family/packages /out/$family/provenance; done
+FROM scratch AS security-stub
+COPY --from=security-stub-tree /out/ /
+FROM security-${SECURITY_SRC} AS security-out
 
 # Python application
 # Plain Ubuntu base - no nvidia/cuda image. ctranslate2 statically links the
 # CUDA runtime, and cuDNN/cuBLAS come from the pip nvidia-* wheels (torch
 # deps) via LD_LIBRARY_PATH below. GPU access is injected by the NVIDIA
 # container runtime, driven by the NVIDIA_* env vars in the ENV block.
-FROM ubuntu:26.04
+FROM ${BASE_APP_IMAGE}
 ARG MINUSPOD_VERSION=dev
 
 # Install Python 3.12 from deadsnakes PPA and system dependencies
@@ -115,6 +66,7 @@ RUN : "$MINUSPOD_VERSION" && apt-get update && apt-get install -y --no-install-r
     libsndfile1 \
     libchromaprint-tools \
     tzdata \
+    unzip \
     && apt-get upgrade -y \
     && rm -rf /usr/lib/python3/dist-packages/cryptography* \
               /usr/lib/python3/dist-packages/PyJWT* \
@@ -124,6 +76,30 @@ RUN : "$MINUSPOD_VERSION" && apt-get update && apt-get install -y --no-install-r
     && rm -rf /usr/bin/pebble /var/lib/pebble \
     && rm -rf /var/lib/apt/lists/* /tmp/* /var/tmp/* \
     && setpriv --reuid=nobody --regid=nogroup --init-groups true
+
+# yt-dlp floor: the pinned release is baked in; the app copies it to the data
+# volume on boot and self-updates there, so a new image never downgrades it.
+ARG TARGETARCH
+ARG DENO_VERSION=v2.9.8
+COPY ytdlp-version.txt /tmp/ytdlp-version.txt
+RUN set -eu; \
+    YTDLP_VERSION=$(tr -d '[:space:]' < /tmp/ytdlp-version.txt); \
+    case "${TARGETARCH:-amd64}" in \
+      amd64) YTDLP_ASSET=yt-dlp_linux; DENO_ASSET=deno-x86_64-unknown-linux-gnu.zip ;; \
+      arm64) YTDLP_ASSET=yt-dlp_linux_aarch64; DENO_ASSET=deno-aarch64-unknown-linux-gnu.zip ;; \
+      *) echo "unsupported TARGETARCH ${TARGETARCH}" >&2; exit 1 ;; \
+    esac; \
+    base="https://github.com/yt-dlp/yt-dlp/releases/download/${YTDLP_VERSION}"; \
+    curl -fsSL -o /tmp/yt-dlp "${base}/${YTDLP_ASSET}"; \
+    curl -fsSL -o /tmp/SHA2-256SUMS "${base}/SHA2-256SUMS"; \
+    grep " ${YTDLP_ASSET}\$" /tmp/SHA2-256SUMS | sed "s| ${YTDLP_ASSET}| /tmp/yt-dlp|" | sha256sum -c -; \
+    install -m 0755 /tmp/yt-dlp /usr/local/bin/yt-dlp; \
+    curl -fsSL -o /tmp/deno.zip "https://github.com/denoland/deno/releases/download/${DENO_VERSION}/${DENO_ASSET}"; \
+    curl -fsSL -o /tmp/deno.zip.sha256sum "https://github.com/denoland/deno/releases/download/${DENO_VERSION}/${DENO_ASSET}.sha256sum"; \
+    (cd /tmp && sed 's|  .*| deno.zip|' deno.zip.sha256sum | sha256sum -c -); \
+    unzip -q /tmp/deno.zip -d /usr/local/bin && chmod 0755 /usr/local/bin/deno; \
+    rm -f /tmp/yt-dlp /tmp/SHA2-256SUMS /tmp/deno.zip /tmp/deno.zip.sha256sum /tmp/ytdlp-version.txt; \
+    /usr/local/bin/yt-dlp --version && /usr/local/bin/deno --version
 
 # Set python3.12 as default, create venv for all pip installs
 # Venv avoids pip 26+ "uninstall-no-record-file" errors with system packages
@@ -159,37 +135,23 @@ RUN --mount=type=cache,id=pipcache,target=/root/.cache/pip \
 # cublas 12, cufft 11, curand 10 from the torch nvidia wheels.
 RUN --mount=type=cache,id=pipcache,target=/root/.cache/pip \
     pip uninstall -y onnxruntime && pip install onnxruntime-gpu==1.24.4
-COPY --from=core-security-builder /out/packages/ /opt/core-security-packages/
-COPY --from=core-security-builder /out/provenance/ /usr/share/minuspod/core-security/
+COPY --from=security-out / /opt/security/
+ARG SECURITY_SRC
+# Stub builds keep stock packages; every other build must install all five families.
 RUN apt-get update \
-    && apt-get purge -y \
-        linux-libc-dev python3.12-dev libpython3.12-dev libc6-dev libexpat1-dev \
-    && apt-get install -y --no-install-recommends /opt/core-security-packages/*.deb \
-    && rm -rf /opt/core-security-packages /var/lib/apt/lists/*
-# Keep the matching shared-library family and corresponding patched source.
-COPY --from=media-security-builder /out/packages/ /opt/media-security-packages/
-COPY --from=media-security-builder /out/provenance/ /usr/share/minuspod/media-security/
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends /opt/media-security-packages/*.deb \
-    && rm -rf /opt/media-security-packages /var/lib/apt/lists/*
-
-COPY --from=misc-security-builder /out/packages/ /opt/misc-security-packages/
-COPY --from=misc-security-builder /out/provenance/ /usr/share/minuspod/misc-security/
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends /opt/misc-security-packages/*.deb \
-    && rm -rf /opt/misc-security-packages /var/lib/apt/lists/*
-
-COPY --from=graphics-security-builder /out/packages/ /opt/graphics-security-packages/
-COPY --from=graphics-security-builder /out/provenance/ /usr/share/minuspod/graphics-security/
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends /opt/graphics-security-packages/*.deb \
-    && rm -rf /opt/graphics-security-packages /var/lib/apt/lists/*
-
-COPY --from=aux-security-builder /out/packages/ /opt/aux-security-packages/
-COPY --from=aux-security-builder /out/provenance/ /usr/share/minuspod/aux-security/
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends /opt/aux-security-packages/*.deb \
-    && rm -rf /opt/aux-security-packages /var/lib/apt/lists/*
+    && if [ "$SECURITY_SRC" != stub ]; then \
+        apt-get purge -y \
+            linux-libc-dev python3.12-dev libpython3.12-dev libc6-dev libexpat1-dev \
+        && apt-get install -y --no-install-recommends /opt/security/core/packages/*.deb \
+        && for family in media misc graphics aux; do \
+            apt-get install -y --no-install-recommends /opt/security/$family/packages/*.deb || exit 1; \
+        done; \
+    fi \
+    && for family in core media misc graphics aux; do \
+        mkdir -p /usr/share/minuspod/$family-security \
+        && cp -a /opt/security/$family/provenance/. /usr/share/minuspod/$family-security/; \
+    done \
+    && rm -rf /opt/security /var/lib/apt/lists/*
 
 # Use Ubuntu's supported GNU provider instead of the protected Rust provider.
 RUN apt-get update \
@@ -198,11 +160,11 @@ RUN apt-get update \
     && apt-get purge -y --allow-remove-essential \
         software-properties-common python3-jwt systemd systemd-sysv libpam-systemd \
     && apt-get autoremove -y \
-    && python3.12 /usr/share/minuspod/core-security/build_media_security_packages.py --verify-installed \
-    && python3.12 /usr/share/minuspod/media-security/build_media_security_packages.py --verify-installed \
-    && python3.12 /usr/share/minuspod/misc-security/build_media_security_packages.py --verify-installed \
-    && python3.12 /usr/share/minuspod/graphics-security/build_media_security_packages.py --verify-installed \
-    && python3.12 /usr/share/minuspod/aux-security/build_media_security_packages.py --verify-installed \
+    && if [ "$SECURITY_SRC" != stub ]; then \
+        for family in core media misc graphics aux; do \
+            python3.12 /usr/share/minuspod/$family-security/build_media_security_packages.py --verify-installed || exit 1; \
+        done; \
+    fi \
     && python -m pip uninstall -y pip \
     && rm -rf /var/lib/apt/lists/* /root/.cache /tmp/* \
     && find /opt/venv -type d -name '__pycache__' -exec rm -rf {} +
@@ -223,6 +185,7 @@ RUN apt-get update \
 # means any driver >= 525 (CUDA 12.0) works. Do NOT raise it to cuda>=12.6 --
 # that would refuse drivers that merely predate 12.6 but run cu126 fine.
 ENV HOME=/app/data \
+    DENO_DIR=/app/data/.cache/deno \
     WHISPER_MODEL=small \
     HF_HOME=/app/data/.cache \
     HUGGINGFACE_HUB_CACHE=/app/data/.cache/hub \

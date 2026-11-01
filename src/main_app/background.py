@@ -298,6 +298,9 @@ def background_rss_refresh():
     from db_backup_service import db_backup_tick
     from pattern_cleanup import pattern_cleanup_tick
     from update_checker import update_check_tick
+    from youtube.metadata import backfill_tick as metadata_backfill_tick
+    from youtube.watch import sponsorblock_tick
+    from youtube.ytdlp import update_tick as ytdlp_update_tick
     outage_passes = 0
     # None (not 0.0) so the first pass always runs: monotonic() is uptime,
     # which can be below interval_seconds on a freshly booted host.
@@ -320,6 +323,10 @@ def background_rss_refresh():
             _run_tick(db_backup_tick, 'db_backup_tick')
             _run_tick(pattern_cleanup_tick, 'pattern_cleanup_tick')
             _run_tick(update_check_tick, 'update_check_tick')
+        # Both self-throttle, so they run every pass.
+        _run_tick(sponsorblock_tick, 'youtube_sponsorblock_tick')
+        _run_tick(metadata_backfill_tick, 'youtube_metadata_backfill_tick')
+        _run_tick(ytdlp_update_tick, 'youtube_ytdlp_update_tick')
         # Guard point for issue #566: a tick that swallowed a write failure
         # may have left a transaction open. Clear it before the wait so it
         # cannot block other writers.
@@ -490,7 +497,7 @@ def _wait_for_claimed_episode(queue_id: int, slug: str, episode_id: str) -> None
             shutdown_event.wait(timeout=10)
             waited += 10
             episode = db.get_episode_state(slug, episode_id)
-            if episode and episode['status'] in ('processed', 'failed', 'permanently_failed', 'deferred'):
+            if episode and episode['status'] in ('processed', 'failed', 'permanently_failed', 'deferred', 'discovered'):
                 break
             # A rate-limit hold put the row back to pending.
             if episode and episode['status'] == 'pending' and any_hold_active(db):
@@ -543,6 +550,11 @@ def _wait_for_claimed_episode(queue_id: int, slug: str, episode_id: str) -> None
             # re-opens it as pending once the service is back.
             db.close_claimed_queue_row(queue_id, 'completed')
             refresh_logger.info(f"[{slug}:{episode_id}] Deferred to offline queue (endpoint unreachable)")
+        elif episode and episode['status'] == 'discovered':
+            # A YouTube episode stepped aside to wait for SponsorBlock marks;
+            # the watcher re-queues it, so the row closes without a failure.
+            db.close_claimed_queue_row(queue_id, 'completed')
+            refresh_logger.info(f"[{slug}:{episode_id}] Waiting for SponsorBlock marks; queue row closed")
         elif (episode and episode['status'] == 'pending'
                 and any_hold_active(db)):
             # The failure handler already reopened the row as

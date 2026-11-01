@@ -22,7 +22,7 @@ from config import (
     PASS2_AUTOAPPROVE_SNIPPET_PREFIX,
     PASS2_AUTOAPPROVE_TRIM_SLACK_S,
     CORRECTION_ORIGIN_AUTO_PASS2,
-    is_pending_review, normalize_segment_category, is_keep_like,
+    is_pending_review, normalize_segment_category, is_keep_like, is_known_ad,
     SEGMENT_CATEGORIES,
     DEFAULT_SEGMENT_ACTION,
     resolve_ad_detection_exclude_start_seconds,
@@ -36,6 +36,8 @@ from llm_capabilities import (
 
 from llm_client import ProviderRateLimitedError
 
+from utils.constants import canonical_sponsor
+from utils.markers import subtract_spans
 from utils.errors import ModelLoadError
 
 from main_app.verification_reconciliation import (
@@ -116,6 +118,27 @@ def _stamp_pass2_marker_categories(markers):
             continue
         m.pop('category', None)
     return markers
+
+
+def _stamp_known_sponsors(processed_ads, original_ads):
+    """Flag pass-2 ads naming a sponsor with an active pattern; is_known_ad reads the flag."""
+    known = db.get_active_pattern_sponsors() if db else set()
+    if not known:
+        return
+    for processed, original in zip(processed_ads, original_ads, strict=True):
+        sponsor = canonical_sponsor(original.get('sponsor') or processed.get('sponsor') or '')
+        if sponsor and sponsor.lower() in known:
+            processed['sponsor_known'] = original['sponsor_known'] = True
+
+
+def _keeps_yielding_to_known_ads(kept_markers, original_ads):
+    """Kept spans minus the audio a known pass-2 ad covers; the keep yields to the ad."""
+    known = [(ad['start'], ad['end']) for ad in original_ads if is_known_ad(ad)]
+    if not known:
+        return list(kept_markers or [])
+    return [{**marker, 'start': start, 'end': end}
+            for marker in (kept_markers or [])
+            for start, end in subtract_spans([(marker['start'], marker['end'])], known)]
 
 
 def _partition_pass2_category_actions(processed_ads, original_ads, actions_map,
@@ -926,6 +949,7 @@ def _run_verification_pass(ctx, processed_path, pass1_cuts,
             verification_ads_processed, verification_ads_original,
             lambda o: _matches_false_positive_correction(o, false_positive_corrections),
             'rejected:fp_correction', ledger)
+        _stamp_known_sponsors(verification_ads_processed, verification_ads_original)
         # A pass-1 keep is operator intent. Settle overlaps before category
         # partitioning so a same-category keep does not become a duplicate
         # pass-2 marker and only fragments outside the keep reach validation.
@@ -964,7 +988,8 @@ def _run_verification_pass(ctx, processed_path, pass1_cuts,
         )
         # After the category partition, so every Protection carries the category keeps.
         hard_protection = build_protection(
-            kept=pass1_kept_markers, category_kept=category_kept,
+            kept=_keeps_yielding_to_known_ads(pass1_kept_markers, verification_ads_original),
+            category_kept=_keeps_yielding_to_known_ads(category_kept, verification_ads_original),
             user_trims=pass1_trim_ranges,
             fp_corrections=false_positive_corrections,
             holds=[], pass1_cuts=pass1_cuts, reviewer_rejects=pass1_reviewer_rejects)
@@ -1026,6 +1051,13 @@ def _run_verification_pass(ctx, processed_path, pass1_cuts,
                 (v_ads_to_cut, v_ads_for_ui, gated_held, v_corroborated_count,
                  hold_release_candidates) = gated
                 v_ads_held.extend(gated_held)
+                # Keeps yield only to the known ads that survived validation and gating.
+                hard_protection = build_protection(
+                    kept=_keeps_yielding_to_known_ads(pass1_kept_markers, v_ads_to_cut),
+                    category_kept=_keeps_yielding_to_known_ads(category_kept, v_ads_to_cut),
+                    user_trims=pass1_trim_ranges,
+                    fp_corrections=false_positive_corrections,
+                    holds=[], pass1_cuts=pass1_cuts, reviewer_rejects=pass1_reviewer_rejects)
                 # Before the fragment gate so a covering adjust's outside pieces take that path.
                 released, outside_pairs = review._review_hold_release_candidates(
                     ctx, hold_release_candidates, original_segments,

@@ -160,6 +160,42 @@ def normalize_segment_category(value: Any) -> str:
     return value if value in SEGMENT_CATEGORIES else 'sponsor'
 
 
+AD_CATEGORIES = ('sponsor', 'cross_promo', 'self_promo', 'interaction')
+
+
+def _has_fingerprint_evidence(marker: dict) -> bool:
+    """A merged-in fingerprint member counts; lazy import, utils imports this module."""
+    from utils.markers import recorded_member_spans
+    return any(span.get('stage') == 'fingerprint' for span in recorded_member_spans(marker))
+
+
+def _validation(m: dict) -> dict:
+    return m.get('validation') or {}
+
+
+_KNOWN_AD_EVIDENCE = (
+    ('user confirmed', lambda m: bool(_validation(m).get('user_confirmed')) or m.get('_confirmed_correction') is not None),
+    ('reviewer confirmed', lambda m: m.get('reviewer_verdict') == 'confirmed'),
+    ('fingerprint', lambda m: m.get('fingerprint_match_start') is not None or _has_fingerprint_evidence(m)),
+    ('pattern', lambda m: bool(m.get('pattern_defined')
+                               or (m.get('pattern_id') is not None and m.get('sponsor')))),
+    ('known sponsor', lambda m: bool(m.get('sponsor_known') or _validation(m).get('sponsor_confirmed'))),
+    ('verified span', lambda m: bool(_validation(m).get('confirmed_span'))),
+    ('community mark', lambda m: m.get('source') == 'sponsorblock'),
+)
+
+
+def known_ad_evidence(marker: dict) -> list[str]:
+    """Labels of the evidence that makes a marker a known ad, in table order."""
+    return [label for label, hit in _KNOWN_AD_EVIDENCE if hit(marker)]
+
+
+def is_known_ad(marker: dict) -> bool:
+    """An ad-category marker with evidence beyond an LLM guess; it always cuts."""
+    return (normalize_segment_category(marker.get('category')) in AD_CATEGORIES
+            and bool(known_ad_evidence(marker)))
+
+
 # Per-category community-sync acceptance (issue #565): which categories this
 # install pulls from community sync. Defaults to every category, so an
 # upgrade with an unset setting syncs exactly as it did before this feature.
@@ -567,6 +603,7 @@ FEED_REFRESH_OUTAGE_RETRY_JITTER_SECONDS = 90  # Random extra delay, avoids thun
 # NULL reads as DEFER_SERVICE_LLM.
 DEFER_SERVICE_LLM = 'llm'
 DEFER_SERVICE_WHISPER = 'whisper'
+DEFER_SERVICE_SPONSORBLOCK = 'sponsorblock'
 
 # ============================================================
 # Text Pattern Matching Thresholds
@@ -1822,6 +1859,9 @@ TYPESAFE_BASE_URL = 'https://api.typesafe.ai/v1'
 TYPESAFE_SYSTEMONE_URL = 'https://api.typesafe.ai/v1/systemone'
 SYSTEMONE_COMPATIBLE_BASE_URL = ''
 SYSTEMONE_PROVIDERS = (PROVIDER_TYPESAFE, PROVIDER_SYSTEMONE_COMPATIBLE)
+
+PRICING_OVERRIDE_REQUIRED = frozenset({'inputCostPerMtok', 'outputCostPerMtok'})
+PRICING_OVERRIDE_OPTIONAL = frozenset({'cacheReadCostPerMtok'})
 PROVIDERS_NON_ANTHROPIC = ('openai-compatible', 'ollama', *SYSTEMONE_PROVIDERS)
 SYSTEMONE_TUNABLE_DEFAULTS = {
     PROVIDER_TYPESAFE: {
@@ -2576,6 +2616,9 @@ MAX_ARTWORK_BYTES_MIN = 64 * 1024
 MAX_ARTWORK_BYTES_MAX = 50 * 1024 * 1024
 MAX_RSS_BYTES_MIN = 1024 * 1024
 MAX_AUDIO_DOWNLOAD_MB_MIN = 1
+LOCAL_UPLOAD_MAX_MB_MIN = 1
+LOCAL_UPLOAD_MAX_MB_MAX = 4096
+LOCAL_UPLOAD_MAX_MB_DEFAULT = 1024
 # Advisory threshold only -- the download cap is the disk-fill guard, so
 # values past 10 GB log a warning but are honored (no hard ceiling; a
 # clamp would regress deployments that deliberately run above it).

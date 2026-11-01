@@ -29,7 +29,7 @@ from config import (
 from ad_chapters import ID3_CHAPTER_SOURCE_KEY, public_chapters
 from storage import is_chapter_image_filename
 from database.downloads import capture_request
-from database.podcasts import has_upstream, is_local_feed
+from database.podcasts import has_upstream_audio, is_youtube_feed
 from database.queue import compute_queue_priority
 from main_app.feeds import is_served_rss_stale
 from rss_parser import (
@@ -39,6 +39,7 @@ from rss_parser import (
     extract_cached_render_version,
 )
 from user_agent import download_user_agent
+from youtube import settings as yt_settings
 from utils.constants import EpisodeStatus, REPROCESS_SOURCE_JIT
 from utils.episode_paths import published_episode_version
 from utils.safe_http import URLTrust, safe_head
@@ -211,9 +212,9 @@ def _lookup_episode(slug, episode_id, feed_map, episode_row=None):
     # fallback below. Also avoids an SSRF-blocked fetch_feed call on every
     # lookup.
     podcast = db.get_podcast_by_slug(slug)
-    # An unknown row keeps the historical fetch; only local/recents rows skip it.
+    # An unknown row keeps the historical fetch; local, recents and YouTube rows have no RSS to fetch.
     original_feed = (rss_parser.fetch_feed(feed_map[slug]['in'], podcast=podcast)
-                     if podcast is None or has_upstream(podcast) else None)
+                     if has_upstream_audio(podcast) else None)
     if original_feed:
         parsed_feed = rss_parser.parse_feed(original_feed, source=slug)
         podcast_name = parsed_feed.feed.get('title', 'Unknown') if parsed_feed else 'Unknown'
@@ -306,18 +307,39 @@ def _published_processed_path(slug, episode_id, episode,
     return None
 
 
-def _head_local(slug, episode_id, episode, requested_version=None):
+def _audio_head_response(size=None):
+    resp = Response(status=200)
+    resp.headers['Content-Type'] = 'audio/mpeg'
+    if size is None:
+        resp.automatically_set_content_length = False
+    else:
+        resp.content_length = size
+    return resp
+
+
+def _head_local(slug, episode_id, episode, podcast, requested_version=None):
     """HEAD the published local cut or retained original."""
     path = _published_processed_path(
         slug, episode_id, episode, requested_version)
     if path is None:
         path = storage.get_original_path(slug, episode_id)
     if path.exists():
-        proxy_resp = Response('', status=200)
-        proxy_resp.headers['Content-Type'] = 'audio/mpeg'
-        proxy_resp.content_length = path.stat().st_size
-        return proxy_resp
+        return _audio_head_response(path.stat().st_size)
+    if is_youtube_feed(podcast):
+        # Discovered video not downloaded yet: apps probe with HEAD before the first play.
+        return _audio_head_response()
     abort(404)
+
+
+def _stamp_jit_play(slug, episode_id, episode):
+    """Mark a play as user intent unless a reprocess or requeue already owns the row."""
+    episode = episode or {}
+    if episode.get('reprocess_source') or episode.get('reprocess_mode'):
+        return False
+    db.upsert_episode(slug, episode_id,
+                      reprocess_requested_at=utc_now_iso(),
+                      reprocess_source=REPROCESS_SOURCE_JIT)
+    return True
 
 
 def _record_download(slug, episode_id):
@@ -608,7 +630,7 @@ def register_routes(app):
         # branch is the hottest path in the app and must not pay for a
         # podcast row it never uses.
         podcast = db.get_podcast_by_slug(slug)
-        local_feed = is_local_feed(podcast)
+        serves_own_audio = not has_upstream_audio(podcast)
 
         if status == EpisodeStatus.PERMANENTLY_FAILED:
             ep_key = f"{slug}:{episode_id}"
@@ -620,7 +642,7 @@ def register_routes(app):
             # A local feed always has its original mp3 on disk; a listener
             # should never be blanked by a permanently-failed ad-removal
             # pass when the untouched source audio is right there.
-            if local_feed:
+            if serves_own_audio:
                 original_response = _routes._local_original_response(slug, episode_id, requested_version)
                 if original_response is not None:
                     return original_response
@@ -635,7 +657,7 @@ def register_routes(app):
                 # Mark as permanently failed
                 feed_logger.warning(f"[{slug}:{episode_id}] Max retries ({MAX_EPISODE_RETRIES}) exceeded, marking permanently failed")
                 db.upsert_episode(slug, episode_id, status=EpisodeStatus.PERMANENTLY_FAILED.value)
-                if local_feed:
+                if serves_own_audio:
                     original_response = _routes._local_original_response(slug, episode_id, requested_version)
                     if original_response is not None:
                         return original_response
@@ -653,7 +675,7 @@ def register_routes(app):
                 if elapsed < cooldown_seconds:
                     wait_remaining = int(cooldown_seconds - elapsed)
                     feed_logger.debug(f"[{slug}:{episode_id}] Failed {elapsed:.0f}s ago, cooldown {cooldown_seconds}s (retry {retry_count})")
-                    if local_feed:
+                    if serves_own_audio:
                         original_response = _routes._local_original_response(slug, episode_id, requested_version)
                         if original_response is not None:
                             return original_response
@@ -668,7 +690,7 @@ def register_routes(app):
 
         elif status == EpisodeStatus.PROCESSING:
             feed_logger.info(f"[{slug}:{episode_id}] Currently processing")
-            if local_feed:
+            if serves_own_audio:
                 original_response = _routes._local_original_response(slug, episode_id, requested_version)
                 if original_response is not None:
                     return original_response
@@ -682,11 +704,14 @@ def register_routes(app):
         if request.method == 'HEAD' and status != EpisodeStatus.PROCESSED:
             ep_data, _ = _routes._lookup_episode(slug, episode_id, feed_map, episode_row=episode)
             if ep_data:
-                if local_feed:
+                if serves_own_audio:
                     return _routes._head_local(
-                        slug, episode_id, episode, requested_version)
+                        slug, episode_id, episode, podcast, requested_version)
                 return _routes._head_upstream(slug, episode_id, ep_data['url'])
             abort(404)
+
+        if is_youtube_feed(podcast) and not yt_settings.enabled(db):
+            return Response('YouTube feeds are disabled in Settings', status=503)
 
         # Need to process - find original URL from RSS
         if (not feed_auth_enabled(db)
@@ -709,7 +734,7 @@ def register_routes(app):
 
         # Filtered subscribed episodes serve upstream audio without processing.
         # Reuses the podcast row fetched above instead of separate per-column queries.
-        if not local_feed:
+        if not serves_own_audio:
             jit_episode = {
                 'title': episode_title,
                 'description': episode_description,
@@ -725,13 +750,17 @@ def register_routes(app):
         # unreachable local:// sentinel -- so this guard never applies to
         # them; a blocked agent hitting a local episode falls through to
         # normal JIT processing/serving like any other request.
-        if not local_feed:
+        if not serves_own_audio:
             blocked_agents = resolve_jit_blocked_user_agents(
                 db.get_setting('jit_blocked_user_agents'))
             if user_agent_is_jit_blocked(request.headers.get('User-Agent'), blocked_agents):
                 feed_logger.info(
                     f"[{slug}:{episode_id}] JIT suppressed for blocked agent, serving original")
                 return redirect(original_url, code=302)
+
+        # An own-audio play is user intent; acquire treats a stamp as manual, never over an existing one.
+        if serves_own_audio:
+            _stamp_jit_play(slug, episode_id, episode)
 
         # Start background processing (non-blocking)
         started, reason = start_background_processing(
@@ -742,7 +771,7 @@ def register_routes(app):
 
         if started:
             feed_logger.info(f"[{slug}:{episode_id}] Started background processing")
-            if local_feed:
+            if serves_own_audio:
                 original_response = _routes._local_original_response(slug, episode_id, requested_version)
                 if original_response is not None:
                     return original_response
@@ -753,7 +782,7 @@ def register_routes(app):
             )
         elif reason == "already_processing":
             feed_logger.info(f"[{slug}:{episode_id}] Already processing")
-            if local_feed:
+            if serves_own_audio:
                 original_response = _routes._local_original_response(slug, episode_id, requested_version)
                 if original_response is not None:
                     return original_response
@@ -769,10 +798,8 @@ def register_routes(app):
             # feed with auto-process off.
             # Never over an existing stamp: relabelling a person's reprocess
             # as a play request would let automatic policies act on their run.
-            if not (episode or {}).get('reprocess_requested_at'):
-                db.upsert_episode(slug, episode_id,
-                                  reprocess_requested_at=utc_now_iso(),
-                                  reprocess_source=REPROCESS_SOURCE_JIT)
+            if not serves_own_audio:
+                _stamp_jit_play(slug, episode_id, episode)
             feed_priority = db.get_podcast_queue_priority(slug)
             priority = compute_queue_priority(
                 feed_priority, ep_data.get('published'), manual=True)
@@ -782,7 +809,7 @@ def register_routes(app):
             status_service.queue_episode(slug, episode_id, episode_title, podcast_name)
             queue_position = status_service.get_queue_position(slug, episode_id)
             feed_logger.info(f"[{slug}:{episode_id}] Queue busy ({reason}), queued at position {queue_position}")
-            if local_feed:
+            if serves_own_audio:
                 original_response = _routes._local_original_response(slug, episode_id, requested_version)
                 if original_response is not None:
                     return original_response
